@@ -1,0 +1,16 @@
+# nothing here is code, and some of it is either a secret or the asset itself
+*.env
+.env
+keys.json
+alerts.env
+s2.env
+*.db
+*.db-wal
+*.db-shm
+latex_cache/
+chunk_cache/
+backups/
+__pycache__/
+*.pyc
+monitor_state.json
+harness_baseline.json

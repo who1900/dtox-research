@@ -1,0 +1,205 @@
+{
+  "_about": "Regression set for /v1/validate. Two kinds of case: 'audited' ones were checked by a human reading the papers (they encode judgements, and a failure is a real regression), 'snapshot' ones only freeze today's behaviour so a refactor cannot silently change it. Never promote a snapshot case to audited without someone reading the paper.",
+  "cases": [
+    {
+      "id": "entropy-kv-budget",
+      "verified_by": "audited",
+      "layer": "llm-slm",
+      "idea": "router that decides how aggressively to compress the KV cache",
+      "claim": "entropy-based criterion for how aggressively to compress",
+      "phrasings": [
+        "attention variance and information entropy to allocate cache budget across layers"
+      ],
+      "must_find": [
+        "2406.13035",
+        "2502.17599",
+        "2503.12491"
+      ],
+      "expect_verdict": [
+        "strong_candidates",
+        "prior_art_confirmed",
+        "candidates_read_pending_quorum",
+        "prior_art_reported_pending_quorum"
+      ]
+    },
+    {
+      "id": "entropy-kv-budget-terse",
+      "verified_by": "audited",
+      "layer": "llm-slm",
+      "idea": "router that decides how aggressively to compress the KV cache",
+      "claim": "entropy-based criterion for how aggressively to compress",
+      "must_not_verdict": [
+        "no_match_in_corpus"
+      ],
+      "_why": "the terse wording finds the wrong papers by itself; it must never answer with a clean no-match, and once a reader has judged this claim under any wording the registry answer should come through"
+    },
+    {
+      "id": "onchain-oracle",
+      "verified_by": "audited",
+      "layer": "web3",
+      "idea": "prediction market settled by an oracle",
+      "claim": "on-chain oracle validating external real-world event data",
+      "must_find": [
+        "wp:chainlink-v2"
+      ],
+      "must_not_be_direct": [
+        "1509.08443"
+      ],
+      "_why": "Weaver is a graph database whose 'timeline oracle' is a different thing; it held first place for weeks"
+    },
+    {
+      "id": "model-routing-by-difficulty",
+      "verified_by": "audited",
+      "layer": "llm-slm",
+      "idea": "cost-cutting router between a small local model and a large hosted one",
+      "claim": "routing queries between a small and a large language model based on predicted difficulty",
+      "must_find": [
+        "2504.07113"
+      ],
+      "expect_verdict": [
+        "strong_candidates",
+        "prior_art_confirmed",
+        "candidates_read_pending_quorum",
+        "prior_art_reported_pending_quorum"
+      ]
+    },
+    {
+      "id": "adaptive-kv-strategy-routing",
+      "verified_by": "audited",
+      "layer": "llm-slm",
+      "idea": "adaptive router that switches KV cache compression strategy per input",
+      "claim": "adaptive routing between KV cache compression strategies",
+      "must_find": [
+        "2502.01068"
+      ]
+    },
+    {
+      "id": "out-of-scope-perovskite",
+      "verified_by": "audited",
+      "idea": "photovoltaic perovskite cell degradation under humidity",
+      "claim": "tandem perovskite cell stability under humid conditions",
+      "expect_in_scope": false
+    },
+    {
+      "id": "out-of-scope-robotics",
+      "verified_by": "audited",
+      "idea": "soft robotic gripper with tactile feedback for warehouse picking",
+      "claim": "tactile feedback control for a soft gripper",
+      "expect_in_scope": false
+    },
+    {
+      "id": "out-of-scope-crispr",
+      "verified_by": "audited",
+      "idea": "CRISPR base editing to correct a point mutation in hepatocytes",
+      "claim": "base editing to correct a point mutation in liver cells",
+      "expect_in_scope": false
+    },
+    {
+      "id": "speculative-decoding",
+      "verified_by": "snapshot",
+      "layer": "llm-slm",
+      "idea": "speed up inference with a draft model",
+      "claim": "speculative decoding with a draft model verified by the target model",
+      "expect_verdict": [
+        "strong_candidates",
+        "prior_art_confirmed",
+        "candidates_read_pending_quorum",
+        "prior_art_reported_pending_quorum"
+      ],
+      "min_coverage": 20
+    },
+    {
+      "id": "moe-routing",
+      "verified_by": "snapshot",
+      "layer": "llm-slm",
+      "idea": "sparse expert model with a learned router",
+      "claim": "mixture of experts routing with load balancing across experts",
+      "expect_verdict": [
+        "strong_candidates",
+        "prior_art_confirmed",
+        "candidates_read_pending_quorum",
+        "prior_art_reported_pending_quorum"
+      ],
+      "min_coverage": 10
+    },
+    {
+      "id": "quantized-inference",
+      "verified_by": "snapshot",
+      "layer": "llm-slm",
+      "idea": "run a large model on a small GPU",
+      "claim": "post-training quantization of transformer weights to four bits",
+      "min_coverage": 10
+    },
+    {
+      "id": "agent-memory",
+      "verified_by": "snapshot",
+      "layer": "ai-agents",
+      "idea": "agent that remembers across sessions",
+      "claim": "long-term memory store for an llm agent across episodes",
+      "min_coverage": 5
+    },
+    {
+      "id": "agent-tool-planning",
+      "verified_by": "snapshot",
+      "layer": "ai-agents",
+      "idea": "agent that plans a sequence of tool calls",
+      "claim": "planning a sequence of tool calls and recovering from failures",
+      "min_coverage": 5
+    },
+    {
+      "id": "zk-rollup-aggregation",
+      "verified_by": "snapshot",
+      "layer": "web3",
+      "idea": "cheaper rollup proofs",
+      "claim": "recursive aggregation of zero knowledge proofs for rollups",
+      "min_coverage": 5
+    },
+    {
+      "id": "threshold-signatures",
+      "verified_by": "snapshot",
+      "layer": "web3",
+      "idea": "validator set signing with a shared key",
+      "claim": "threshold signature scheme for a validator committee",
+      "min_coverage": 5
+    },
+    {
+      "id": "mev-sequencer",
+      "verified_by": "snapshot",
+      "layer": "web3",
+      "idea": "fair ordering in a rollup",
+      "claim": "MEV extraction in rollup sequencer design",
+      "min_coverage": 5
+    },
+    {
+      "id": "registry-survives-rewording",
+      "verified_by": "audited",
+      "layer": "llm-slm",
+      "_why": "The one invariant this service is built around: a paper judged under one wording must come back when the same question is asked in other words. It broke silently when automatic claim merging was removed, and nothing in the suite noticed.",
+      "setup_judgment": {
+        "claim": "entropy-based criterion for how aggressively to compress",
+        "layer": "llm-slm",
+        "judgments": [
+          {
+            "id": "2406.13035",
+            "verdict": "asserts",
+            "reason": "allocates the per-layer cache budget from attention variance",
+            "score": 0.892,
+            "band": "direct",
+            "section_type": "method",
+            "niche_score": 8
+          }
+        ]
+      },
+      "idea": "budget for the kv cache from an information measure",
+      "claim": "entropy-based or information-theoretic criterion for deciding how aggressively to compress context",
+      "expect_in_registry": [
+        "2406.13035"
+      ],
+      "expect_verdict": [
+        "prior_art_confirmed",
+        "prior_art_reported_pending_quorum",
+        "prior_art_reported_on_similar_claim"
+      ]
+    }
+  ]
+}
