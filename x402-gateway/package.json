@@ -1,0 +1,28 @@
+{
+  "name": "dtox-x402-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/server.ts",
+    "start": "node dist/server.js",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@x402/core": "2.24.0",
+    "@x402/evm": "2.24.0",
+    "@x402/extensions": "2.24.0",
+    "@x402/mcp": "2.24.0",
+    "@x402/svm": "2.24.0",
+    "express": "5.1.0",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.3",
+    "@types/node": "22.18.0",
+    "tsx": "4.20.5",
+    "typescript": "5.9.2"
+  }
+}

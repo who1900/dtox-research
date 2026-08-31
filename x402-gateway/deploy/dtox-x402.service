@@ -1,0 +1,30 @@
+[Unit]
+Description=dtox x402 MCP gateway
+After=network-online.target dtox-mcp.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/dtox-x402
+ExecStart=/usr/bin/node dist/server.js
+Environment=X402_MODE=shadow
+Environment=X402_HOST=127.0.0.1
+Environment=X402_PORT=8012
+Environment=DTOX_UPSTREAM_MCP_URL=http://127.0.0.1:8011/mcp
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=512M
+CPUQuota=100%
+
+[Install]
+WantedBy=multi-user.target

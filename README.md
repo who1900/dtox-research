@@ -44,6 +44,7 @@ pipeline/    harvest, quality gate, LaTeX extraction, chunking, embedding,
 api/         FastAPI: search, spec, compare, trends, validate, adjudicate,
              claim linking. api/tests holds the regression harness.
 mcp/         MCP server (streamable-http) wrapping the API as seven tools.
+x402-gateway/ isolated Base + Solana USDC payment surface for read-only tools.
 embed/       the embedding and reranking service, CPU only, ONNX int8.
 ops/         backups with verified restores, monitoring with alerts on
              transitions, an audit of the deferred and rejected shelves.
