@@ -22,6 +22,7 @@ import re
 import sqlite3
 import sys
 import tarfile
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -29,6 +30,7 @@ import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -52,7 +54,7 @@ logging.basicConfig(
 log = logging.getLogger("dtox-research")
 logging.getLogger("pylatexenc").setLevel(logging.WARNING)  # tolerant-parsing notices are noise
 
-ARXIV_API_URL = "http://export.arxiv.org/api/query"
+ARXIV_API_URL = "https://export.arxiv.org/api/query"
 ARXIV_DELAY_SECONDS = 3
 ARXIV_FETCH_TIMEOUT = 60
 ARXIV_FETCH_RETRIES = 5
@@ -80,8 +82,8 @@ S2_FIELDS = ("citationCount,influentialCitationCount,venue,year,publicationVenue
 # Affiliation is a weak channel here and the code should not pretend otherwise:
 # Semantic Scholar fills it for roughly one author in eight, so it admits
 # papers when present and never rejects on absence.
-SOTA_MAX_AGE_MONTHS = 3
-SOTA_MIN_NICHE = 8
+SOTA_MAX_AGE_MONTHS = 6
+SOTA_MIN_NICHE = 5
 TOP_LABS = (
     "google", "deepmind", "google brain", "openai", "anthropic", "meta ai",
     "facebook ai", "microsoft research", "nvidia", "mistral", "cohere",
@@ -170,8 +172,11 @@ CHUNK_CYCLE_LIMIT = 200          # local CPU work, no external rate limits
 
 EMBED_CYCLE_LIMIT = 150         # stage runs continuously now, not once per cycle
                                   # bounds how much work one cycle looks at, not how long until progress lands)
-EMBED_BATCH_TEXTS = 64          # measured clean: 2x64 = 116ms/chunk, best of 1x32..3x32
-EMBED_WORKERS = 2               # 2 concurrent callers beat 3: fewer arenas, less contention
+# Two 64-text requests can overlap at full 512-token padding and push the
+# shared ONNX arena past the container's 9 GiB limit. 32 keeps the same two
+# callers and CPU saturation while bounding peak memory.
+EMBED_BATCH_TEXTS = 32
+EMBED_WORKERS = 2
                                   # (raised container limit 2GiB->4GiB; keep this at 1 to avoid concurrent memory spikes OOM-killing it)
 
 NAMESPACE_URL = uuid.NAMESPACE_URL
@@ -266,6 +271,46 @@ ALLOWED_LAYERS = {"llm-slm", "ai-agents", "web3"}
 # these papers ride the existing abstract-only path.
 # ---------------------------------------------------------------------------
 IACR_OAI_URL = "https://eprint.iacr.org/oai"
+# ACL Anthology. Measured before building this: 89 424 papers from 2015 on,
+# 50 102 of them absent from the index, abstracts present on 100% of records and
+# PDFs served without a challenge. Unlike arXiv it is peer-reviewed proceedings,
+# so the venue alone answers the question the citation gate exists to ask.
+ACL_ID_PREFIX = "acl:"
+ACL_START_YEAR = 2015
+ACL_TREE_URL = ("https://api.github.com/repos/acl-org/acl-anthology/"
+                "git/trees/master?recursive=1")
+ACL_XML_BASE = "https://raw.githubusercontent.com/acl-org/acl-anthology/master/data/xml/"
+ACL_PDF_BASE = "https://aclanthology.org/"
+
+# OpenAlex is the discovery layer for peer-reviewed Web3 work that never lands
+# on arXiv. Only open-access works with a direct PDF are admitted; the PDF URL
+# stays attached to the row so fulltext can be fetched without guessing a
+# publisher route. Queries are deliberately Web3-specific and the normal niche
+# classifier remains the final gate.
+OPENALEX_ID_PREFIX = "oa:"
+OPENALEX_API_URL = "https://api.openalex.org/works"
+OPENALEX_START_YEAR = 2015
+OPENALEX_PAGE_SIZE = 100
+OPENALEX_MAX_PAGES = 100
+FRESH_WINDOW_DAYS = 5
+FRESH_POLL_SECONDS = 60 * 60
+SPEC_REFRESH_SECONDS = 24 * 60 * 60
+OPENALEX_FRESH_MAX_PAGES = 10
+OPENALEX_QUERIES = (
+    "zero knowledge proof blockchain", "zk rollup", "blockchain rollup",
+    "maximal extractable value blockchain", "smart contract security",
+    "blockchain consensus protocol", "threshold signature blockchain",
+    "multiparty computation blockchain", "decentralized finance protocol",
+    "state channel blockchain", "verifiable delay function blockchain",
+    "proof of stake blockchain", "account abstraction blockchain",
+    "cross chain bridge security", "decentralized sequencer",
+    "blockchain data availability", "polynomial commitment blockchain",
+    "recursive snark", "zero knowledge virtual machine", "solana svm",
+    "durable nonce solana", "transaction ordering blockchain",
+    "blockchain oracle", "automated market maker blockchain",
+)
+openalex_gate = _ArxivGate(1.0)
+
 IACR_ID_PREFIX = "iacr:"
 IACR_DELAY_SECONDS = 3
 IACR_START_YEAR = 2016
@@ -320,7 +365,8 @@ def is_spec_source(paper_id) -> bool:
 
 def is_non_arxiv(paper_id) -> bool:
     """True for sources Semantic Scholar does not index (IACR, EIP, SIMD)."""
-    return str(paper_id).startswith((IACR_ID_PREFIX, EIP_ID_PREFIX, SIMD_ID_PREFIX))
+    return str(paper_id).startswith((IACR_ID_PREFIX, EIP_ID_PREFIX, SIMD_ID_PREFIX,
+                                     ACL_ID_PREFIX, OPENALEX_ID_PREFIX))
 
 
 def _parse_front_matter(text):
@@ -511,6 +557,31 @@ def fetch_iacr_month(query_key: str):
     return entries
 
 
+# Whole categories, swept year by year. The keyword and boolean queries were
+# built to find papers already known to be on subject, and they worked: 534
+# cursors, every one of them exhausted. What they cannot do is turn up a paper
+# nobody thought to name. Measured totals: cs.LG 279k, cs.AI 192k, cs.CL 115k,
+# cs.CR 51k, cs.DC 29k, cs.SE 28k, cs.IR 26k, cs.MA 13k -- about 734k records
+# against the 212k harvested so far.
+#
+# Most of that is off subject and will be dropped, which is the point: the
+# lexical niche filter is local and free, so a category sweep costs arXiv
+# requests and nothing else. The layer a category is filed under only balances
+# the round-robin scheduler; upsert_discovered classifies each paper against
+# all three niches regardless of which query found it.
+CATEGORY_SWEEP = {
+    "llm-slm": ["cs.CL", "cs.LG", "cs.IR"],
+    "ai-agents": ["cs.AI", "cs.MA", "cs.SE"],
+    "web3": ["cs.CR", "cs.DC"],
+}
+
+
+def category_sweep_keys(layer: str) -> list:
+    slices = ["pre"] + [str(y) for y in range(DATE_SLICE_START_YEAR, DATE_SLICE_END_YEAR + 1)]
+    return [f"cat:{cat}@{suffix}"
+            for cat in CATEGORY_SWEEP.get(layer, []) for suffix in slices]
+
+
 def bool_date_slice_keys(layer: str, idx: int) -> list:
     return [f"bq:{layer}:{idx}@{year}" for year in range(DATE_SLICE_START_YEAR, DATE_SLICE_END_YEAR + 1)]
 
@@ -526,7 +597,8 @@ def build_layer_query_groups() -> list:
         for idx in range(len(BOOLEAN_QUERIES.get(layer, []))):
             sliced.extend(bool_date_slice_keys(layer, idx))
         extra = (iacr_month_keys() + list(SPEC_SOURCES)) if layer == "web3" else []
-        groups.append((layer, sliced + list(keyword_queries) + extra))
+        groups.append((layer, sliced + list(keyword_queries) + extra
+                       + category_sweep_keys(layer)))
     return groups
 
 
@@ -580,11 +652,10 @@ def resolve_search_query(query_key: str) -> str:
         return f"({_loose_terms(text)}) AND {_slice_clause(suffix)}"
     base = base_category_of(query_key)
     if query_key.startswith("cat:") and "@" in query_key:
-        # legacy cursor rows from the old bare-category harvest; no longer
-        # produced by build_layer_query_groups() but kept resolvable in case
-        # a stale cursor entry is ever looked up directly.
-        year = query_key.split("@", 1)[1]
-        return f"{base} AND submittedDate:[{year}01010000 TO {year}12312359]"
+        # Through _slice_clause, not a hand-built year range: a category that
+        # hits the pagination wall is split into months, and the old code
+        # pasted "2023-05" straight into the date literal.
+        return f"{base} AND {_slice_clause(query_key.split('@', 1)[1])}"
     if query_key.startswith("cat:"):
         return query_key
     return f"all:{query_key}"
@@ -662,6 +733,8 @@ def init_db(conn):
         conn.execute("ALTER TABLE papers ADD COLUMN niche_score INTEGER")
     if "matched_terms" not in cols:
         conn.execute("ALTER TABLE papers ADD COLUMN matched_terms TEXT")
+    if "source_url" not in cols:
+        conn.execute("ALTER TABLE papers ADD COLUMN source_url TEXT")
     # migration: last_run_at on cursors + scheduler_state, for the layer-fair
     # persistent scheduler. The old in-memory rotation counter restarted at 0 on
     # every service restart, so queries at the tail of the list (web3) were never
@@ -704,7 +777,8 @@ def now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def upsert_discovered(conn, arxiv_id, title, year, layer, abstract=None):
+def upsert_discovered(conn, arxiv_id, title, year, layer, abstract=None,
+                      source_url=None, citation_count=None, venue=None, commit=True):
     """Insert/update a harvested paper, gated by the deterministic lexical
     niche filter (niche_filter.niche_match). The arXiv boolean query already
     narrows results, but this is the authoritative second check: it decides
@@ -727,16 +801,18 @@ def upsert_discovered(conn, arxiv_id, title, year, layer, abstract=None):
         if matched_layers:
             conn.execute(
                 "INSERT INTO papers (arxiv_id, title, year, layers, status, abstract, "
-                "niche_score, matched_terms, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                "niche_score, matched_terms, source_url, citation_count, venue, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (arxiv_id, title, year, ",".join(matched_layers), "discovered", abstract,
-                 primary_score, matched_terms_json, now_iso()),
+                 primary_score, matched_terms_json, source_url, citation_count, venue, now_iso()),
             )
         else:
             conn.execute(
                 "INSERT INTO papers (arxiv_id, title, year, layers, status, abstract, "
-                "niche_score, matched_terms, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                "niche_score, matched_terms, source_url, citation_count, venue, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (arxiv_id, title, year, "", "off_niche", abstract,
-                 primary_score, matched_terms_json, now_iso()),
+                 primary_score, matched_terms_json, source_url, citation_count, venue, now_iso()),
             )
     else:
         if row["status"] == "off_niche" and matched_layers:
@@ -757,7 +833,15 @@ def upsert_discovered(conn, arxiv_id, title, year, layer, abstract=None):
                     (",".join(sorted(new_layers)) if new_layers else layer, abstract,
                      primary_score, matched_terms_json, now_iso(), arxiv_id),
                 )
-    conn.commit()
+        if source_url or citation_count is not None or venue:
+            conn.execute(
+                "UPDATE papers SET source_url=COALESCE(source_url, ?), "
+                "citation_count=COALESCE(citation_count, ?), venue=COALESCE(venue, ?) "
+                "WHERE arxiv_id=?",
+                (source_url, citation_count, venue, arxiv_id),
+            )
+    if commit:
+        conn.commit()
 
 
 def get_cursor(conn, query_key, layer=None):
@@ -799,6 +883,19 @@ def _sched_set(conn, key, value):
         (key, str(value)),
     )
     conn.commit()
+
+
+def _poll_due(conn, key, interval_seconds):
+    """Restart-safe clock for rolling sources that never become exhausted."""
+    raw = _sched_get(conn, key)
+    try:
+        return time.time() - float(raw) >= interval_seconds
+    except (TypeError, ValueError):
+        return True
+
+
+def _mark_polled(conn, key):
+    _sched_set(conn, key, str(time.time()))
 
 
 def pick_next_query(conn):
@@ -951,6 +1048,52 @@ def refine_capped_cursors(conn):
 HARVEST_QUERIES_PER_CYCLE = 4  # keep each cycle short so quality/fulltext/chunk/embed get a turn too
 
 
+def refresh_live_cursors(conn):
+    """Reopen append-only sources on a durable schedule.
+
+    Historical cursors really are finite, but the current arXiv year/month,
+    current ACL volumes, IACR month and protocol repositories keep changing.
+    Treating their first empty page as permanent exhaustion stopped discovery
+    while the service itself stayed healthy.  Offsets are preserved for arXiv;
+    sources without stable offsets are re-read and deduplicated by paper id.
+    """
+    now = datetime.now(timezone.utc)
+    year = now.strftime("%Y")
+    month = now.strftime("%Y-%m")
+
+    if _poll_due(conn, "fresh:hourly", FRESH_POLL_SECONDS):
+        patterns = (f"bq:%@{year}", f"kw:%@{year}", f"cat:%@{year}",
+                    f"bq:%@{month}", f"kw:%@{month}", f"cat:%@{month}")
+        reopened = 0
+        for pattern in patterns:
+            cur = conn.execute(
+                "UPDATE harvest_cursor SET done=0,last_run_at=NULL "
+                "WHERE query_key LIKE ? AND refined=0 AND done=1", (pattern,))
+            reopened += cur.rowcount
+        cur = conn.execute(
+            "UPDATE harvest_cursor SET done=0,last_run_at=NULL "
+            "WHERE query_key=? AND done=1", (f"iacr@{month}",))
+        reopened += cur.rowcount
+        conn.commit()
+        _mark_polled(conn, "fresh:hourly")
+        if reopened:
+            log.info(f"fresh: reopened {reopened} live arXiv/IACR cursors")
+
+    if _poll_due(conn, "fresh:daily", SPEC_REFRESH_SECONDS):
+        # GitHub specs and current ACL XML files are mutable snapshots, not
+        # immutable pages. Re-reading them is cheap and INSERT/UPDATE is
+        # idempotent, so newly merged EIPs, SIMDs and ACL papers are admitted.
+        cur_specs = conn.execute(
+            "UPDATE harvest_cursor SET next_start=0,done=0,last_run_at=NULL "
+            "WHERE query_key IN ('eip@all','simd@all')")
+        cur_acl = conn.execute(
+            "UPDATE harvest_cursor SET next_start=0,done=0,last_run_at=NULL "
+            "WHERE query_key LIKE ?", (f"acl@{year}%",))
+        conn.commit()
+        _mark_polled(conn, "fresh:daily")
+        log.info(f"fresh: daily sources reopened specs={cur_specs.rowcount} acl={cur_acl.rowcount}")
+
+
 def harvest_step(conn):
     """Process one page per turn, picking queries layer-fairly via the
     persistent scheduler so every niche advances even across restarts.
@@ -958,6 +1101,7 @@ def harvest_step(conn):
     new_count = 0
     if not ALL_QUERY_KEYS:
         return 0
+    refresh_live_cursors(conn)
     touched = 0
     attempts = 0
     max_attempts = len(ALL_QUERY_KEYS)
@@ -992,10 +1136,18 @@ def harvest_step(conn):
             continue
 
         if query_key.startswith("iacr@"):
+            # A month that has not started yet has nothing to give, and with the
+            # arXiv plan exhausted these were the only open cursors left: four of
+            # every five harvest slots went to fetching an empty future. They are
+            # parked instead, and _open_current_iacr_month reopens each one on
+            # the day it becomes real.
+            if query_key.split("@", 1)[1] > time.strftime("%Y-%m", time.gmtime()):
+                set_cursor(conn, query_key, 0, 1)
+                continue
             # One OAI request covers a whole month, so there is no offset to
-            # advance: the month is either taken or retried. The current month
-            # is never closed out, so newly posted papers keep arriving (dedup
-            # by id makes the re-read cheap).
+            # advance. Every successful poll is closed and the durable hourly
+            # refresher opens the current month again; this avoids hammering an
+            # empty month every few seconds.
             entries = fetch_iacr_month(query_key)
             time.sleep(IACR_DELAY_SECONDS)
             if entries is None:
@@ -1004,8 +1156,15 @@ def harvest_step(conn):
                 upsert_discovered(conn, e["arxiv_id"], e["title"], e["year"], layer,
                                   abstract=e.get("abstract"))
                 new_count += 1
-            current_month = time.strftime("iacr@%Y-%m", time.gmtime())
-            set_cursor(conn, query_key, len(entries), 0 if query_key == current_month else 1)
+            # A month is finished only once it is in the past. Closing it by
+            # equality with "the current month" froze every future month the
+            # moment it was first probed: iacr@2026-08 was read empty in July,
+            # marked done, and stayed done when August arrived. IACR went
+            # silent, and since every arXiv cursor was already exhausted, the
+            # whole harvest went silent with it.
+            current_month = time.strftime("%Y-%m", time.gmtime())
+            month_suffix = query_key.split("@", 1)[1]
+            set_cursor(conn, query_key, len(entries), 1)
             log.info(f"harvest: {query_key} -> {len(entries)} records")
             continue
 
@@ -1061,7 +1220,12 @@ TOP_VENUES = [
 # with three outcomes instead of two -- pass, reject, or "ask again later" --
 # so a verdict is never passed at the moment of least information.
 DEFER_GIVE_UP_MONTHS = 24   # still nothing by here: the field really did pass it by
-RECHECK_AFTER_DAYS = 14
+# Fourteen days was chosen when the harvest still had a queue and the deferred
+# shelf was a place to park things. With the arXiv plan exhausted that shelf is
+# a working queue, and 24k papers sitting untouched for two weeks is two weeks
+# of an idle pipeline. Five days is still long enough for a citation to appear
+# and short enough that the shelf keeps moving.
+RECHECK_AFTER_DAYS = 5
 
 
 def paper_age_months(arxiv_id, year, now=None):
@@ -1086,8 +1250,20 @@ def paper_age_months(arxiv_id, year, now=None):
 # about 8% of a shelf of 24k, so roughly 1900 papers thrown away for being
 # specialised rather than for being weak. The bar is lowered for work that
 # clearly belongs to one of the niches, and only for that work.
-NICHE_DISCOUNT_FROM = 6
-NICHE_DISCOUNT = 0.6
+# The gate was tuned when the harvest still had a queue. With every arXiv
+# cursor exhausted, what it now rejects is the only place left to grow, and
+# measured against the 57k it had already turned away, the bar was in the wrong
+# place rather than merely high: 6849 of them clear it on subject alone.
+#
+# The loosening is deliberately conditioned on the niche score instead of
+# applied across the board. Halving the bar for everyone admits 15084 papers of
+# which 4458 are barely on subject; halving it only for papers the lexical gate
+# already puts inside a niche admits 10766 of which 140 are. Same order of
+# growth, a thirtieth of the dilution.
+NICHE_DISCOUNT_FROM = 4
+NICHE_DISCOUNT = 0.5
+YOUNG_MONTHS = 36            # a citation count means little before this age
+YOUNG_NICHE_SCALE = 0.5      # ...so in-niche work gets a second discount here
 
 
 def citation_threshold(age_months: int, niche_score=None) -> int:
@@ -1104,7 +1280,11 @@ def citation_threshold(age_months: int, niche_score=None) -> int:
     else:
         base = 150
     if (niche_score or 0) >= NICHE_DISCOUNT_FROM:
-        return max(2, int(round(base * NICHE_DISCOUNT)))
+        base = max(2, int(round(base * NICHE_DISCOUNT)))
+        if age_months <= YOUNG_MONTHS:
+            # young and on subject: the field has not had time to react, and
+            # waiting for it to react is what left these in the deferred shelf
+            base = max(1, int(round(base * YOUNG_NICHE_SCALE)))
     return base
 
 
@@ -1504,7 +1684,7 @@ def fetch_latex_source(arxiv_id: str, session: requests.Session = None):
 
 
 def fetch_abstract_fallback(arxiv_id: str):
-    url = f"http://export.arxiv.org/api/query?id_list={arxiv_id}"
+    url = f"https://export.arxiv.org/api/query?id_list={arxiv_id}"
     try:
         with urllib.request.urlopen(url, timeout=30) as response:
             raw_xml = response.read()
@@ -1537,7 +1717,69 @@ def get_fulltext_session():
     return _fulltext_session
 
 
-def _fetch_one_fulltext(arxiv_id, stored_abstract=None):
+def _fetch_acl_fulltext(paper_id, stored_abstract=None):
+    """PDF -> markdown for one ACL paper. Falls back to the abstract."""
+    ident = str(paper_id)[len(ACL_ID_PREFIX):].strip("/")
+    url = f"{ACL_PDF_BASE}{ident}.pdf"
+    try:
+        session = get_fulltext_session()
+        resp = session.get(url, timeout=90,
+                           headers={"User-Agent": ARXIV_CONTACT_UA})
+        if resp.status_code != 200 or not resp.content[:4] == b"%PDF":
+            raise ValueError(f"status {resp.status_code}")
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(resp.content)
+            tmp_path = tmp.name
+        try:
+            import pymupdf4llm
+            text = pymupdf4llm.to_markdown(tmp_path, show_progress=False)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        if text and len(text) > 500:
+            return paper_id, text, "acl-pdf"
+        raise ValueError("pdf produced no usable text")
+    except Exception as e:
+        log.debug(f"acl fulltext {ident}: {e}")
+    if stored_abstract:
+        return paper_id, "\\section{Abstract}\n" + stored_abstract, "acl-abstract"
+    return paper_id, None, None
+
+
+def _fetch_openalex_fulltext(paper_id, pdf_url, stored_abstract=None):
+    """Fetch one OpenAlex-selected OA PDF and preserve its Markdown structure."""
+    if not pdf_url:
+        return paper_id, None, None
+    try:
+        session = get_fulltext_session()
+        resp = session.get(pdf_url, timeout=120,
+                           headers={"User-Agent": ARXIV_CONTACT_UA})
+        if resp.status_code != 200 or resp.content[:4] != b"%PDF":
+            raise ValueError(f"status {resp.status_code}")
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(resp.content)
+            tmp_path = tmp.name
+        try:
+            import pymupdf4llm
+            text = pymupdf4llm.to_markdown(tmp_path, show_progress=False)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        if text and len(text) > 500:
+            return paper_id, text, "openalex-oa-pdf"
+        raise ValueError("pdf produced no usable text")
+    except Exception as e:
+        log.debug(f"openalex fulltext {paper_id}: {e}")
+    if stored_abstract:
+        return paper_id, "# Abstract\n\n" + stored_abstract, "openalex-abstract"
+    return paper_id, None, None
+
+
+def _fetch_one_fulltext(arxiv_id, stored_abstract=None, source_url=None):
     """Runs in a worker thread. Pure I/O, no DB access. Returns (arxiv_id, text, source)."""
     if str(arxiv_id).startswith((EIP_ID_PREFIX, SIMD_ID_PREFIX)):
         # the markdown was stored at harvest time; nothing to download
@@ -1545,6 +1787,14 @@ def _fetch_one_fulltext(arxiv_id, stored_abstract=None):
         if not cached:
             return arxiv_id, None, None
         return arxiv_id, cached, "spec-markdown"
+
+    if str(arxiv_id).startswith(ACL_ID_PREFIX):
+        # ACL ships PDFs, and unlike IACR it serves them to anyone. pymupdf4llm
+        # keeps the section headings, which is what the chunker reads.
+        return _fetch_acl_fulltext(arxiv_id, stored_abstract)
+
+    if str(arxiv_id).startswith(OPENALEX_ID_PREFIX):
+        return _fetch_openalex_fulltext(arxiv_id, source_url, stored_abstract)
 
     if str(arxiv_id).startswith(IACR_ID_PREFIX):
         # IACR ships PDFs only, no LaTeX source, but OAI-PMH already handed us
@@ -1566,7 +1816,7 @@ def _fetch_one_fulltext(arxiv_id, stored_abstract=None):
 
 def fulltext_step(conn, limit=FULLTEXT_CYCLE_LIMIT):
     rows = conn.execute(
-        "SELECT arxiv_id, abstract FROM papers WHERE status='quality_checked' LIMIT ?", (limit,)
+        "SELECT arxiv_id, abstract, source_url FROM papers WHERE status='quality_checked' LIMIT ?", (limit,)
     ).fetchall()
     if not rows:
         return 0
@@ -1574,13 +1824,15 @@ def fulltext_step(conn, limit=FULLTEXT_CYCLE_LIMIT):
     processed = 0
     ids = [row["arxiv_id"] for row in rows]
     abstracts = {row["arxiv_id"]: row["abstract"] for row in rows}
+    source_urls = {row["arxiv_id"]: row["source_url"] for row in rows}
     # Download/parse concurrently (I/O-bound, no DB touched from worker threads).
     # Each paper's status transition is still committed one at a time, sequentially,
     # in this (main) thread as results arrive -- durability is unchanged: a crash
     # mid-batch leaves in-flight papers at 'quality_checked' and they are retried
     # from scratch next cycle (nothing partially written to state.db).
     with ThreadPoolExecutor(max_workers=FULLTEXT_WORKERS) as pool:
-        futures = {pool.submit(_fetch_one_fulltext, aid, abstracts.get(aid)): aid for aid in ids}
+        futures = {pool.submit(_fetch_one_fulltext, aid, abstracts.get(aid),
+                               source_urls.get(aid)): aid for aid in ids}
         for future in as_completed(futures):
             arxiv_id = futures[future]
             try:
@@ -1627,7 +1879,11 @@ def chunk_step(conn, session, limit=CHUNK_CYCLE_LIMIT):
             continue
         text = tex_path.read_text(encoding="utf-8", errors="ignore")
         try:
-            if is_spec_source(arxiv_id):
+            # ACL arrives as markdown too (pymupdf4llm keeps the headings), so
+            # it takes the markdown path rather than the LaTeX parser, which
+            # would find no \section commands and fall back to one flat blob.
+            if is_spec_source(arxiv_id) or str(arxiv_id).startswith(
+                    (ACL_ID_PREFIX, OPENALEX_ID_PREFIX)):
                 chunks, mode = extractor.build_chunks_markdown(text)
             else:
                 chunks, mode = extractor.build_chunks(text, embed_fn=embed_fn)
@@ -1733,8 +1989,8 @@ def fts_write(points):
 
 def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT):
     rows = conn.execute(
-        "SELECT arxiv_id, title, year, layers, citation_count, venue, niche_score, matched_terms "
-        "FROM papers WHERE status='chunked' LIMIT ?",
+        "SELECT arxiv_id, title, year, layers, citation_count, venue, niche_score, matched_terms, "
+        "source_url FROM papers WHERE status='chunked' LIMIT ?",
         (limit,),
     ).fetchall()
     if not rows:
@@ -1838,6 +2094,7 @@ def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT):
                     "niche_score": niche_score,
                     "terms": terms,
                     "repos": repos,
+                    "url": row["source_url"],
                 },
             })
         try:
@@ -1894,6 +2151,8 @@ def seed_latex_cache_from_fulltext(conn):
     """One-time backfill: papers already downloaded under the old pipeline have
     their resolved LaTeX sitting in fulltext_cache/<id>.tex. Copy those into
     latex_cache/<id>/source.tex so re-processing never re-hits arXiv for them."""
+    if _sched_get(conn, "latex_cache_seeded_v1") == "1":
+        return 0
     rows = conn.execute(
         "SELECT arxiv_id FROM papers WHERE fulltext_source='latex' "
         "AND status IN ('fulltext_fetched','chunked','done')"
@@ -1913,6 +2172,7 @@ def seed_latex_cache_from_fulltext(conn):
             continue
     if seeded:
         log.info(f"seeded latex_cache from fulltext_cache for {seeded} papers")
+    _sched_set(conn, "latex_cache_seeded_v1", "1")
     return seeded
 
 
@@ -2059,8 +2319,303 @@ def recheck_step(conn, session):
     return len(rows)
 
 
+# The bibliography as a harvest source. Every arXiv cursor is exhausted and the
+# category sweep is done, but the corpus keeps pointing at work the index does
+# not hold: 54 664 distinct papers are cited from inside it and missing from it.
+# Unlike a query, this channel needs nobody to think of the right words -- the
+# papers were chosen by the authors we already trust, and how often they are
+# cited from inside our own three subjects is a relevance signal no search gives.
+#
+# Measured on 400 candidates cited three or more times: 46% clear the niche
+# filter. The rejects are exactly what should be rejected (ResNet, MS COCO,
+# Latent Diffusion) and the passes are exactly what should pass (Deep
+# Compression, Code as Policies), so the existing filter is doing the work and
+# nothing here needs to second-guess it.
+# Dropped from 3 to 1 once the stricter tier ran dry: papers cited three or
+# more times from inside the corpus lasted a single day (3656 admitted, then
+# zero candidates left and the pipeline stood still for 29 hours). Cited once
+# is still a deliberate reference by an author already in the index, which is a
+# stronger signal than any keyword query, and the niche filter and the quality
+# gate both still stand between the candidate and the corpus.
+# Remaining at this threshold: 45 263.
+GRAPH_HARVEST_MIN_CITES = 1
+GRAPH_HARVEST_BATCH = 100
+_graph_queue = []
+
+
+def fetch_s2_titles(session, arxiv_ids):
+    """Title, abstract and year for ids we do not hold. Returns None to retry.
+
+    Separate from fetch_s2_batch because the pipeline's field list carries no
+    title: everywhere else the title arrives from arXiv at harvest time, and
+    here there is no harvest to take it from."""
+    if not arxiv_ids:
+        return {}
+    s2_gate.wait()
+    try:
+        resp = session.post(
+            S2_API_URL,
+            params={"fields": "title,abstract,year"},
+            json={"ids": [f"ARXIV:{i}" for i in arxiv_ids]},
+            headers={"x-api-key": S2_API_KEY} if S2_API_KEY else None,
+            timeout=60,
+        )
+    except requests.RequestException as e:
+        log.warning(f"graph_harvest: request error: {e}")
+        return None
+    if resp.status_code == 429:
+        s2_gate.penalize(S2_PENALTY_SECONDS)
+        return None
+    if resp.status_code != 200:
+        log.warning(f"graph_harvest: S2 status {resp.status_code}: {resp.text[:200]}")
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    time.sleep(S2_PAUSE)
+    return {pid: paper for pid, paper in zip(arxiv_ids, data)}
+
+
+def acl_seed_cursors(conn):
+    """One cursor per volume file, taken from the repository tree.
+
+    The file list needs a network call, so it cannot live in ALL_QUERY_KEYS
+    (which is built at import time and must not depend on the network being up
+    when the service starts). The cursors are the durable part: created once,
+    then drained across restarts like every other query."""
+    if not _poll_due(conn, "acl:tree", SPEC_REFRESH_SECONDS):
+        return 0
+    try:
+        req = urllib.request.Request(ACL_TREE_URL, headers={
+            "User-Agent": ARXIV_CONTACT_UA, "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            tree = json.loads(resp.read())
+    except Exception as e:
+        log.warning(f"acl: tree listing failed: {e}")
+        return 0
+    names = sorted({t["path"].split("/")[-1] for t in tree.get("tree", [])
+                    if t["path"].startswith("data/xml/") and t["path"].endswith(".xml")})
+    added = 0
+    for name in names:
+        year = name[:4]
+        if not (year.isdigit() and int(year) >= ACL_START_YEAR):
+            continue
+        conn.execute("INSERT OR IGNORE INTO harvest_cursor (query_key, next_start, done, layer) "
+                     "VALUES (?,0,0,?)", (f"acl@{name}", "llm-slm"))
+        added += 1
+    conn.commit()
+    _mark_polled(conn, "acl:tree")
+    log.info(f"acl: {added} volume files queued")
+    return added
+
+
+def acl_harvest_step(conn):
+    """Take one ACL volume file per turn."""
+    acl_seed_cursors(conn)
+    row = conn.execute(
+        "SELECT query_key FROM harvest_cursor WHERE query_key LIKE 'acl@%' AND done=0 "
+        "ORDER BY query_key DESC LIMIT 1").fetchone()
+    if row is None:
+        return 0
+    key = row["query_key"]
+    name = key.split("@", 1)[1]
+    try:
+        req = urllib.request.Request(ACL_XML_BASE + name,
+                                     headers={"User-Agent": ARXIV_CONTACT_UA})
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            raw = resp.read()
+    except Exception as e:
+        log.warning(f"acl: fetch failed for {name}: {e}")
+        return 0                      # cursor stays open, retried next cycle
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as e:
+        log.warning(f"acl: parse failed for {name}: {e}")
+        set_cursor(conn, key, 0, 1)   # a broken file will not fix itself
+        return 0
+
+    year = int(name[:4])
+    taken = 0
+    for paper in root.findall(".//paper"):
+        url_el = paper.find("url")
+        title_el = paper.find("title")
+        if url_el is None or url_el.text is None or title_el is None:
+            continue
+        title = " ".join("".join(title_el.itertext()).split())
+        abs_el = paper.find("abstract")
+        abstract = " ".join("".join(abs_el.itertext()).split()) if abs_el is not None else None
+        if not title:
+            continue
+        upsert_discovered(conn, f"{ACL_ID_PREFIX}{url_el.text.strip()}", title, year,
+                          "llm-slm", abstract=abstract)
+        taken += 1
+    set_cursor(conn, key, taken, 1)
+    conn.commit()
+    log.info(f"acl: {name} -> {taken} papers")
+    return taken
+
+
+def _openalex_abstract(inverted):
+    if not isinstance(inverted, dict):
+        return None
+    words = []
+    for token, positions in inverted.items():
+        for pos in positions or []:
+            if isinstance(pos, int):
+                words.append((pos, token))
+    return " ".join(token for _, token in sorted(words)) or None
+
+
+def openalex_seed_cursors(conn):
+    added = 0
+    for idx, _ in enumerate(OPENALEX_QUERIES):
+        for key in (f"openalex@{idx}", f"openalex-fresh@{idx}"):
+            before = conn.total_changes
+            conn.execute(
+                "INSERT OR IGNORE INTO harvest_cursor "
+                "(query_key,next_start,done,layer) VALUES (?,0,0,'web3')", (key,))
+            added += conn.total_changes - before
+    conn.commit()
+    if added:
+        log.info(f"openalex: {added} durable query cursors queued")
+    return added
+
+
+def openalex_harvest_step(conn, session):
+    """Discover OA Web3 papers outside arXiv, one durable page at a time."""
+    openalex_seed_cursors(conn)
+    if _poll_due(conn, "openalex:fresh", FRESH_POLL_SECONDS):
+        conn.execute(
+            "UPDATE harvest_cursor SET next_start=0,done=0,last_run_at=NULL "
+            "WHERE query_key LIKE 'openalex-fresh@%'")
+        conn.commit()
+        _mark_polled(conn, "openalex:fresh")
+    row = conn.execute(
+        "SELECT query_key,next_start FROM harvest_cursor "
+        "WHERE (query_key LIKE 'openalex@%' OR query_key LIKE 'openalex-fresh@%') "
+        "AND done=0 "
+        "ORDER BY COALESCE(last_run_at,''), query_key LIMIT 1").fetchone()
+    if row is None:
+        return 0
+    key = row["query_key"]
+    fresh = key.startswith("openalex-fresh@")
+    idx = int(key.split("@", 1)[1])
+    query = OPENALEX_QUERIES[idx]
+    page = int(row["next_start"] or 0) + 1
+    from_date = ((datetime.now(timezone.utc) - timedelta(days=FRESH_WINDOW_DAYS)).date().isoformat()
+                 if fresh else f"{OPENALEX_START_YEAR}-01-01")
+    openalex_gate.wait()
+    try:
+        resp = session.get(OPENALEX_API_URL, params={
+            "search": query,
+            "filter": (f"from_publication_date:{from_date},"
+                       "is_oa:true,has_abstract:true"),
+            "sort": "publication_date:desc" if fresh else "cited_by_count:desc",
+            "page": page,
+            "per-page": OPENALEX_PAGE_SIZE,
+            "select": ("id,title,publication_year,cited_by_count,ids,"
+                       "abstract_inverted_index,best_oa_location,primary_location"),
+        }, timeout=60, headers={"User-Agent": ARXIV_CONTACT_UA})
+    except requests.RequestException as e:
+        log.warning(f"openalex: request failed for {query!r}: {e}")
+        return 0
+    if resp.status_code == 429:
+        openalex_gate.penalize(60)
+        log.warning("openalex: 429 rate limited, backing off")
+        return 0
+    if resp.status_code != 200:
+        log.warning(f"openalex: status {resp.status_code}: {resp.text[:200]}")
+        return 0
+    try:
+        results = resp.json().get("results") or []
+    except ValueError:
+        return 0
+
+    taken = 0
+    for work in results:
+        title = (work.get("title") or "").strip()
+        location = work.get("best_oa_location") or {}
+        pdf_url = location.get("pdf_url")
+        if not title or not pdf_url:
+            continue
+        ids = work.get("ids") or {}
+        arxiv_url = ids.get("arxiv")
+        if arxiv_url:
+            paper_id = arxiv_url.rstrip("/").split("/")[-1]
+        else:
+            oa_id = (work.get("id") or "").rstrip("/").split("/")[-1]
+            if not oa_id:
+                continue
+            paper_id = OPENALEX_ID_PREFIX + oa_id
+        venue = ((work.get("primary_location") or {}).get("source") or {}).get("display_name")
+        upsert_discovered(
+            conn, paper_id, title, work.get("publication_year"), "web3",
+            abstract=_openalex_abstract(work.get("abstract_inverted_index")),
+            source_url=pdf_url,
+            citation_count=work.get("cited_by_count") or 0,
+            venue=venue,
+            commit=False,
+        )
+        taken += 1
+    page_limit = OPENALEX_FRESH_MAX_PAGES if fresh else OPENALEX_MAX_PAGES
+    done = page >= page_limit or len(results) < OPENALEX_PAGE_SIZE
+    conn.execute(
+        "UPDATE harvest_cursor SET next_start=?,done=?,last_run_at=? WHERE query_key=?",
+        (page, 1 if done else 0, now_iso(), key),
+    )
+    conn.commit()
+    log.info(f"openalex: {query!r} page {page} -> {taken} OA PDFs")
+    return taken
+
+
+def graph_harvest_step(conn, session):
+    """Pull in works the corpus cites but does not hold."""
+    global _graph_queue
+    if not _graph_queue:
+        # The scan is over two million edges, so it is done once and drained
+        # from memory rather than re-run every few seconds.
+        _graph_queue = [r["dst"] for r in conn.execute(
+            "SELECT c.dst AS dst, COUNT(*) AS k FROM citations c "
+            "WHERE NOT EXISTS (SELECT 1 FROM papers p WHERE p.arxiv_id = c.dst) "
+            "GROUP BY c.dst HAVING k >= ? ORDER BY k DESC LIMIT 5000",
+            (GRAPH_HARVEST_MIN_CITES,))]
+        if not _graph_queue:
+            return 0
+        log.info(f"graph_harvest: {len(_graph_queue)} cited-but-missing papers queued")
+
+    batch, _graph_queue = _graph_queue[:GRAPH_HARVEST_BATCH], _graph_queue[GRAPH_HARVEST_BATCH:]
+    meta = fetch_s2_titles(session, batch)
+    if meta is None:
+        _graph_queue = batch + _graph_queue   # transient failure: keep the slice
+        return 0
+
+    taken = unresolved = 0
+    for pid in batch:
+        paper = meta.get(pid)
+        if not paper or not paper.get("title"):
+            # Nothing to classify it with. Parked so the scan does not offer it
+            # again on every pass; it is not a rejection on the merits.
+            conn.execute(
+                "INSERT OR IGNORE INTO papers (arxiv_id, title, status, niche_score, updated_at) "
+                "VALUES (?,?,?,?,?)", (pid, "", "graph_unresolved", 0, now_iso()))
+            unresolved += 1
+            continue
+        upsert_discovered(conn, pid, paper["title"], paper.get("year"), "llm-slm",
+                          abstract=paper.get("abstract"))
+        taken += 1
+    conn.commit()
+    if taken or unresolved:
+        log.info(f"graph_harvest: {taken} classified, {unresolved} without metadata, "
+                 f"{len(_graph_queue)} left in queue")
+    return taken
+
+
 STAGES = (
     ("harvest", lambda conn: harvest_step(conn), False),
+    ("graph_harvest", graph_harvest_step, True),
+    ("acl_harvest", lambda conn: acl_harvest_step(conn), False),
+    ("openalex", openalex_harvest_step, True),
     ("quality", quality_step, True),
     ("fulltext", lambda conn: fulltext_step(conn), False),
     ("chunk", chunk_step, True),
