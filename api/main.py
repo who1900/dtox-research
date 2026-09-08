@@ -18,7 +18,9 @@ from pydantic import BaseModel, Field
 
 QDRANT_URL = "http://127.0.0.1:6333"
 COLLECTION = "papers_fulltext"
-EMBED_URL = "http://127.0.0.1:8005/embed"
+EMBED_URL = "http://127.0.0.1:8006/embed"
+EMBED_BATCH_URL = "http://127.0.0.1:8006/embed_batch"
+QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 KEYS_PATH = Path("/opt/dtox-research-api/keys.json")
 
 ALLOWED_LAYERS = {"llm-slm", "web3", "ai-agents"}
@@ -53,6 +55,12 @@ def require_api_key(x_api_key: Optional[str]):
     info = keys.get(x_api_key)
     if not info:
         raise HTTPException(status_code=401, detail="Invalid API key")
+    # A key handed out for a trial should stop working on its own. Keys without
+    # an "expires" field are permanent, so this changes nothing for them.
+    expires = info.get("expires")
+    if expires and datetime.now(timezone.utc).isoformat() > expires:
+        raise HTTPException(status_code=401,
+                            detail=f"API key expired on {expires[:10]}")
     return x_api_key, info
 
 
@@ -122,6 +130,8 @@ class TTLCache:
 
 
 search_cache = TTLCache(ttl_seconds=600, max_size=500)
+embedding_cache = TTLCache(ttl_seconds=1800, max_size=2000)
+qdrant_result_cache = TTLCache(ttl_seconds=600, max_size=1000)
 
 
 # ---------------- lexical half of the search ----------------
@@ -276,6 +286,10 @@ EMBED_WAIT_TIMEOUT = 25
 
 
 def embed_query(text: str) -> List[float]:
+    text = (text or "").strip()
+    cached = embedding_cache.get(text)
+    if cached is not None:
+        return cached
     if not API_EMBED_SLOTS.acquire(timeout=EMBED_WAIT_TIMEOUT):
         raise HTTPException(
             status_code=503,
@@ -283,21 +297,120 @@ def embed_query(text: str) -> List[float]:
     try:
         resp = requests.post(EMBED_URL, json={"text": text, "query": True}, timeout=30)
         resp.raise_for_status()
-        return resp.json()["vector"]
+        vector = resp.json()["vector"]
+        embedding_cache.set(text, vector)
+        return vector
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"embed service error: {e}")
     finally:
         API_EMBED_SLOTS.release()
 
 
+def prime_query_embeddings(texts):
+    """Embed the known audit phrasings in small batches before retrieval.
+
+    validate_project used to run the same ONNX graph separately for the idea,
+    claim, and every rephrasing, then repeat several of them during coverage.
+    The passage batch endpoint accepts raw text, so prepend the exact BGE query
+    instruction here and seed the ordinary embedding cache with its vectors.
+    Unknown corpus-vocabulary expansions still fall back to embed_query.
+    """
+    pending = []
+    seen = set()
+    for raw in texts:
+        text = (raw or "").strip()
+        if text and text not in seen and embedding_cache.get(text) is None:
+            seen.add(text)
+            pending.append(text)
+    for start in range(0, len(pending), 8):
+        batch = pending[start:start + 8]
+        if not API_EMBED_SLOTS.acquire(timeout=EMBED_WAIT_TIMEOUT):
+            return
+        try:
+            resp = requests.post(
+                EMBED_BATCH_URL,
+                json={"texts": [QUERY_INSTRUCTION + text for text in batch]},
+                timeout=60,
+            )
+            resp.raise_for_status()
+            vectors = resp.json().get("vectors") or []
+            if len(vectors) != len(batch):
+                return
+            for text, vector in zip(batch, vectors):
+                embedding_cache.set(text, vector)
+        except requests.RequestException:
+            return
+        finally:
+            API_EMBED_SLOTS.release()
+
+
+def _qdrant_cache_key(vector, qfilter):
+    vector_key = hashlib.sha1(
+        json.dumps(vector, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    filter_key = json.dumps(qfilter, sort_keys=True, separators=(",", ":")) if qfilter else ""
+    return vector_key, filter_key
+
+
+def prime_qdrant_searches(texts, layer, limit=80):
+    """Batch the known layer-filtered searches of one audit into one request.
+
+    Scope, coverage, and evidence all ask Qdrant for the same vector and layer.
+    Priming their shared cache through search/batch removes the serial network
+    and scheduler round-trips. Unscoped audits are left alone because priming
+    every text across all three layers would multiply work rather than merge it.
+    """
+    if not layer:
+        return
+    qfilter = {"must": [{"key": "layers", "match": {"any": [layer]}}]}
+    searches, keys = [], []
+    seen = set()
+    for raw in texts:
+        text = (raw or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        vector = embedding_cache.get(text)
+        if vector is None:
+            continue
+        key = _qdrant_cache_key(vector, qfilter)
+        cached = qdrant_result_cache.get(key)
+        if cached is not None and cached["limit"] >= limit:
+            continue
+        searches.append({"vector": vector, "filter": qfilter, "limit": limit,
+                         "with_payload": True})
+        keys.append(key)
+    if not searches:
+        return
+    try:
+        resp = requests.post(
+            f"{QDRANT_URL}/collections/{COLLECTION}/points/search/batch",
+            json={"searches": searches}, timeout=60,
+        )
+        resp.raise_for_status()
+        result_sets = resp.json().get("result") or []
+        if len(result_sets) != len(keys):
+            return
+        for key, results in zip(keys, result_sets):
+            qdrant_result_cache.set(key, {"limit": limit, "results": results})
+    except requests.RequestException:
+        return
+
+
 def qdrant_search(vector, qfilter, limit):
+    cache_key = _qdrant_cache_key(vector, qfilter)
+    cached = qdrant_result_cache.get(cache_key)
+    if cached is not None and cached["limit"] >= limit:
+        return cached["results"][:limit]
     body = {"vector": vector, "limit": limit, "with_payload": True}
     if qfilter:
         body["filter"] = qfilter
     try:
-        resp = requests.post(f"{QDRANT_URL}/collections/{COLLECTION}/points/search", json=body, timeout=30)
+        resp = requests.post(f"{QDRANT_URL}/collections/{COLLECTION}/points/search", json=body, timeout=45)
         resp.raise_for_status()
-        return resp.json()["result"]
+        results = resp.json()["result"]
+        qdrant_result_cache.set(cache_key, {"limit": limit, "results": results})
+        return results
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"qdrant error: {e}")
 
@@ -356,6 +469,8 @@ SOURCE_LABELS = {
     "eip": "Ethereum EIP",
     "simd": "Solana SIMD",
     "wp": "Industry whitepaper",
+    "oa": "OpenAlex open-access work",
+    "pmlr": "Proceedings of Machine Learning Research",
     "arxiv": "arXiv",
 }
 
@@ -381,6 +496,10 @@ def source_url(paper_id, payload=None):
                 f"/blob/main/proposals/{pid.split(':', 1)[1]}")
     if pid.startswith("wp:"):
         return None  # curated document with no stored origin yet
+    if pid.startswith("oa:"):
+        return payload.get("url") if payload else f"https://openalex.org/{pid.split(':', 1)[1]}"
+    if pid.startswith("pmlr:"):
+        return payload.get("url") if payload else f"https://proceedings.mlr.press/{pid.split(':', 1)[1]}.html"
     return f"https://arxiv.org/abs/{pid}"
 
 
@@ -420,6 +539,16 @@ LICENSE_INFO = {
         "terms": "Published by the project itself and freely available; "
                  "copyright normally stays with the authors.",
         "redistribution": "quote fragments with attribution and a link to the original",
+    },
+    "oa": {
+        "spdx": None,
+        "terms": "Open-access copy discovered through OpenAlex. Licence is set per work; check the linked source before reuse.",
+        "redistribution": "quote fragments with attribution; check the source licence",
+    },
+    "pmlr": {
+        "spdx": None,
+        "terms": "PMLR proceedings are published as freely accessible papers; copyright and reuse terms remain paper-specific.",
+        "redistribution": "quote fragments with attribution and link the paper page",
     },
 }
 
@@ -877,7 +1006,14 @@ def _papers_about(topic, layer=None):
     and hands the ids to the same counting code."""
     must = [{"key": "layers", "match": {"any": [layer]}}] if layer else []
     vector = embed_query(topic)
-    hits = qdrant_search(vector, {"must": must} if must else None, TOPIC_PAPER_LIMIT * 3)
+    # Asking for 1,800 chunks became slower than Qdrant's 30-second request
+    # budget once the collection passed five million points. Trends need a
+    # representative topic sample, not an exhaustive nearest-neighbour scan.
+    # 200 candidates cover the high-confidence neighbourhood used by trend
+    # analysis. Larger requests time out against a five-million-point live
+    # collection while mostly adding duplicate chunks below TOPIC_MIN_SCORE.
+    candidate_limit = min(TOPIC_PAPER_LIMIT, 200)
+    hits = qdrant_search(vector, {"must": must} if must else None, candidate_limit)
     ids = []
     seen = set()
     for h in hits:
@@ -1218,7 +1354,7 @@ BAND_EPSILON = 0.006
 # bottleneck. So it fires only where the cheap signals are genuinely undecided
 # -- nobody has read this claim, and the best hit sits in the grey zone around
 # the band -- and never on the ordinary case that the bands already settle.
-RERANK_URL = os.getenv("RERANK_URL", "http://127.0.0.1:8005/rerank")
+RERANK_URL = os.getenv("RERANK_URL", "http://127.0.0.1:8006/rerank")
 RERANK_ENABLED = os.getenv("RERANK_ENABLED", "0") == "1"
 RERANK_UNCERTAINTY = 0.02   # distance from the direct band that counts as grey
 RERANK_TOP_N = 8
@@ -1296,7 +1432,7 @@ def _evidence_band(hit, requested_layer=None, claim_words=None):
 
 # IACR mirrors nothing but titles and abstracts, so a section or element filter
 # silently cannot apply there. The caller has to be told which it is looking at.
-FULLTEXT_SOURCES = {"arxiv", "eip", "simd", "wp"}
+FULLTEXT_SOURCES = {"arxiv", "eip", "simd", "wp", "oa"}
 
 
 def _paper_facts(paper_ids):
@@ -1320,7 +1456,8 @@ def _paper_facts(paper_ids):
     return {r[0]: r[1] for r in rows}
 
 
-COVERAGE_PROBE_LIMIT = 400
+COVERAGE_PROBE_LIMIT = 80
+FAST_COVERAGE_PROBE_LIMIT = 40
 # An idea outside the three niches must be refused, not answered. Cosine is
 # useless for deciding this -- a CRISPR idea still scores 0.79 against LLM
 # papers -- but coverage is decisive: measured, CRISPR and soft robotics have
@@ -1328,8 +1465,42 @@ COVERAGE_PROBE_LIMIT = 400
 IN_SCOPE_MIN_PAPERS = 3
 THIN_COVERAGE_PAPERS = 10
 
+# Semantic similarity cannot define the boundary of a specialist index. A
+# CRISPR claim matched CRISPR-GPT, which is an LLM-agent paper mentioning gene
+# editing examples, and was therefore audited as biology. Explicit foreign
+# domains are refused unless the request also names an anchor of one of the
+# three indexed niches. This still admits "an LLM agent for CRISPR design" but
+# refuses "correct a liver mutation with CRISPR".
+INDEX_SCOPE_ANCHORS = re.compile(
+    r"\b(?:large language model|small language model|language model|llm|slm|"
+    r"transformer|kv[ -]?cache|retrieval[ -]?augmented|rag|ai agent|llm agent|"
+    r"agentic|autonomous agent|multi[ -]?agent|blockchain|web3|smart contract|"
+    r"zero[ -]?knowledge|zk[ -]?(?:proof|rollup|snark|stark)|rollup|solana|"
+    r"ethereum|defi|mev|cryptograph\w*|consensus|validator|wallet)\b", re.I)
+FOREIGN_SCOPE_DOMAINS = {
+    "biomedicine": re.compile(
+        r"\b(?:crispr|gene[ -]?edit\w*|genome[ -]?edit\w*|hepatocyte\w*|"
+        r"liver cell\w*|point mutation\w*|base edit(?:ing|or)|clinical trial|"
+        r"protein mutation\w*|drug discovery)\b", re.I),
+    "materials_science": re.compile(
+        r"\b(?:perovskite|photovoltaic|solar cell\w*|humidity degradation|"
+        r"battery electrolyte|crystal lattice)\b", re.I),
+    "mechanical_robotics": re.compile(
+        r"\b(?:soft robotic gripper|soft gripper|tactile feedback control|"
+        r"warehouse picking|robotic manipulation)\b", re.I),
+}
 
-def _topic_coverage(text, layer=None, strict=False):
+
+def _foreign_scope_domain(text):
+    if INDEX_SCOPE_ANCHORS.search(text or ""):
+        return None
+    for domain, pattern in FOREIGN_SCOPE_DOMAINS.items():
+        if pattern.search(text or ""):
+            return domain
+    return None
+
+
+def _topic_coverage(text, layer=None, strict=False, probe_limit=None):
     """How many papers this index holds on the subject of one claim, per layer.
 
     "No match" means one thing over 800 papers and another over 3, and that
@@ -1339,6 +1510,7 @@ def _topic_coverage(text, layer=None, strict=False):
     robotics reaches 1 paper and CRISPR 2, while a parimutuel market reaches 50
     and MEV 23. One embedding, one vector query per layer."""
     layers = [layer] if layer else sorted(SCORE_BANDS_BY_LAYER)
+    probe_limit = probe_limit or COVERAGE_PROBE_LIMIT
     try:
         vector = embed_query(text)
     except HTTPException:
@@ -1361,7 +1533,7 @@ def _topic_coverage(text, layer=None, strict=False):
         try:
             hits = qdrant_search(vector, {"must": [{"key": "layers",
                                                     "match": {"any": [lay]}}]},
-                                 COVERAGE_PROBE_LIMIT)
+                                 probe_limit)
         except HTTPException:
             continue
         papers, reaches_band = set(), False
@@ -2209,6 +2381,7 @@ class ValidateBody(BaseModel):
     claims: List[Union[str, ClaimSpec]] = Field(..., min_length=1)
     layer: Optional[str] = None
     evidence_per_claim: int = Field(default=4, ge=1, le=10)
+    depth: str = "full"
 
 
 @app.post("/v1/validate")
@@ -2234,12 +2407,47 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
         raise HTTPException(status_code=400, detail="at least one claim required")
     if body.layer is not None and body.layer not in ALLOWED_LAYERS:
         raise HTTPException(status_code=400, detail=f"layer must be one of {sorted(ALLOWED_LAYERS)}")
+    if body.depth not in {"fast", "full"}:
+        raise HTTPException(status_code=400, detail="depth must be 'fast' or 'full'")
+    fast_mode = body.depth == "fast"
 
     corpus = _corpus_stats()
     corpus["as_of"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     corpus["note"] = ("The index grows continuously, so a verdict is only "
                       "reproducible against the same as_of date. Cite it.")
     layer_size = corpus.get("by_layer", {}).get(body.layer) if body.layer else corpus.get("papers_indexed")
+
+    scope_text = " ".join([idea] + [text for text, _ in claim_specs] +
+                          [p for _, phrasings in claim_specs for p in phrasings])
+    foreign_domain = _foreign_scope_domain(scope_text)
+    if foreign_domain:
+        return {
+            "idea": idea,
+            "in_scope": False,
+            "verdict": "out_of_index_scope",
+            "corpus": corpus,
+            "headline": ("The request is about a domain outside this specialist "
+                         "index, so no literature audit was run. This says nothing "
+                         "about novelty in the wider literature."),
+            "scope_reason": "explicit_foreign_domain_without_index_anchor",
+            "foreign_domain": foreign_domain,
+            "covered_topics": ["large and small language models", "AI agents",
+                               "web3 and applied cryptography"],
+            "what_to_do": ("Use a scientific index for this domain. If the actual "
+                           "claim is about applying an LLM, an AI agent, or web3 to "
+                           "it, state that mechanism explicitly and run the audit again."),
+        }
+
+    prime_query_embeddings(
+        [idea] + [text for text, _ in claim_specs] +
+        [phrasing for _, phrasings in claim_specs for phrasing in phrasings]
+    )
+    prime_qdrant_searches(
+        [idea] + [text for text, _ in claim_specs] +
+        [phrasing for _, phrasings in claim_specs for phrasing in phrasings],
+        body.layer,
+        FAST_COVERAGE_PROBE_LIMIT if fast_mode else COVERAGE_PROBE_LIMIT,
+    )
 
     # Scope check before anything else: a robotics or biotech idea would
     # otherwise collect a page of "no match in corpus" and read as a clean bill.
@@ -2252,10 +2460,14 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
     def _coverage_of(text, strict=False):
         key = (text, strict)
         if key not in coverage_cache:
-            coverage_cache[key] = _topic_coverage(text, body.layer, strict)
+            coverage_cache[key] = _topic_coverage(
+                text, body.layer, strict,
+                FAST_COVERAGE_PROBE_LIMIT if fast_mode else COVERAGE_PROBE_LIMIT,
+            )
         return coverage_cache[key]
 
     idea_coverage, idea_by_layer, idea_best = _coverage_of(idea)
+    coverage_probes_succeeded = 1 if idea_coverage is not None else 0
     scope_best = idea_coverage or 0
     scope_by_layer = dict(idea_by_layer or {})
     for text, phrasings in claim_specs:
@@ -2263,10 +2475,19 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
             got, by_layer, best = _coverage_of(probe)
             if got is None:
                 continue
+            coverage_probes_succeeded += 1
             scope_best = max(scope_best, got)
             for lay, n in (by_layer or {}).items():
                 scope_by_layer[lay] = max(scope_by_layer.get(lay, 0), n)
             idea_best = max(idea_best or 0, best or 0)
+    # Infrastructure failure is not evidence that a topic is outside the
+    # corpus. Previously an embed timeout turned every failed probe into zero
+    # coverage and produced a confident out_of_index_scope verdict.
+    if not coverage_probes_succeeded:
+        raise HTTPException(
+            status_code=503,
+            detail="scope could not be measured because retrieval is temporarily unavailable",
+        )
     if scope_best < IN_SCOPE_MIN_PAPERS:
         return {
             "idea": idea,
@@ -2412,31 +2633,29 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
         # seeding only from today's hits made the graph inherit the mistake it
         # was meant to fix: a wording that missed the precedents expanded from
         # the wrong neighbourhood. Papers on the record are seeds by right.
-        seeds = list(dict.fromkeys(
-            [pid for pid in registry] + [h["arxiv_id"] for h in found[:GRAPH_SEED_PAPERS]]
-        ))[:GRAPH_SEED_PAPERS + 3]
-        neighbours = _citation_neighbours(seeds)
-        known = {h["arxiv_id"] for h in found}
-        wanted = [pid for pid in neighbours if pid not in known]
-        graph_added = []
-        if wanted:
-            scored = _score_specific_papers(claim, wanted, body.layer)
-            facts2 = _paper_facts([h["arxiv_id"] for h in scored])
-            for h in scored:
-                info = neighbours[h["arxiv_id"]]
-                h["niche_score"] = facts2.get(h["arxiv_id"])
-                h["citation_support"] = info["support"]
-                h["found_via"] = (f"citation graph: {info['relation']} "
-                                  f"{', '.join(info['via'])}")
-                # a paper several independent hits point at is the canonical
-                # one for the subject; worth a nudge, never worth a rank of
-                # its own
-                h["citation_weight"] = info["weight"]
-                h["cited_in_index"] = info["cited_in_index"]
-                h["graph_bonus"] = min(3.0, info["weight"]) * GRAPH_SUPPORT_BONUS
-                graph_added.append(h)
-            found = found + graph_added
-            found.sort(key=lambda h: -(_rank_score(h) + h.get("graph_bonus", 0)))
+        seeds, neighbours, graph_added = [], {}, []
+        if not fast_mode:
+            seeds = list(dict.fromkeys(
+                [pid for pid in registry] + [h["arxiv_id"] for h in found[:GRAPH_SEED_PAPERS]]
+            ))[:GRAPH_SEED_PAPERS + 3]
+            neighbours = _citation_neighbours(seeds)
+            known = {h["arxiv_id"] for h in found}
+            wanted = [pid for pid in neighbours if pid not in known]
+            if wanted:
+                scored = _score_specific_papers(claim, wanted, body.layer)
+                facts2 = _paper_facts([h["arxiv_id"] for h in scored])
+                for h in scored:
+                    info = neighbours[h["arxiv_id"]]
+                    h["niche_score"] = facts2.get(h["arxiv_id"])
+                    h["citation_support"] = info["support"]
+                    h["found_via"] = (f"citation graph: {info['relation']} "
+                                      f"{', '.join(info['via'])}")
+                    h["citation_weight"] = info["weight"]
+                    h["cited_in_index"] = info["cited_in_index"]
+                    h["graph_bonus"] = min(3.0, info["weight"]) * GRAPH_SUPPORT_BONUS
+                    graph_added.append(h)
+                found = found + graph_added
+                found.sort(key=lambda h: -(_rank_score(h) + h.get("graph_bonus", 0)))
 
         # the second proposal channel: nodes already judged against the papers
         # this search returned, regardless of how either claim was worded
@@ -2482,7 +2701,7 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
                             and rec["counts"].get("does_not_assert", 0) == 0}
         claim_words = _distinctive_words(claim, body.layer)
         rerank_report, rerank_order = None, {}
-        if _needs_rerank(hits, body.layer, registry):
+        if not fast_mode and _needs_rerank(hits, body.layer, registry):
             candidates = hits[:RERANK_TOP_N]
             ce_scores = _rerank(claim, candidates)
             if ce_scores:
@@ -2613,37 +2832,38 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
         # for them separately answered with whoever happened to match the claim
         # wording, so every limitation arrived flagged from_cited_paper=false
         # and start_here stayed empty while the section existed all along.
-        found_limits = []
-        for pid in list(cited_ids)[:4]:
-            try:
-                points = qdrant_scroll_by_arxiv(pid, limit=200)
-            except HTTPException:
-                continue
-            for pt in points:
-                pay = pt.get("payload") or {}
-                # prose only: a figure macro from the limitations section is
-                # technically a limitations chunk and tells the reader nothing
-                if ((pay.get("section_type") or "") == "limitations"
-                        and (pay.get("element_type") or "prose") == "prose"
-                        and pay.get("text")):
-                    found_limits.append({"arxiv_id": pid, "title": pay.get("title"),
-                                         "year": pay.get("year"), "text": pay.get("text")})
-                    break
-        found_limits += _search(claim, section_type="limitations")
-        limitations = ([l for l in found_limits if l["arxiv_id"] in cited_ids]
-                       + [l for l in found_limits if l["arxiv_id"] not in cited_ids])[:3]
-        formulas = []
-        if hits:
-            try:
-                spec = paper_spec(hits[0]["arxiv_id"], target_elements="algorithm,equation",
-                                  max_chars=2500, x_api_key=x_api_key)
-                formulas = spec.get("sections", [])[:2]
-            except HTTPException:
-                formulas = []
+        found_limits, limitations, formulas = [], [], []
+        if not fast_mode:
+            for pid in list(cited_ids)[:4]:
+                try:
+                    points = qdrant_scroll_by_arxiv(pid, limit=200)
+                except HTTPException:
+                    continue
+                for pt in points:
+                    pay = pt.get("payload") or {}
+                    if ((pay.get("section_type") or "") == "limitations"
+                            and (pay.get("element_type") or "prose") == "prose"
+                            and pay.get("text")):
+                        found_limits.append({"arxiv_id": pid, "title": pay.get("title"),
+                                             "year": pay.get("year"), "text": pay.get("text")})
+                        break
+            found_limits += _search(claim, section_type="limitations")
+            limitations = ([l for l in found_limits if l["arxiv_id"] in cited_ids]
+                           + [l for l in found_limits if l["arxiv_id"] not in cited_ids])[:3]
+            if hits:
+                try:
+                    spec = paper_spec(hits[0]["arxiv_id"], target_elements="algorithm,equation",
+                                      max_chars=2500, x_api_key=x_api_key)
+                    formulas = spec.get("sections", [])[:2]
+                except HTTPException:
+                    formulas = []
 
         years = [h.get("year") for h in hits if h.get("year")]
         claim_reports.append({
             "claim": claim,
+            "depth": body.depth,
+            "deferred_sections": (["citation_graph", "cross_encoder", "limitations",
+                                   "supporting_math"] if fast_mode else []),
             "reranked": rerank_report,
             "phrasings_searched": queries_used,
             "claim_id": claim_id,
@@ -2688,11 +2908,18 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
             },
             "corpus_coverage": {
                 "papers_about_this_claim": coverage,
+                "is_lower_bound": coverage >= (FAST_COVERAGE_PROBE_LIMIT if fast_mode
+                                                else COVERAGE_PROBE_LIMIT),
+                "probe_cap": (FAST_COVERAGE_PROBE_LIMIT if fast_mode
+                              else COVERAGE_PROBE_LIMIT),
                 "by_layer": coverage_by_layer,
                 "how_counted": ("papers_about_this_claim is the largest of the "
                                 "per-layer counts, not their sum: a paper can sit "
                                 "in several layers and each layer is probed with "
-                                "its own filter and its own band"),
+                                "its own filter and its own band. When is_lower_bound "
+                                "is true, the subject has at least probe_cap papers; "
+                                "the endpoint stops counting there to keep audits "
+                                "responsive while the live index is being written"),
                 "depth": _coverage_grade(coverage),
                 "reading": ("A quiet result over a well-covered subject is a real "
                             "signal; over a thin one it only shows the index is thin."

@@ -12,6 +12,7 @@ cursor resumes from its saved next_start.
 
 import fcntl
 import gzip
+import html
 import io
 import json
 import logging
@@ -82,8 +83,14 @@ S2_FIELDS = ("citationCount,influentialCitationCount,venue,year,publicationVenue
 # Affiliation is a weak channel here and the code should not pretend otherwise:
 # Semantic Scholar fills it for roughly one author in eight, so it admits
 # papers when present and never rejects on absence.
-SOTA_MAX_AGE_MONTHS = 6
-SOTA_MIN_NICHE = 5
+SOTA_MAX_AGE_MONTHS = 12
+SOTA_MIN_NICHE = 4
+# A strong lexical fit is itself a quality signal in narrow fields where raw
+# citation counts lag badly. These two lanes only run after the deterministic
+# niche filter has accepted the paper; they do not weaken the off-topic gate.
+STRONG_NICHE_AUTO_PASS = 8
+NICHE_CITATION_PASS_SCORE = 3
+NICHE_CITATION_PASS_MIN = 3
 TOP_LABS = (
     "google", "deepmind", "google brain", "openai", "anthropic", "meta ai",
     "facebook ai", "microsoft research", "nvidia", "mistral", "cohere",
@@ -311,6 +318,14 @@ OPENALEX_QUERIES = (
 )
 openalex_gate = _ArxivGate(1.0)
 
+# Proceedings of Machine Learning Research: peer-reviewed, openly hosted PDF
+# proceedings (ICML, AISTATS, CoRL and many workshops).  It supplies a large
+# historical pool outside arXiv and is especially useful for LLM/agent methods.
+PMLR_ID_PREFIX = "pmlr:"
+PMLR_INDEX_URL = "https://proceedings.mlr.press/"
+PMLR_MIN_VOLUME = 100
+PMLR_REFRESH_VOLUMES = 5
+
 IACR_ID_PREFIX = "iacr:"
 IACR_DELAY_SECONDS = 3
 IACR_START_YEAR = 2016
@@ -366,7 +381,8 @@ def is_spec_source(paper_id) -> bool:
 def is_non_arxiv(paper_id) -> bool:
     """True for sources Semantic Scholar does not index (IACR, EIP, SIMD)."""
     return str(paper_id).startswith((IACR_ID_PREFIX, EIP_ID_PREFIX, SIMD_ID_PREFIX,
-                                     ACL_ID_PREFIX, OPENALEX_ID_PREFIX))
+                                     ACL_ID_PREFIX, OPENALEX_ID_PREFIX,
+                                     PMLR_ID_PREFIX))
 
 
 def _parse_front_matter(text):
@@ -923,6 +939,10 @@ def pick_next_query(conn):
         row = conn.execute(
             "SELECT query_key FROM harvest_cursor "
             f"WHERE done=0 AND (query_key IN ({placeholders}) OR layer=?) "
+            "AND query_key NOT LIKE 'acl@%' "
+            "AND query_key NOT LIKE 'openalex@%' "
+            "AND query_key NOT LIKE 'openalex-fresh@%' "
+            "AND query_key NOT LIKE 'pmlr@%' "
             "ORDER BY (last_run_at IS NOT NULL), last_run_at ASC LIMIT 1",
             keys + [layer],
         ).fetchone()
@@ -1295,6 +1315,11 @@ def quality_verdict(venue, citation_count, influential, year, arxiv_id=None,
     if any(v in venue_l for v in TOP_VENUES):
         return "pass"
     if (influential or 0) >= 3:
+        return "pass"
+    if (niche_score or 0) >= STRONG_NICHE_AUTO_PASS:
+        return "pass"
+    if ((niche_score or 0) >= NICHE_CITATION_PASS_SCORE
+            and (citation_count or 0) >= NICHE_CITATION_PASS_MIN):
         return "pass"
     age_months = paper_age_months(arxiv_id, year)
     # the SOTA lane: too new to be cited, admitted on what it is rather than on
@@ -1793,7 +1818,7 @@ def _fetch_one_fulltext(arxiv_id, stored_abstract=None, source_url=None):
         # keeps the section headings, which is what the chunker reads.
         return _fetch_acl_fulltext(arxiv_id, stored_abstract)
 
-    if str(arxiv_id).startswith(OPENALEX_ID_PREFIX):
+    if str(arxiv_id).startswith((OPENALEX_ID_PREFIX, PMLR_ID_PREFIX)):
         return _fetch_openalex_fulltext(arxiv_id, source_url, stored_abstract)
 
     if str(arxiv_id).startswith(IACR_ID_PREFIX):
@@ -2569,6 +2594,91 @@ def openalex_harvest_step(conn, session):
     return taken
 
 
+def _plain_html(value):
+    return " ".join(html.unescape(re.sub(r"<[^>]+>", " ", value or "")).split())
+
+
+def pmlr_seed_cursors(conn, session):
+    """Discover new PMLR volumes daily and reopen only the newest few."""
+    if not _poll_due(conn, "pmlr:tree", SPEC_REFRESH_SECONDS):
+        return 0
+    try:
+        resp = session.get(PMLR_INDEX_URL, timeout=60,
+                           headers={"User-Agent": ARXIV_CONTACT_UA})
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        log.warning(f"pmlr: index failed: {e}")
+        return 0
+    volumes = sorted({int(v) for v in re.findall(r'href=["\'][^"\']*v(\d+)/?["\']', resp.text)
+                      if int(v) >= PMLR_MIN_VOLUME}, reverse=True)
+    added = 0
+    for volume in volumes:
+        before = conn.total_changes
+        conn.execute(
+            "INSERT OR IGNORE INTO harvest_cursor "
+            "(query_key,next_start,done,layer) VALUES (?,0,0,'llm-slm')",
+            (f"pmlr@v{volume}",))
+        added += conn.total_changes - before
+    for volume in volumes[:PMLR_REFRESH_VOLUMES]:
+        conn.execute(
+            "UPDATE harvest_cursor SET done=0,last_run_at=NULL "
+            "WHERE query_key=?", (f"pmlr@v{volume}",))
+    conn.commit()
+    _mark_polled(conn, "pmlr:tree")
+    log.info(f"pmlr: {added} new volumes, {len(volumes)} known")
+    return added
+
+
+def pmlr_harvest_step(conn, session):
+    """Read one PMLR volume; title and PDF URL are present on its index page."""
+    pmlr_seed_cursors(conn, session)
+    row = conn.execute(
+        "SELECT query_key FROM harvest_cursor WHERE query_key LIKE 'pmlr@%' AND done=0 "
+        "ORDER BY CAST(substr(query_key,7) AS INTEGER) DESC LIMIT 1").fetchone()
+    if row is None:
+        return 0
+    key = row["query_key"]
+    volume = key.split("@v", 1)[1]
+    url = f"{PMLR_INDEX_URL}v{volume}/"
+    try:
+        resp = session.get(url, timeout=90, headers={"User-Agent": ARXIV_CONTACT_UA})
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        log.warning(f"pmlr: volume v{volume} failed: {e}")
+        return 0
+    published = re.search(
+        r"Published\s+as\s+Volume.*?(20\d{2})",
+        resp.text[:10000], re.I | re.S,
+    )
+    year = int(published.group(1)) if published else 0
+    taken = 0
+    blocks = re.findall(r'<div class="paper">(.*?)</div>', resp.text, re.I | re.S)
+    for block in blocks:
+        title_m = re.search(r'<p class="title">(.*?)</p>', block, re.I | re.S)
+        pdf_m = re.search(r'href="([^"]+\.pdf)"', block, re.I)
+        abs_m = re.search(r'href="https?://proceedings\.mlr\.press/(v\d+/[^"/]+)\.html"',
+                          block, re.I)
+        venue_m = re.search(r'<span class="info">\s*<i>(.*?)</i>', block, re.I | re.S)
+        if not title_m or not pdf_m or not abs_m:
+            continue
+        title = _plain_html(title_m.group(1))
+        if not title:
+            continue
+        upsert_discovered(
+            conn, f"{PMLR_ID_PREFIX}{abs_m.group(1)}", title, year, "llm-slm",
+            source_url=html.unescape(pdf_m.group(1)),
+            venue=_plain_html(venue_m.group(1)) if venue_m else "PMLR",
+            commit=False,
+        )
+        taken += 1
+    conn.execute(
+        "UPDATE harvest_cursor SET next_start=?,done=1,last_run_at=? WHERE query_key=?",
+        (taken, now_iso(), key))
+    conn.commit()
+    log.info(f"pmlr: v{volume} -> {taken} papers")
+    return taken
+
+
 def graph_harvest_step(conn, session):
     """Pull in works the corpus cites but does not hold."""
     global _graph_queue
@@ -2616,6 +2726,7 @@ STAGES = (
     ("graph_harvest", graph_harvest_step, True),
     ("acl_harvest", lambda conn: acl_harvest_step(conn), False),
     ("openalex", openalex_harvest_step, True),
+    ("pmlr", pmlr_harvest_step, True),
     ("quality", quality_step, True),
     ("fulltext", lambda conn: fulltext_step(conn), False),
     ("chunk", chunk_step, True),
