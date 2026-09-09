@@ -177,7 +177,7 @@ s2_gate = _ArxivGate(S2_PAUSE)
 
 CHUNK_CYCLE_LIMIT = 200          # local CPU work, no external rate limits
 
-EMBED_CYCLE_LIMIT = 150         # stage runs continuously now, not once per cycle
+EMBED_CYCLE_LIMIT = 20          # bound commit latency; throughput still comes from 64-chunk batches
                                   # bounds how much work one cycle looks at, not how long until progress lands)
 # Two 64-text requests can overlap at full 512-token padding and push the
 # shared ONNX arena past the container's 9 GiB limit. 32 keeps the same two
