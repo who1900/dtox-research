@@ -84,13 +84,13 @@ S2_FIELDS = ("citationCount,influentialCitationCount,venue,year,publicationVenue
 # Semantic Scholar fills it for roughly one author in eight, so it admits
 # papers when present and never rejects on absence.
 SOTA_MAX_AGE_MONTHS = 12
-SOTA_MIN_NICHE = 4
+SOTA_MIN_NICHE = 3
 # A strong lexical fit is itself a quality signal in narrow fields where raw
 # citation counts lag badly. These two lanes only run after the deterministic
 # niche filter has accepted the paper; they do not weaken the off-topic gate.
-STRONG_NICHE_AUTO_PASS = 8
+STRONG_NICHE_AUTO_PASS = 7
 NICHE_CITATION_PASS_SCORE = 3
-NICHE_CITATION_PASS_MIN = 3
+NICHE_CITATION_PASS_MIN = 1
 TOP_LABS = (
     "google", "deepmind", "google brain", "openai", "anthropic", "meta ai",
     "facebook ai", "microsoft research", "nvidia", "mistral", "cohere",
