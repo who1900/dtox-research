@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>dtox research × x402 — product validation</title>
+  <style>
+    :root{color-scheme:light;--bg:#fafaf3;--ink:#1a1a1a;--muted:#686860;--panel:#f0f0e7;--good:#245c3a;--warn:#8a5a12}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 Inter,Arial,sans-serif}
+    main{max-width:960px;margin:auto;padding:64px 32px 96px}h1{font-size:clamp(42px,8vw,84px);line-height:.92;letter-spacing:-.055em;margin:0 0 28px}h2{margin:56px 0 18px;font-size:25px;letter-spacing:-.025em}h3{margin:26px 0 8px;font-size:17px}p{max-width:760px}.meta,.small{font:12px/1.5 "Roboto Mono",monospace;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}.card{background:var(--panel);padding:24px}.score{font-size:44px;line-height:1;font-weight:700}.go{color:var(--good)}.warn{color:var(--warn)}table{width:100%;border-collapse:collapse;background:var(--panel)}th,td{text-align:left;vertical-align:top;padding:14px 16px;border-bottom:1px solid #d9d9cf}code{font-family:"Roboto Mono",monospace;font-size:.9em}ul,ol{padding-left:22px}li{margin:8px 0}@media(max-width:700px){main{padding:38px 20px 70px}.grid{grid-template-columns:1fr}table{font-size:14px}}
+  </style>
+</head>
+<body><main>
+  <div class="meta">Product validation · 25 Aug 2026</div>
+  <h1>dtox research<br>× x402</h1>
+  <p><strong>Вердикт: запускать платный пилот, не закрывая бесплатный вход.</strong> dtox уже является работающим evidence engine для агентов. x402 подходит ему как машинный pay-per-result слой, но не должен превращать каждый внутренний поиск по Qdrant в отдельную платную транзакцию.</p>
+
+  <div class="grid">
+    <section class="card"><div class="meta">Validation score</div><div class="score go">11/15</div><p>GO для пилота. Не доказан массовый спрос, поэтому ещё не GO для полного закрытия бесплатного MCP.</p></section>
+    <section class="card"><div class="meta">Product thesis</div><p>Продавать не статьи и не «поиск», а компактные доказательные пакеты: источники, формулы, алгоритмы, ограничения, сравнение и честный verdict.</p></section>
+  </div>
+
+  <h2>Почему продукт силён</h2>
+  <ul>
+    <li>Полный текст разбит по структуре: methods, equations, algorithms, tables, results, limitations.</li>
+    <li>Dense, BM25 и citation graph дают три независимых канала recall.</li>
+    <li>Claim registry отделяет «похожий текст» от прочитанного утверждения.</li>
+    <li>Ответы компактнее PDF и пригодны для прямого использования агентом.</li>
+    <li>Система показывает источники, дату снимка корпуса, полноту и границы уверенности.</li>
+  </ul>
+
+  <h2>Что продавать</h2>
+  <table><thead><tr><th>Продукт</th><th>Результат</th><th>Модель доступа</th></tr></thead><tbody>
+    <tr><td>Discovery</td><td>Метаданные, покрытие темы, несколько кандидатов</td><td>Бесплатно и с rate limit</td></tr>
+    <tr><td>Evidence bundle</td><td>Лучшие passages, источники, limitations, provenance</td><td>Низкая фиксированная цена</td></tr>
+    <tr><td>Implementation spec</td><td>Формулы, псевдокод, таблицы и архитектура</td><td>Цена за завершённый пакет</td></tr>
+    <tr><td>Deep audit</td><td>Prior art, feasibility, gaps, сравнение, граф цитирований</td><td>Премиальный вызов</td></tr>
+    <tr><td>Trends / monitoring</td><td>Изменения темы и новые доказательства</td><td>Пакет или prepaid balance</td></tr>
+  </tbody></table>
+
+  <h2>Рекомендуемая архитектура</h2>
+  <ol>
+    <li>Сохранить бесплатные <code>tools/list</code>, preview и coverage.</li>
+    <li>На платный tool-call возвращать x402 v2 <code>402 Payment Required</code> с двумя вариантами оплаты USDC: Base и Solana.</li>
+    <li>После проверки платежа выполнять весь внутренний pipeline как одну атомарную услугу.</li>
+    <li>Использовать idempotency key: повтор после сетевого сбоя не должен списывать деньги второй раз.</li>
+    <li>Публиковать paid tools в Bazaar, чтобы агенты могли обнаруживать сервис автоматически.</li>
+    <li>Ввести spending caps, price discovery и оценку стоимости до подтверждения.</li>
+  </ol>
+
+  <h2>Риски до production</h2>
+  <ul>
+    <li><strong>Спрос:</strong> полезность доказана на собственных тестах, willingness-to-pay ещё нет.</li>
+    <li><strong>Лицензии:</strong> продавать обработку и retrieval; не обещать перепродажу чужих полных текстов.</li>
+    <li><strong>Безопасность:</strong> payment identity нельзя считать доверенным научным читателем; запись в claim registry требует отдельной авторизации.</li>
+    <li><strong>Экономика:</strong> цена должна быть выше p95 себестоимости полного запроса, а не средней.</li>
+    <li><strong>UX агента:</strong> лимит бюджета, подтверждение дорогих вызовов, понятный refund/retry contract.</li>
+  </ul>
+
+  <h2>План проверки за 14 дней</h2>
+  <ol>
+    <li>Сделать shadow pricing: показывать агенту цену, но не списывать.</li>
+    <li>Измерять выбор tool, completion, latency, cache hit, глубину ответа и повторное использование.</li>
+    <li>Дать 10–20 внешним агентам бесплатный баланс и наблюдать, за что они готовы платить повторно.</li>
+    <li>Платными оставить только evidence/spec/deep audit; raw search держать бесплатным.</li>
+    <li>GO: повторные платные вызовы и понятная маржа. PIVOT: пользуются только бесплатным поиском. STOP: evidence не влияет на решения.</li>
+  </ol>
+</main></body></html>

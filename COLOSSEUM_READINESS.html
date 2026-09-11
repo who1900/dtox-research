@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="ru"><meta charset="utf-8"><title>dtox research — Colosseum readiness</title>
+<style>body{max-width:860px;margin:60px auto;padding:0 24px;background:#fafaf3;color:#1a1a1a;font:16px/1.55 Inter,Arial,sans-serif}h1,h2{letter-spacing:-.03em}code{font-family:monospace;background:#ecece4;padding:2px 5px}li{margin:8px 0}</style>
+<h1>dtox research × Crypto World’s Fair</h1>
+<p><strong>Статус:</strong> исследовательское ядро и MCP работают; dual-chain x402 gateway запушен, но пока находится в shadow-режиме. До подачи нужны реальные тестовые платежи и публичный агентный demo flow.</p>
+<h2>Hackathon scope</h2>
+<ol>
+  <li>Один AI-агент покупает доказательный research bundle через x402.</li>
+  <li>Пользователь выбирает оплату USDC через Base или Solana; ответ сервиса одинаков и не привязан к сети.</li>
+  <li>Demo показывает HTTP 402, подпись, успешный settlement, transaction hash и получение MCP-результата.</li>
+  <li>Solana-клиент строится на <code>@solana/kit</code>; Base-клиент — на официальном x402/CDP стеке.</li>
+</ol>
+<h2>Перед подачей</h2>
+<ul>
+  <li>Активировать два testnet receiving address и выполнить end-to-end платежи.</li>
+  <li>Устранить текущий пустой цикл IACR и стабилизировать latency демонстрационных запросов.</li>
+  <li>Сделать GitHub mirror, README quickstart, живой demo и видео до трёх минут.</li>
+  <li>Отдельно перечислить pre-existing code и изменения, сделанные 14 сентября–12 октября.</li>
+</ul>
+</html>
