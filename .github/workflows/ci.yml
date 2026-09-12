@@ -18,6 +18,8 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
+      - run: pip install pip-audit==2.10.1
+      - run: pip-audit -r requirements.txt -r embed/requirements.txt
       - run: python -m compileall -q api mcp ops pipeline embed
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
@@ -36,3 +38,17 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - run: docker build -t dtox-embed:ci embed
+      - run: docker run -d --name dtox-embed-ci -p 127.0.0.1:8005:8080 dtox-embed:ci
+      - run: |
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8005/healthz && break
+            sleep 2
+          done
+          curl -fsS -X POST http://127.0.0.1:8005/embed \
+            -H 'Content-Type: application/json' \
+            -d '{"text":"verifiable delay function","query":true}' \
+            | python -c 'import json,sys; assert len(json.load(sys.stdin)["vector"]) == 384'
+          curl -fsS -X POST http://127.0.0.1:8005/rerank \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"zero knowledge proof","passages":["a zero knowledge proof system"]}' \
+            | python -c 'import json,sys; assert len(json.load(sys.stdin)["scores"]) == 1'

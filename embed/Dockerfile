@@ -7,14 +7,8 @@ ARG RERANK_REVISION=233902d25c440f23af6f7d6e94d2946bac0bee0a
 ENV BGE_REVISION=${BGE_REVISION} \
     RERANK_REVISION=${RERANK_REVISION}
 
-RUN pip install --no-cache-dir \
-    fastapi==0.116.1 \
-    huggingface-hub==0.34.4 \
-    numpy==2.2.6 \
-    onnx==1.18.0 \
-    onnxruntime==1.22.1 \
-    transformers==4.57.1 \
-    uvicorn==0.35.0
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 COPY prepare_models.py /tmp/prepare_models.py
 RUN python /tmp/prepare_models.py && rm /tmp/prepare_models.py

@@ -18,8 +18,8 @@ from pydantic import BaseModel, Field
 
 QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
 COLLECTION = os.getenv("QDRANT_COLLECTION", "papers_fulltext")
-EMBED_URL = os.getenv("EMBED_URL", "http://127.0.0.1:8005/embed")
-EMBED_BATCH_URL = os.getenv("EMBED_BATCH_URL", "http://127.0.0.1:8005/embed_batch")
+EMBED_URL = os.getenv("EMBED_URL", "http://127.0.0.1:8006/embed")
+EMBED_BATCH_URL = os.getenv("EMBED_BATCH_URL", "http://127.0.0.1:8006/embed_batch")
 QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 KEYS_PATH = Path(os.getenv("RESEARCH_KEYS_PATH", "/opt/dtox-research-api/keys.json"))
 
