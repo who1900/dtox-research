@@ -5,7 +5,7 @@ import type { GatewayConfig } from "./config.js";
 type ToolContent = { type: string; text?: string };
 
 export function createResearchUpstream(config: GatewayConfig) {
-  async function call(name: string, args: Record<string, unknown>): Promise<unknown> {
+  async function callOnce(name: string, args: Record<string, unknown>): Promise<unknown> {
     const client = new Client({ name: "dtox-x402-gateway", version: "0.1.0" });
     const transport = new StreamableHTTPClientTransport(new URL(config.upstreamMcpUrl));
     try {
@@ -19,6 +19,17 @@ export function createResearchUpstream(config: GatewayConfig) {
       return parsed;
     } finally {
       await client.close().catch(() => undefined);
+    }
+  }
+
+  async function call(name: string, args: Record<string, unknown>): Promise<unknown> {
+    try {
+      return await callOnce(name, args);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const transient = /timed?\s*out|timeout|could not reach|\b50[234]\b|connection reset/i.test(message);
+      if (!transient) throw error;
+      return callOnce(name, args);
     }
   }
 
