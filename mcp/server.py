@@ -18,13 +18,14 @@ import requests
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-RESEARCH_API_BASE = "http://127.0.0.1:8010"
+RESEARCH_API_BASE = os.getenv("RESEARCH_API_BASE", "http://127.0.0.1:8010")
 RESEARCH_API_KEY = os.getenv("RESEARCH_API_KEY", "")
+REGISTRY_WRITES_ENABLED = os.getenv("MCP_REGISTRY_WRITES_ENABLED", "0") == "1"
 # The MCP server holds a server-side key for the internal API so that MCP
 # clients never need one. Set it in the environment; there is no default.
 
-MCP_HOST = "127.0.0.1"
-MCP_PORT = 8011
+MCP_HOST = os.getenv("MCP_HOST", "127.0.0.1")
+MCP_PORT = int(os.getenv("MCP_PORT", "8011"))
 
 # Server sits behind nginx at https://read.whoim.space/mcp — the Host header
 # seen by uvicorn is the external hostname, so it must be explicitly allowed
@@ -308,6 +309,11 @@ def record_claim_judgment(claim: str, judgments: List[dict],
         "confirmed_prior_art", "ruled_out", "contested") with the number of
         independent readers.
     """
+    if not REGISTRY_WRITES_ENABLED:
+        return {
+            "error": "claim-registry writes are disabled on this public MCP endpoint",
+            "next_step": "use an authenticated/private MCP deployment to submit judgments",
+        }
     try:
         payload = {"claim": claim, "judgments": judgments}
         if layer:
@@ -346,6 +352,11 @@ def link_claim_nodes(claim: str, same_as_claim_id: str, reason: str = "") -> dic
         dict with the node the claim is now filed under and how many judgments
         that node carries.
     """
+    if not REGISTRY_WRITES_ENABLED:
+        return {
+            "error": "claim-registry writes are disabled on this public MCP endpoint",
+            "next_step": "use an authenticated/private MCP deployment to link claims",
+        }
     try:
         resp = requests.post(f"{RESEARCH_API_BASE}/v1/claims/link", headers=_headers(),
                              json={"claim": claim, "same_as_claim_id": same_as_claim_id,

@@ -16,12 +16,12 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-QDRANT_URL = "http://127.0.0.1:6333"
-COLLECTION = "papers_fulltext"
-EMBED_URL = "http://127.0.0.1:8006/embed"
-EMBED_BATCH_URL = "http://127.0.0.1:8006/embed_batch"
+QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
+COLLECTION = os.getenv("QDRANT_COLLECTION", "papers_fulltext")
+EMBED_URL = os.getenv("EMBED_URL", "http://127.0.0.1:8005/embed")
+EMBED_BATCH_URL = os.getenv("EMBED_BATCH_URL", "http://127.0.0.1:8005/embed_batch")
 QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
-KEYS_PATH = Path("/opt/dtox-research-api/keys.json")
+KEYS_PATH = Path(os.getenv("RESEARCH_KEYS_PATH", "/opt/dtox-research-api/keys.json"))
 
 ALLOWED_LAYERS = {"llm-slm", "web3", "ai-agents"}
 SPEC_SECTION_TYPES = {"method", "architecture"}
@@ -141,7 +141,7 @@ qdrant_result_cache = TTLCache(ttl_seconds=600, max_size=1000)
 # between. The lexical index is an FTS5 table built from the payloads Qdrant
 # already holds; sparse vectors inside Qdrant would have meant recreating a
 # collection of 820k points for the same effect.
-FTS_DB_PATH = "/opt/dtox-research/fts.db"
+FTS_DB_PATH = os.getenv("FTS_DB_PATH", "/opt/dtox-research/fts.db")
 RRF_K = 60                 # standard reciprocal rank fusion constant
 BM25_CANDIDATES = 40
 

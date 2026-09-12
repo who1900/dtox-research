@@ -1,0 +1,9 @@
+{
+  "replace-with-a-random-key": {
+    "name": "local",
+    "rate_limit_per_min": 60,
+    "validate_per_min": 8,
+    "adjudicate_per_min": 20,
+    "trends_per_min": 12
+  }
+}

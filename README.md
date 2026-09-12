@@ -1,6 +1,6 @@
 # dtox research
 
-A retrieval service over the **full text** of research papers in three subjects: language models, AI agents, web3 and applied cryptography. It is built for agents rather than for people: the unit it returns is a method section, an equation in raw LaTeX, a results table, or the paragraph where the authors admit what did not work.
+A Web3-first retrieval service over the **full text** of research papers, protocol specifications and technical whitepapers, with AI agents and language models as the two adjacent layers. It is built for agents rather than for people: the unit it returns is a method section, an equation in raw LaTeX, a results table, or the paragraph where the authors admit what did not work.
 
 Live MCP endpoint, no key and no signup:
 
@@ -16,7 +16,7 @@ Other clients: `{"type": "http", "url": "https://read.whoim.space/mcp"}`. Anythi
 
 **Three retrieval channels that fail differently.**
 
-- Dense vectors (bge-small-en-v1.5, int8 ONNX, 384 dim) over ~1M chunks in Qdrant.
+- Dense vectors (bge-small-en-v1.5, int8 ONNX, 384 dim) over millions of structural chunks in Qdrant.
 - Lexical BM25 over the same chunks in SQLite FTS5, fused by reciprocal rank. Exact terms like `GRPO` or `durable nonce` survive here and drown in embeddings alone.
 - The citation graph: one hop through the bibliography of the best hits. This channel does not depend on wording at all, which is the failure mode the other two share.
 
@@ -39,7 +39,7 @@ The failure this service works hardest to avoid is a confident answer where it s
 
 ```
 pipeline/    harvest, quality gate, LaTeX extraction, chunking, embedding,
-             citation graph, deferred re-checks. One systemd service, seven
+             citation graph, deferred re-checks. One systemd service, eight
              stages in threads, SQLite WAL for durability.
 api/         FastAPI: search, spec, compare, trends, validate, adjudicate,
              claim linking. api/tests holds the regression harness.
@@ -52,10 +52,16 @@ ops/         backups with verified restores, monitoring with alerts on
 
 ## Running it
 
-You need Qdrant, the embedding container, and Python 3.12.
+You need Qdrant, Docker, and Python 3.12. Model weights are downloaded from
+their official Hugging Face repositories during the image build; they are not
+stored in git.
 
 ```bash
 cp .env.example .env          # fill in what you need; nothing is required to start
+cp keys.example.json keys.json
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
 docker build -t embed-small embed/
 docker run -d --name embed-small --cpus=6 --memory=9g \
   -e ORT_THREADS=5 -p 127.0.0.1:8005:8080 embed-small
@@ -63,6 +69,14 @@ python3 pipeline/service.py   # ingestion, resumable, safe to kill
 uvicorn api.main:app --port 8010
 python3 mcp/server.py         # needs RESEARCH_API_KEY
 ```
+
+Generate a random local API key, replace the placeholder in `keys.json`, and
+set the same value as `RESEARCH_API_KEY`. Runtime paths and internal service
+URLs can be overridden with the variables documented in `.env.example`.
+
+The public MCP should be read-only. Keep `MCP_REGISTRY_WRITES_ENABLED=0` unless
+the endpoint is protected by per-user authentication; otherwise anonymous
+callers share the server identity and can poison the claim registry.
 
 The pipeline is designed to be killed. Every stage commits per paper, so a crash or a reboot resumes from the last committed status rather than starting over.
 

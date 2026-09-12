@@ -13,7 +13,8 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from transformers import AutoTokenizer
 
-MODEL_DIR = "/app/model"
+MODEL_DIR = os.getenv("MODEL_DIR", "/app/model")
+MODEL_FILE = os.getenv("MODEL_FILE", "model_int8.onnx")
 ORT_THREADS = int(os.getenv("ORT_THREADS", "2"))
 
 QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
@@ -33,7 +34,7 @@ sess_opts.inter_op_num_threads = 1
 # batch sizes steady -- the 14GB footprint seen earlier came from one-off
 # oversized probe batches, not from normal work.
 session = ort.InferenceSession(
-    f"{MODEL_DIR}/model_int8.onnx",
+    f"{MODEL_DIR}/{MODEL_FILE}",
     sess_options=sess_opts,
     providers=["CPUExecutionProvider"],
 )
@@ -104,7 +105,8 @@ def embed_batch_endpoint(req: EmbedBatchRequest) -> EmbedBatchResponse:
 # embedder is the ingestion bottleneck and is already short of CPU, so this
 # must never take cores from it: two threads, and a lock so exactly one rerank
 # runs at a time no matter how many callers arrive.
-RERANK_DIR = "/models/ce"
+RERANK_DIR = os.getenv("RERANK_DIR", "/models/ce")
+RERANK_MODEL_FILE = os.getenv("RERANK_MODEL_FILE", "model_quint8_avx2.onnx")
 RERANK_THREADS = int(os.getenv("RERANK_THREADS", "2"))
 RERANK_MAX_PAIRS = 12
 RERANK_MAX_LEN = 320
@@ -119,7 +121,7 @@ def _rerank_session():
         opts.intra_op_num_threads = RERANK_THREADS
         opts.inter_op_num_threads = 1
         _rerank_state["sess"] = ort.InferenceSession(
-            f"{RERANK_DIR}/model_qint8_avx512.onnx", opts,
+            f"{RERANK_DIR}/{RERANK_MODEL_FILE}", opts,
             providers=["CPUExecutionProvider"])
         _rerank_state["tok"] = AutoTokenizer.from_pretrained(RERANK_DIR)
     return _rerank_state["sess"], _rerank_state["tok"]

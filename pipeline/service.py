@@ -40,7 +40,7 @@ from requests.adapters import HTTPAdapter
 import extractor
 import niche_filter
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(os.getenv("DTOX_DATA_DIR", Path(__file__).resolve().parent))
 DB_PATH = BASE_DIR / "state.db"
 LOCK_FILE = BASE_DIR / "service.lock"
 LOG_FILE = BASE_DIR / "pipeline.log"
@@ -123,11 +123,11 @@ S2_PENALTY_SECONDS = 30
 # The lexical index lives beside the vector one and has to be written at the
 # same moment, or hybrid search silently degrades to dense-only for everything
 # harvested after the initial build.
-FTS_DB_PATH = "/opt/dtox-research/fts.db"
+FTS_DB_PATH = os.getenv("FTS_DB_PATH", str(BASE_DIR / "fts.db"))
 
-QDRANT_URL = "http://127.0.0.1:6333"
-COLLECTION_NAME = "papers_fulltext"
-EMBED_BATCH_URL = "http://127.0.0.1:8005/embed_batch"
+QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
+COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "papers_fulltext")
+EMBED_BATCH_URL = os.getenv("EMBED_BATCH_URL", "http://127.0.0.1:8005/embed_batch")
 EMBED_TIMEOUT = 90
 UPSERT_BATCH_SIZE = 64
 
