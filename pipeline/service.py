@@ -88,7 +88,7 @@ SOTA_MIN_NICHE = 3
 # A strong lexical fit is itself a quality signal in narrow fields where raw
 # citation counts lag badly. These two lanes only run after the deterministic
 # niche filter has accepted the paper; they do not weaken the off-topic gate.
-STRONG_NICHE_AUTO_PASS = 7
+STRONG_NICHE_AUTO_PASS = 6
 NICHE_CITATION_PASS_SCORE = 3
 NICHE_CITATION_PASS_MIN = 1
 TOP_LABS = (
@@ -317,6 +317,25 @@ OPENALEX_QUERIES = (
     "blockchain oracle", "automated market maker blockchain",
 )
 openalex_gate = _ArxivGate(1.0)
+
+# HAL is an open academic archive with direct PDF links.  It is especially
+# useful for applied cryptography and protocol-engineering work that never
+# reaches arXiv.  Unlike OpenAlex, its search API is public and does not need
+# a key; the ordinary lexical gate is still the first relevance filter.
+HAL_ID_PREFIX = "hal:"
+HAL_API_URL = "https://api.archives-ouvertes.fr/search/"
+HAL_PAGE_SIZE = 100
+HAL_MAX_PAGES = 20
+HAL_MIN_NICHE_AUTO_PASS = 6
+HAL_QUERIES = (
+    "zero knowledge proof blockchain", "zk rollup blockchain", "blockchain consensus",
+    "smart contract security", "threshold signature blockchain", "multiparty computation blockchain",
+    "verifiable delay function blockchain", "proof of stake blockchain", "state channel blockchain",
+    "cross chain bridge security", "decentralized finance blockchain", "maximal extractable value blockchain",
+    "polynomial commitment blockchain", "recursive snark blockchain", "zero knowledge virtual machine",
+)
+HAL_CURSOR_PREFIX = "hal-v2@"
+hal_gate = _ArxivGate(1.0)
 
 # Proceedings of Machine Learning Research: peer-reviewed, openly hosted PDF
 # proceedings (ICML, AISTATS, CoRL and many workshops).  It supplies a large
@@ -1524,8 +1543,22 @@ def quality_step(conn, session):
     # Semantic Scholar does not index IACR ePrint, so a citation gate would
     # reject every crypto paper outright. Those are admitted on the lexical
     # niche score alone (which is what got them harvested in the first place).
+    hal_rows = [r for r in rows if str(r["arxiv_id"]).startswith(HAL_ID_PREFIX)]
     iacr_rows = [r for r in rows if is_non_arxiv(r["arxiv_id"])]
-    rows = [r for r in rows if not is_non_arxiv(r["arxiv_id"])]
+    rows = [r for r in rows if not is_non_arxiv(r["arxiv_id"])
+            and not str(r["arxiv_id"]).startswith(HAL_ID_PREFIX)]
+    hal_done = 0
+    for r in hal_rows:
+        # HAL records are deposited academic work with a direct PDF.  We do
+        # not have a stable external identifier to ask S2 about, so admit only
+        # documents that clear the same strong-niche bar used for arXiv.
+        passed = (r["niche_score"] or 0) >= HAL_MIN_NICHE_AUTO_PASS
+        conn.execute(
+            "UPDATE papers SET passed=?, status=?, updated_at=? WHERE arxiv_id=?",
+            (1 if passed else 0, "quality_checked" if passed else "deferred",
+             now_iso(), r["arxiv_id"]),
+        )
+        hal_done += 1
     iacr_done = 0
     for r in iacr_rows:
         conn.execute(
@@ -1533,10 +1566,10 @@ def quality_step(conn, session):
             (now_iso(), r["arxiv_id"]),
         )
         iacr_done += 1
-    if iacr_done:
+    if iacr_done or hal_done:
         conn.commit()
     if not rows:
-        return iacr_done
+        return iacr_done + hal_done
 
     ids = [f"ARXIV:{r['arxiv_id']}" for r in rows]
     by_id = {r["arxiv_id"]: r for r in rows}
@@ -1595,7 +1628,7 @@ def quality_step(conn, session):
         processed += 1
     conn.commit()
     time.sleep(S2_PAUSE)
-    return processed + iacr_done
+    return processed + iacr_done + hal_done
 
 
 # ---------------------------------------------------------------------------
@@ -1818,7 +1851,7 @@ def _fetch_one_fulltext(arxiv_id, stored_abstract=None, source_url=None):
         # keeps the section headings, which is what the chunker reads.
         return _fetch_acl_fulltext(arxiv_id, stored_abstract)
 
-    if str(arxiv_id).startswith((OPENALEX_ID_PREFIX, PMLR_ID_PREFIX)):
+    if str(arxiv_id).startswith((OPENALEX_ID_PREFIX, PMLR_ID_PREFIX, HAL_ID_PREFIX)):
         return _fetch_openalex_fulltext(arxiv_id, source_url, stored_abstract)
 
     if str(arxiv_id).startswith(IACR_ID_PREFIX):
@@ -1908,7 +1941,7 @@ def chunk_step(conn, session, limit=CHUNK_CYCLE_LIMIT):
             # it takes the markdown path rather than the LaTeX parser, which
             # would find no \section commands and fall back to one flat blob.
             if is_spec_source(arxiv_id) or str(arxiv_id).startswith(
-                    (ACL_ID_PREFIX, OPENALEX_ID_PREFIX)):
+                    (ACL_ID_PREFIX, OPENALEX_ID_PREFIX, PMLR_ID_PREFIX, HAL_ID_PREFIX)):
                 chunks, mode = extractor.build_chunks_markdown(text)
             else:
                 chunks, mode = extractor.build_chunks(text, embed_fn=embed_fn)
@@ -2594,6 +2627,84 @@ def openalex_harvest_step(conn, session):
     return taken
 
 
+def hal_seed_cursors(conn):
+    added = 0
+    for idx, _ in enumerate(HAL_QUERIES):
+        before = conn.total_changes
+        conn.execute(
+            "INSERT OR IGNORE INTO harvest_cursor "
+            "(query_key,next_start,done,layer) VALUES (?,0,0,'web3')", (f"{HAL_CURSOR_PREFIX}{idx}",))
+        added += conn.total_changes - before
+    conn.commit()
+    if added:
+        log.info(f"hal: {added} durable query cursors queued")
+    return added
+
+
+def hal_harvest_step(conn, session):
+    """Harvest one durable page of full-PDF Web3 research from HAL."""
+    hal_seed_cursors(conn)
+    row = conn.execute(
+        "SELECT query_key,next_start FROM harvest_cursor WHERE query_key LIKE 'hal-v2@%' "
+        "AND done=0 ORDER BY COALESCE(last_run_at,''),query_key LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return 0
+    key = row["query_key"]
+    start = int(row["next_start"] or 0)
+    idx = int(key.split("@", 1)[1])
+    hal_gate.wait()
+    try:
+        resp = session.get(HAL_API_URL, params={
+            "q": HAL_QUERIES[idx],
+            "fq": ["submitType_s:file", "producedDateY_i:[2015 TO *]"],
+            "fl": "docid,title_s,abstract_s,producedDateY_i,fileMain_s,uri_s",
+            "rows": HAL_PAGE_SIZE,
+            "start": start,
+            "sort": "producedDateY_i desc",
+            "wt": "json",
+        }, timeout=60, headers={"User-Agent": ARXIV_CONTACT_UA})
+    except requests.RequestException as e:
+        log.warning(f"hal: request failed for {HAL_QUERIES[idx]!r}: {e}")
+        return 0
+    if resp.status_code == 429:
+        hal_gate.penalize(60)
+        log.warning("hal: 429 rate limited, backing off")
+        return 0
+    if resp.status_code != 200:
+        log.warning(f"hal: status {resp.status_code}: {resp.text[:200]}")
+        return 0
+    try:
+        docs = (resp.json().get("response") or {}).get("docs") or []
+    except ValueError:
+        return 0
+
+    taken = 0
+    for doc in docs:
+        docid = str(doc.get("docid") or "").strip()
+        titles = doc.get("title_s") or []
+        title = " ".join(titles[0].split()) if titles else ""
+        pdf_url = doc.get("fileMain_s")
+        if not docid or not title or not pdf_url:
+            continue
+        abstracts = doc.get("abstract_s") or []
+        upsert_discovered(
+            conn, f"{HAL_ID_PREFIX}{docid}", title,
+            doc.get("producedDateY_i") or 0, "web3",
+            abstract=_plain_html(abstracts[0]) if abstracts else None,
+            source_url=pdf_url, venue="HAL Open Science", commit=False,
+        )
+        taken += 1
+    done = (start // HAL_PAGE_SIZE) + 1 >= HAL_MAX_PAGES or len(docs) < HAL_PAGE_SIZE
+    conn.execute(
+        "UPDATE harvest_cursor SET next_start=?,done=?,last_run_at=? WHERE query_key=?",
+        (start + HAL_PAGE_SIZE, 1 if done else 0, now_iso(), key),
+    )
+    conn.commit()
+    log.info(f"hal: {HAL_QUERIES[idx]!r} start={start} -> {taken} full-PDF records")
+    return taken
+
+
 def _plain_html(value):
     return " ".join(html.unescape(re.sub(r"<[^>]+>", " ", value or "")).split())
 
@@ -2726,6 +2837,7 @@ STAGES = (
     ("graph_harvest", graph_harvest_step, True),
     ("acl_harvest", lambda conn: acl_harvest_step(conn), False),
     ("openalex", openalex_harvest_step, True),
+    ("hal_harvest", hal_harvest_step, True),
     ("pmlr", pmlr_harvest_step, True),
     ("quality", quality_step, True),
     ("fulltext", lambda conn: fulltext_step(conn), False),

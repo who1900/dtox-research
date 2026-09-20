@@ -471,6 +471,7 @@ SOURCE_LABELS = {
     "wp": "Industry whitepaper",
     "oa": "OpenAlex open-access work",
     "pmlr": "Proceedings of Machine Learning Research",
+    "hal": "HAL Open Science",
     "arxiv": "arXiv",
 }
 
@@ -500,6 +501,8 @@ def source_url(paper_id, payload=None):
         return payload.get("url") if payload else f"https://openalex.org/{pid.split(':', 1)[1]}"
     if pid.startswith("pmlr:"):
         return payload.get("url") if payload else f"https://proceedings.mlr.press/{pid.split(':', 1)[1]}.html"
+    if pid.startswith("hal:"):
+        return payload.get("url") if payload else f"https://hal.science/hal-{pid.split(':', 1)[1]}"
     return f"https://arxiv.org/abs/{pid}"
 
 
