@@ -12,6 +12,7 @@ cursor resumes from its saved next_start.
 
 import fcntl
 import gzip
+import hashlib
 import html
 import io
 import json
@@ -365,6 +366,7 @@ OAI_NS = {
 # ---------------------------------------------------------------------------
 EIP_ID_PREFIX = "eip:"
 SIMD_ID_PREFIX = "simd:"
+GITHUB_DOC_ID_PREFIX = "gh:"
 SPEC_SOURCES = {
     "eip@all": {
         "prefix": EIP_ID_PREFIX,
@@ -387,6 +389,28 @@ SPEC_DELAY_SECONDS = 0.4
 # an agent implement against a dead standard.
 SPEC_SKIP_STATUSES = {"withdrawn", "stagnant"}
 
+# Curated technical documentation from canonical protocol and ZK repositories.
+# This is intentionally a manifest, not GitHub-wide search: every repository
+# is a first-party implementation or specification, and only documentation
+# paths are eligible.  GitHub's tree API is used once per repo per process;
+# raw content downloads then bypass the low unauthenticated API quota.
+GITHUB_DOC_SOURCES = {
+    "eth-consensus": {"repo": "ethereum/consensus-specs", "branch": "master", "paths": ("specs/",)},
+    "eth-execution": {"repo": "ethereum/execution-specs", "branch": "forks/amsterdam", "paths": ("docs/",)},
+    "op-specs": {"repo": "ethereum-optimism/specs", "branch": "main", "paths": ("specs/",)},
+    "nitro": {"repo": "OffchainLabs/nitro", "branch": "master", "paths": ("docs/decisions/",)},
+    "wormhole": {"repo": "wormhole-foundation/wormhole", "branch": "main", "paths": ("docs/",)},
+    "hyperlane": {"repo": "hyperlane-xyz/hyperlane-monorepo", "branch": "main", "paths": ("docs/",)},
+    "sp1": {"repo": "succinctlabs/sp1", "branch": "main", "paths": ("docs/", "crates/recursion/")},
+    "risc0": {"repo": "risc0/risc0", "branch": "main", "paths": ("risc0/zkvm/", "website/api/blockchain-integration/")},
+    "halo2": {"repo": "privacy-scaling-explorations/halo2", "branch": "main", "paths": ("book/",)},
+    "anchor": {"repo": "coral-xyz/anchor", "branch": "master", "paths": ("docs/content/docs/",)},
+}
+GITHUB_DOCS_PER_CYCLE = 20
+GITHUB_DOC_DELAY_SECONDS = 0.2
+GITHUB_DOC_REFRESH_SECONDS = 24 * 60 * 60
+_github_tree_cache = {}
+
 
 WHITEPAPER_ID_PREFIX = "wp:"
 
@@ -394,12 +418,14 @@ WHITEPAPER_ID_PREFIX = "wp:"
 def is_spec_source(paper_id) -> bool:
     """True for documents that are plain text or markdown rather than LaTeX:
     protocol specifications and the hand-curated industry whitepapers."""
-    return str(paper_id).startswith((EIP_ID_PREFIX, SIMD_ID_PREFIX, WHITEPAPER_ID_PREFIX))
+    return str(paper_id).startswith((EIP_ID_PREFIX, SIMD_ID_PREFIX, GITHUB_DOC_ID_PREFIX,
+                                     WHITEPAPER_ID_PREFIX))
 
 
 def is_non_arxiv(paper_id) -> bool:
     """True for sources Semantic Scholar does not index (IACR, EIP, SIMD)."""
     return str(paper_id).startswith((IACR_ID_PREFIX, EIP_ID_PREFIX, SIMD_ID_PREFIX,
+                                     GITHUB_DOC_ID_PREFIX,
                                      ACL_ID_PREFIX, OPENALEX_ID_PREFIX,
                                      PMLR_ID_PREFIX))
 
@@ -494,6 +520,106 @@ def fetch_spec_batch(query_key, start, count):
             "source": cfg["source"],
         })
     return entries, len(names)
+
+
+def github_doc_files(source_key):
+    """Return the allowed Markdown paths for one curated repository.
+
+    Tree results are cached for the process lifetime.  A restart merely costs
+    one authenticated-free GitHub API call per curated repository, while raw
+    files are fetched from raw.githubusercontent.com.
+    """
+    cached = _github_tree_cache.get(source_key)
+    if cached is not None:
+        return cached
+    cfg = GITHUB_DOC_SOURCES[source_key]
+    branch = urllib.parse.quote(cfg["branch"], safe="")
+    url = f"https://api.github.com/repos/{cfg['repo']}/git/trees/{branch}?recursive=1"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": ARXIV_CONTACT_UA})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            tree = json.loads(resp.read().decode("utf-8", errors="replace")).get("tree") or []
+    except Exception as e:
+        log.warning(f"github_docs: tree failed for {cfg['repo']}: {e}")
+        return None
+    paths = sorted(
+        item.get("path") for item in tree
+        if isinstance(item, dict) and item.get("type") == "blob"
+        and str(item.get("path", "")).lower().endswith((".md", ".mdx"))
+        and any(str(item.get("path", "")).startswith(prefix) for prefix in cfg["paths"])
+    )
+    _github_tree_cache[source_key] = paths
+    return paths
+
+
+def _github_doc_title(text, path):
+    match = re.search(r"^\s*#\s+(.+?)\s*$", text, re.M)
+    return " ".join((match.group(1) if match else Path(path).stem.replace("-", " ")).split())
+
+
+def fetch_github_doc_batch(source_key, start, count):
+    """Fetch one durable slice of first-party technical Markdown."""
+    cfg = GITHUB_DOC_SOURCES[source_key]
+    paths = github_doc_files(source_key)
+    if paths is None:
+        return None, None
+    entries = []
+    raw_base = f"https://raw.githubusercontent.com/{cfg['repo']}/{cfg['branch']}/"
+    page_base = f"https://github.com/{cfg['repo']}/blob/{cfg['branch']}/"
+    for path in paths[start:start + count]:
+        try:
+            req = urllib.request.Request(raw_base + path, headers={"User-Agent": ARXIV_CONTACT_UA})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+        except Exception as e:
+            log.warning(f"github_docs: fetch failed for {cfg['repo']}:{path}: {e}")
+            continue
+        if len(text.strip()) < 200 or len(text) > 500_000:
+            continue
+        digest = hashlib.sha256(f"{cfg['repo']}:{path}".encode()).hexdigest()[:16]
+        title = _github_doc_title(text, path)
+        entries.append({
+            "arxiv_id": f"{GITHUB_DOC_ID_PREFIX}{source_key}:{digest}",
+            "title": title,
+            "year": None,
+            "abstract": text[:1200],
+            "full_text": text,
+            "url": page_base + path,
+        })
+        time.sleep(GITHUB_DOC_DELAY_SECONDS)
+    return entries, len(paths)
+
+
+def github_docs_step(conn):
+    """Incrementally ingest selected protocol/ZK docs without GitHub search."""
+    if _poll_due(conn, "github_docs:refresh", GITHUB_DOC_REFRESH_SECONDS):
+        conn.execute("UPDATE harvest_cursor SET next_start=0,done=0,last_run_at=NULL "
+                     "WHERE query_key LIKE 'ghdoc@%'")
+        conn.commit()
+        _mark_polled(conn, "github_docs:refresh")
+    for key in GITHUB_DOC_SOURCES:
+        conn.execute("INSERT OR IGNORE INTO harvest_cursor "
+                     "(query_key,next_start,done,layer) VALUES (?,0,0,'web3')", (f"ghdoc@{key}",))
+    conn.commit()
+    row = conn.execute("SELECT query_key,next_start FROM harvest_cursor WHERE query_key LIKE 'ghdoc@%' "
+                       "AND done=0 ORDER BY COALESCE(last_run_at,''),query_key LIMIT 1").fetchone()
+    if row is None:
+        return 0
+    key = row["query_key"].split("@", 1)[1]
+    start = int(row["next_start"] or 0)
+    entries, total = fetch_github_doc_batch(key, start, GITHUB_DOCS_PER_CYCLE)
+    if entries is None:
+        return 0
+    for entry in entries:
+        upsert_discovered(conn, entry["arxiv_id"], entry["title"], entry["year"], "web3",
+                          abstract=entry["abstract"], source_url=entry["url"], commit=False)
+        write_latex_cache(entry["arxiv_id"], entry["full_text"])
+    next_start = start + GITHUB_DOCS_PER_CYCLE
+    conn.execute("UPDATE harvest_cursor SET next_start=?,done=?,last_run_at=? WHERE query_key=?",
+                 (next_start, 1 if next_start >= total else 0, now_iso(), row["query_key"]))
+    conn.commit()
+    log.info(f"github_docs: {key} {start}-{next_start} of {total} -> {len(entries)} docs")
+    return len(entries)
 
 
 def iacr_month_keys() -> list:
@@ -2838,6 +2964,7 @@ STAGES = (
     ("acl_harvest", lambda conn: acl_harvest_step(conn), False),
     ("openalex", openalex_harvest_step, True),
     ("hal_harvest", hal_harvest_step, True),
+    ("github_docs", lambda conn: github_docs_step(conn), False),
     ("pmlr", pmlr_harvest_step, True),
     ("quality", quality_step, True),
     ("fulltext", lambda conn: fulltext_step(conn), False),
