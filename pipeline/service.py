@@ -147,7 +147,7 @@ ARXIV_CONTACT_UA = "dtox-research/1.1 (research pipeline; mailto:danik1900@gmail
 # downloads earned a 429 that also killed harvest, and the harvester sat idle
 # with its cursor parked. One gate now paces every arXiv request in the process,
 # and a 429 anywhere pauses all of them long enough for the limit to clear.
-ARXIV_MIN_INTERVAL = 1.5     # seconds between any two arXiv requests
+ARXIV_MIN_INTERVAL = 3.0     # arXiv's documented global request interval
 ARXIV_PENALTY_SECONDS = 60   # global cooldown after a 429/503 from arXiv
 
 
@@ -1895,6 +1895,10 @@ def fetch_latex_source(arxiv_id: str, session: requests.Session = None):
 def fetch_abstract_fallback(arxiv_id: str):
     url = f"https://export.arxiv.org/api/query?id_list={arxiv_id}"
     try:
+        # This fallback used to bypass arxiv_gate.  Four fulltext workers then
+        # burst directly into export.arxiv.org whenever source bundles were
+        # absent, rate-limiting the harvester that shared the same IP.
+        arxiv_gate.wait()
         with urllib.request.urlopen(url, timeout=30) as response:
             raw_xml = response.read()
         root = ET.fromstring(raw_xml)
@@ -1906,6 +1910,8 @@ def fetch_abstract_fallback(arxiv_id: str):
             return None
         return " ".join(summary_el.text.split())
     except Exception as e:
+        if getattr(e, "code", None) in (429, 503):
+            arxiv_gate.penalize()
         log.warning(f"fulltext: abstract fallback failed for {arxiv_id}: {e}")
         return None
 
