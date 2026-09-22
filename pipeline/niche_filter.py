@@ -66,6 +66,11 @@ BROAD_TERMS = {
         "mev", "maximal extractable", "cryptocurrency", "on-chain", "web3",
         "tokenomics", "nft market", "staking protocol", "consensus protocol",
     ],
+    "builder-tech": [
+        "mobile application", "mobile app", "mobile wallet", "wallet application",
+        "rust programming language", "software engineering", "software testing",
+        "program analysis", "distributed system", "developer tooling",
+    ],
 }
 
 # Narrow technical markers, weight 5. Presence of any of these is a strong
@@ -114,6 +119,15 @@ SPECIFIC_TERMS = {
         "concentrated liquidity", "jit liquidity", "sandwich attack", "funding rate",
         "restaking", "eigenlayer", "slashing", "distributed validator", "zk-rollup",
         "optimistic rollup", "stablecoin", "liquid staking",
+    ],
+    "builder-tech": [
+        "rust", "webassembly", "wasm", "android application", "ios application",
+        "flutter", "react native", "kotlin", "swift", "walletconnect",
+        "hardware wallet", "secure element", "secure enclave", "passkey", "webauthn",
+        "static analysis", "symbolic execution", "fuzzing", "property-based testing",
+        "formal verification", "model checking", "compiler optimization",
+        "language server protocol", "software supply chain", "dependency resolution",
+        "reproducible build", "distributed systems", "database systems",
     ],
 }
 
@@ -192,6 +206,7 @@ MIN_SCORE_BY_LAYER = {
     "llm-slm": 2,
     "ai-agents": 2,
     "web3": 1,
+    "builder-tech": 2,
 }
 
 

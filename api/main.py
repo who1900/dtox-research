@@ -23,7 +23,7 @@ EMBED_BATCH_URL = os.getenv("EMBED_BATCH_URL", "http://127.0.0.1:8006/embed_batc
 QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 KEYS_PATH = Path(os.getenv("RESEARCH_KEYS_PATH", "/opt/dtox-research-api/keys.json"))
 
-ALLOWED_LAYERS = {"llm-slm", "web3", "ai-agents"}
+ALLOWED_LAYERS = {"llm-slm", "web3", "ai-agents", "builder-tech"}
 SPEC_SECTION_TYPES = {"method", "architecture"}
 SPEC_TITLE_KEYWORDS = ("algorithm", "model", "method")
 
@@ -1218,6 +1218,9 @@ SCORE_BANDS_BY_LAYER = {
     "llm-slm": (0.879, 0.843),
     "ai-agents": (0.848, 0.821),
     "web3": (0.779, 0.768),
+    # Initial conservative bands for the new supporting-research layer. They
+    # will be recalibrated once builder-tech has enough judged examples.
+    "builder-tech": (0.850, 0.810),
 }
 
 # A paper that earned its layer by a single passing mention is not evidence of

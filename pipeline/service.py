@@ -233,6 +233,22 @@ BOOLEAN_QUERIES = {
         'OR all:"web agent" OR all:"browser agent" OR all:"agent memory" OR all:"agent planning" '
         'OR all:"tool-augmented")',
     ],
+    # Supporting research for teams building Web3 products.  This is a
+    # separate layer, not a relaxation of web3: a mobile security paper should
+    # enrich a builder query without appearing as cryptographic prior art.
+    "builder-tech": [
+        '(cat:cs.PL OR cat:cs.SE OR cat:cs.CR) AND (all:"rust programming language" '
+        'OR all:webassembly OR all:"formal verification" OR all:"static analysis" '
+        'OR all:"symbolic execution" OR all:fuzzing OR all:"software supply chain" '
+        'OR all:"smart contract language")',
+        '(cat:cs.HC OR cat:cs.SE OR cat:cs.CR) AND (all:"mobile wallet" '
+        'OR all:"mobile application security" OR all:"secure enclave" '
+        'OR all:"trusted execution environment" OR all:passkey OR all:webauthn '
+        'OR all:walletconnect OR all:"hardware wallet")',
+        '(cat:cs.DC OR cat:cs.SE OR cat:cs.CR) AND (all:"distributed systems" '
+        'OR all:"database systems" OR all:"reproducible build" '
+        'OR all:"dependency resolution" OR all:"language server protocol")',
+    ],
 }
 
 # Plain keyword ("all:phrase") queries, no category restriction needed because
@@ -247,6 +263,11 @@ LLM_SLM_QUERIES = [
 AI_AGENTS_QUERIES = [
     "autonomous agents benchmark",
     "agentic workflow orchestration",
+]
+
+BUILDER_TECH_QUERIES = [
+    "rust webassembly compiler", "mobile wallet security", "smart contract formal verification",
+    "software supply chain security", "distributed systems developer tooling",
 ]
 
 WEB3_QUERIES = [
@@ -266,7 +287,7 @@ WEB3_QUERIES = [
     "stablecoin mechanism",
 ]
 
-ALLOWED_LAYERS = {"llm-slm", "ai-agents", "web3"}
+ALLOWED_LAYERS = {"llm-slm", "ai-agents", "web3", "builder-tech"}
 
 # ---------------------------------------------------------------------------
 # IACR ePrint (second source, web3 layer)
@@ -753,13 +774,17 @@ def build_layer_query_groups() -> list:
         ("llm-slm", LLM_SLM_QUERIES),
         ("ai-agents", AI_AGENTS_QUERIES),
         ("web3", WEB3_QUERIES),
+        ("builder-tech", BUILDER_TECH_QUERIES),
     ):
         sliced = []
         for idx in range(len(BOOLEAN_QUERIES.get(layer, []))):
             sliced.extend(bool_date_slice_keys(layer, idx))
         extra = (iacr_month_keys() + list(SPEC_SOURCES)) if layer == "web3" else []
-        groups.append((layer, sliced + list(keyword_queries) + extra
-                       + category_sweep_keys(layer)))
+        # Category-wide sweeps are appropriate for our three narrow research
+        # domains.  For builder-tech they would ingest the whole SE/PL corpus;
+        # explicit boolean queries provide controlled, relevant coverage.
+        category_keys = [] if layer == "builder-tech" else category_sweep_keys(layer)
+        groups.append((layer, sliced + list(keyword_queries) + extra + category_keys))
     return groups
 
 
