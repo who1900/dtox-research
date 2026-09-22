@@ -248,6 +248,23 @@ BOOLEAN_QUERIES = {
         '(cat:cs.DC OR cat:cs.SE OR cat:cs.CR) AND (all:"distributed systems" '
         'OR all:"database systems" OR all:"reproducible build" '
         'OR all:"dependency resolution" OR all:"language server protocol")',
+        # Full builder stack.  It deliberately lives outside the web3 layer:
+        # language and frontend research is useful to a Web3 team, but is not
+        # cryptographic prior art.  Date slices keep the broad language terms
+        # below arXiv's deep-pagination wall.
+        '(cat:cs.PL OR cat:cs.SE) AND (all:"C++" OR all:"C#" OR all:Rust '
+        'OR all:Golang OR all:"Go language" OR all:Zig OR all:"programming language runtime" '
+        'OR all:compiler OR all:"memory safety")',
+        '(cat:cs.PL OR cat:cs.SE OR cat:cs.HC) AND (all:TypeScript OR all:JavaScript '
+        'OR all:Python OR all:Java OR all:Kotlin OR all:Swift OR all:Dart '
+        'OR all:"mobile application development" OR all:"React Native" OR all:Flutter)',
+        '(cat:cs.SE OR cat:cs.HC OR cat:cs.CR) AND (all:HTML OR all:CSS '
+        'OR all:"web application" OR all:"web frontend" OR all:"Node.js" '
+        'OR all:"Next.js" OR all:"Vue.js" OR all:Angular OR all:Svelte)',
+        '(cat:cs.PL OR cat:cs.SE OR cat:cs.CR) AND (all:Solidity OR all:Vyper '
+        'OR all:"Cairo language" OR all:"Move language" OR all:"Sui Move" '
+        'OR all:"Aptos Move" OR all:"Sway language" OR all:Plutus '
+        'OR all:Cadence OR all:Clarity OR all:Michelson OR all:Circom OR all:Noir)',
     ],
 }
 
@@ -268,6 +285,9 @@ AI_AGENTS_QUERIES = [
 BUILDER_TECH_QUERIES = [
     "rust webassembly compiler", "mobile wallet security", "smart contract formal verification",
     "software supply chain security", "distributed systems developer tooling",
+    "c++ programming language static analysis", "typescript web application security",
+    "react native mobile wallet", "flutter mobile wallet", "swift kotlin wallet application",
+    "solidity vyper cairo move smart contract language", "html css decentralized application",
 ]
 
 WEB3_QUERIES = [
@@ -765,7 +785,11 @@ def category_sweep_keys(layer: str) -> list:
 
 
 def bool_date_slice_keys(layer: str, idx: int) -> list:
-    return [f"bq:{layer}:{idx}@{year}" for year in range(DATE_SLICE_START_YEAR, DATE_SLICE_END_YEAR + 1)]
+    # General software engineering has a huge historical tail.  The current
+    # tooling and language ecosystem is what builders can act on, while the
+    # 2018 cutoff keeps this supporting layer bounded and current.
+    start_year = 2018 if layer == "builder-tech" else DATE_SLICE_START_YEAR
+    return [f"bq:{layer}:{idx}@{year}" for year in range(start_year, DATE_SLICE_END_YEAR + 1)]
 
 
 def build_layer_query_groups() -> list:

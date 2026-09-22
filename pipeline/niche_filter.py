@@ -69,7 +69,8 @@ BROAD_TERMS = {
     "builder-tech": [
         "mobile application", "mobile app", "mobile wallet", "wallet application",
         "rust programming language", "software engineering", "software testing",
-        "program analysis", "distributed system", "developer tooling",
+        "program analysis", "distributed system", "developer tooling", "programming language",
+        "language runtime", "smart contract language", "mobile development",
     ],
 }
 
@@ -121,8 +122,17 @@ SPECIFIC_TERMS = {
         "optimistic rollup", "stablecoin", "liquid staking",
     ],
     "builder-tech": [
-        "rust", "webassembly", "wasm", "android application", "ios application",
-        "flutter", "react native", "kotlin", "swift", "walletconnect",
+        "rust", "c++", "c#", "golang", "go language", "typescript", "javascript",
+        "python", "java", "kotlin", "swift", "dart", "objective-c", "scala", "ruby",
+        "php", "lua", "elixir", "erlang", "haskell", "ocaml", "f#", "zig", "nim",
+        "flutter", "react native", "html", "css", "web frontend", "web application",
+        "node.js", "nodejs", "next.js", "vue.js", "angular framework", "svelte",
+        "webassembly", "wasm", "android application", "ios application", "walletconnect",
+        "solidity", "vyper", "yul", "huff language", "fe language", "cairo language",
+        "move language", "move smart contract", "sui move", "aptos move", "sway language",
+        "func language", "tact language", "cadence language", "clarity language",
+        "michelson language", "plutus", "reach language", "leo language", "noir language",
+        "circom", "circuit language",
         "hardware wallet", "secure element", "secure enclave", "passkey", "webauthn",
         "static analysis", "symbolic execution", "fuzzing", "property-based testing",
         "formal verification", "model checking", "compiler optimization",
@@ -150,7 +160,10 @@ def _compile_group(terms_dict):
             # so any space or hyphen in a term matches any of them. Without
             # this the canonical MoE paper, titled with hyphens, was missed.
             pattern = r"[\s\-_]+".join(re.escape(part) for part in re.split(r"[\s\-]+", term))
-            entries.append((term, re.compile(r"\b" + pattern + r"s?\b", re.IGNORECASE)))
+            # \b cannot close after punctuation, so it silently misses C++ and
+            # C#.  Non-word lookarounds preserve the old anti-substring safety
+            # for terms such as rag while also matching language names.
+            entries.append((term, re.compile(r"(?<!\w)" + pattern + r"s?(?!\w)", re.IGNORECASE)))
         compiled[layer] = entries
     return compiled
 
