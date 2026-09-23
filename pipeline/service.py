@@ -139,6 +139,10 @@ FULLTEXT_MIN_JITTER = 0.15
 FULLTEXT_MAX_JITTER = 0.6
 FULLTEXT_MAX_RETRIES = 3         # retries specifically for 429/503 with backoff
 ARXIV_CONTACT_UA = "dtox-research/1.1 (research pipeline; mailto:danik1900@gmail.com)"
+ARXIV_HEADERS = {
+    "User-Agent": ARXIV_CONTACT_UA,
+    "Accept": "application/atom+xml, application/xml;q=0.9, */*;q=0.8",
+}
 
 
 # --- arXiv traffic gate -----------------------------------------------------
@@ -1163,16 +1167,17 @@ def fetch_page(query_key: str, start: int, max_results: int):
     url = f"{ARXIV_API_URL}?{urllib.parse.urlencode(params)}"
 
     last_err = None
-    req = urllib.request.Request(url, headers={"User-Agent": ARXIV_CONTACT_UA})
     for attempt in range(ARXIV_FETCH_RETRIES):
         try:
             arxiv_gate.wait()
-            with urllib.request.urlopen(req, timeout=ARXIV_FETCH_TIMEOUT) as response:
-                raw_xml = response.read()
+            response = requests.get(url, timeout=ARXIV_FETCH_TIMEOUT, headers=ARXIV_HEADERS)
+            response.raise_for_status()
+            raw_xml = response.content
             break
-        except (urllib.error.URLError, TimeoutError) as e:
+        except requests.RequestException as e:
             last_err = e
-            if getattr(e, "code", None) in (429, 503):
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status in (406, 429, 503):
                 arxiv_gate.penalize()
             wait = min(3 * (2 ** attempt), 24)
             log.warning(f"arXiv fetch error (attempt {attempt+1}/{ARXIV_FETCH_RETRIES}): {e}. Retrying in {wait}s...")
@@ -1649,13 +1654,14 @@ def iacr_twin_step(conn):
         params = {"search_query": f'ti:"{quoted}"', "start": 0, "max_results": 5,
                   "sortBy": "relevance", "sortOrder": "descending"}
         url = f"{ARXIV_API_URL}?{urllib.parse.urlencode(params)}"
-        req = urllib.request.Request(url, headers={"User-Agent": ARXIV_CONTACT_UA})
         try:
             arxiv_gate.wait()
-            with urllib.request.urlopen(req, timeout=ARXIV_FETCH_TIMEOUT) as resp:
-                raw = resp.read()
-        except (urllib.error.URLError, TimeoutError) as e:
-            if getattr(e, "code", None) in (429, 503):
+            resp = requests.get(url, timeout=ARXIV_FETCH_TIMEOUT, headers=ARXIV_HEADERS)
+            resp.raise_for_status()
+            raw = resp.content
+        except requests.RequestException as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status in (406, 429, 503):
                 arxiv_gate.penalize()
             continue
         try:
@@ -1916,15 +1922,16 @@ def fetch_latex_source(arxiv_id: str, session: requests.Session = None):
         return None, "not-latex"
 
 
-def fetch_abstract_fallback(arxiv_id: str):
+def fetch_abstract_fallback(arxiv_id: str, session: requests.Session = None):
     url = f"https://export.arxiv.org/api/query?id_list={arxiv_id}"
     try:
         # This fallback used to bypass arxiv_gate.  Four fulltext workers then
         # burst directly into export.arxiv.org whenever source bundles were
         # absent, rate-limiting the harvester that shared the same IP.
         arxiv_gate.wait()
-        with urllib.request.urlopen(url, timeout=30) as response:
-            raw_xml = response.read()
+        response = (session or requests).get(url, timeout=30, headers=ARXIV_HEADERS)
+        response.raise_for_status()
+        raw_xml = response.content
         root = ET.fromstring(raw_xml)
         entry = root.find(f"{ATOM_NS}entry")
         if entry is None:
@@ -1934,7 +1941,8 @@ def fetch_abstract_fallback(arxiv_id: str):
             return None
         return " ".join(summary_el.text.split())
     except Exception as e:
-        if getattr(e, "code", None) in (429, 503):
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status in (406, 429, 503):
             arxiv_gate.penalize()
         log.warning(f"fulltext: abstract fallback failed for {arxiv_id}: {e}")
         return None
@@ -2045,7 +2053,10 @@ def _fetch_one_fulltext(arxiv_id, stored_abstract=None, source_url=None):
     session = get_fulltext_session()
     text, source = fetch_latex_source(arxiv_id, session=session)
     if text is None:
-        abstract = fetch_abstract_fallback(arxiv_id)
+        # Harvest already stores arXiv's abstract.  Asking the API for exactly
+        # the same text once the source bundle is unavailable doubled arXiv
+        # traffic and could starve catalogue discovery behind its rate limit.
+        abstract = stored_abstract or fetch_abstract_fallback(arxiv_id, session=session)
         if abstract is None:
             return arxiv_id, None, None
         text = f"\\section{{Abstract}}\n{abstract}"
