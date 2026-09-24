@@ -43,7 +43,7 @@ function paidOrShadow<T extends Record<string, unknown>>(
       const parsed = JSON.parse(response.content[0].text) as Record<string, unknown>;
       response.content[0].text = JSON.stringify({
         ...parsed,
-        payment_preview: { price, networks: [config.evmNetwork, config.svmNetwork], charged: false }
+        payment_preview: { price, networks: [...config.evmNetworks, config.svmNetwork], charged: false }
       }, null, 2);
     }
     return response;
@@ -68,7 +68,7 @@ export function registerTools(
     result({
       service: "dtox research",
       mode: config.mode,
-      networks: [config.evmNetwork, config.svmNetwork],
+      networks: [...config.evmNetworks, config.svmNetwork],
       settlement_asset: "USDC",
       free_tools: ["dtox_service_info", "search_research_preview"],
       paid_tools: {

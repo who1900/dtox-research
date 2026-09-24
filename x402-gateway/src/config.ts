@@ -6,7 +6,7 @@ export interface GatewayConfig {
   mode: PaymentMode;
   upstreamMcpUrl: string;
   facilitatorUrl: string;
-  evmNetwork: `${string}:${string}`;
+  evmNetworks: `${string}:${string}`[];
   svmNetwork: `${string}:${string}`;
   evmPayTo: string;
   svmPayTo: string;
@@ -17,6 +17,22 @@ export interface GatewayConfig {
     trends: string;
     audit: string;
   };
+}
+
+const DEFAULT_EVM_NETWORKS = [
+  "eip155:84532",
+  "eip155:11155111",
+  "eip155:421614"
+] as `${string}:${string}`[];
+
+function parseEvmNetworks(env: NodeJS.ProcessEnv): `${string}:${string}`[] {
+  const raw = env.X402_EVM_NETWORKS ?? env.X402_EVM_NETWORK;
+  const networks = raw ? raw.split(",").map((value) => value.trim()).filter(Boolean) : DEFAULT_EVM_NETWORKS;
+  const unique = [...new Set(networks)];
+  if (!unique.length || unique.some((network) => !/^eip155:\d+$/.test(network))) {
+    throw new Error("X402_EVM_NETWORKS must contain comma-separated eip155 chain identifiers");
+  }
+  return unique as `${string}:${string}`[];
 }
 
 function parseMode(value: string | undefined): PaymentMode {
@@ -40,7 +56,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     mode: parseMode(env.X402_MODE),
     upstreamMcpUrl: env.DTOX_UPSTREAM_MCP_URL ?? "http://127.0.0.1:8011/mcp",
     facilitatorUrl: env.X402_FACILITATOR_URL ?? "https://x402.org/facilitator",
-    evmNetwork: (env.X402_EVM_NETWORK ?? "eip155:84532") as `${string}:${string}`,
+    evmNetworks: parseEvmNetworks(env),
     svmNetwork: (env.X402_SVM_NETWORK ?? "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1") as `${string}:${string}`,
     evmPayTo: env.X402_EVM_PAY_TO ?? "",
     svmPayTo: env.X402_SVM_PAY_TO ?? "",

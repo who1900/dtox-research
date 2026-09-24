@@ -13,6 +13,8 @@ Environment=X402_MODE=shadow
 Environment=X402_HOST=127.0.0.1
 Environment=X402_PORT=8012
 Environment=DTOX_UPSTREAM_MCP_URL=http://127.0.0.1:8011/mcp
+Environment=X402_EVM_NETWORKS=eip155:84532,eip155:11155111,eip155:421614
+Environment=X402_SVM_NETWORK=solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1
 Restart=always
 RestartSec=10
 NoNewPrivileges=true

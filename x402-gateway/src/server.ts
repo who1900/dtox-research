@@ -15,7 +15,7 @@ async function createWrappers(config: GatewayConfig): Promise<PaidWrappers> {
   if (config.mode !== "live") return empty;
 
   const resourceServer = new x402ResourceServer(new HTTPFacilitatorClient({ url: config.facilitatorUrl }));
-  resourceServer.register(config.evmNetwork, new ExactEvmScheme());
+  for (const network of config.evmNetworks) resourceServer.register(network, new ExactEvmScheme());
   resourceServer.register(config.svmNetwork, new ExactSvmScheme());
   await resourceServer.initialize();
 
@@ -26,14 +26,14 @@ async function createWrappers(config: GatewayConfig): Promise<PaidWrappers> {
     inputSchema: Record<string, unknown>,
     example: Record<string, unknown>
   ) {
-    const [evm, svm] = await Promise.all([
-      resourceServer.buildPaymentRequirements({
+    const requirements = await Promise.all([
+      ...config.evmNetworks.map((network) => resourceServer.buildPaymentRequirements({
         scheme: "exact",
-        network: config.evmNetwork,
+        network,
         payTo: config.evmPayTo,
         price,
         extra: { name: "USDC", version: "2" }
-      }),
+      })),
       resourceServer.buildPaymentRequirements({
         scheme: "exact",
         network: config.svmNetwork,
@@ -42,7 +42,7 @@ async function createWrappers(config: GatewayConfig): Promise<PaidWrappers> {
       })
     ]);
     return createPaymentWrapper(resourceServer, {
-      accepts: [...evm, ...svm],
+      accepts: requirements.flat(),
       resource: {
         url: `mcp://tool/${toolName}`,
         serviceName: "dtox research",
@@ -103,7 +103,7 @@ export async function start(): Promise<void> {
       status: "ok",
       service: "dtox-research-x402",
       payment_mode: config.mode,
-      networks: [config.evmNetwork, config.svmNetwork]
+      networks: [...config.evmNetworks, config.svmNetwork]
     });
   });
 
@@ -131,7 +131,7 @@ export async function start(): Promise<void> {
       host: config.host,
       port: config.port,
       payment_mode: config.mode,
-      networks: [config.evmNetwork, config.svmNetwork]
+      networks: [...config.evmNetworks, config.svmNetwork]
     }));
   });
 }

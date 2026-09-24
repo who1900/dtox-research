@@ -1,0 +1,10 @@
+/opt/dtox-research/pipeline.log {
+    daily
+    maxsize 100M
+    rotate 7
+    compress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+}

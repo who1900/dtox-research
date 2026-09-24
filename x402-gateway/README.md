@@ -6,9 +6,9 @@ An isolated, read-only paid MCP surface for dtox research. It does not replace t
 
 - `disabled`: tools execute without payment metadata. Safe default.
 - `shadow`: tools execute for free and return the price and supported networks.
-- `live`: paid tools require x402 v2 USDC payment. Startup fails closed unless the internal API key and both recipient addresses are present.
+- `live`: paid tools require x402 v2 USDC payment. Startup fails closed unless both recipient addresses are present.
 
-The default networks are Base Sepolia and Solana Devnet. Mainnet networks and a production facilitator are configuration, not code changes.
+The default networks are Base Sepolia, Ethereum Sepolia, Arbitrum Sepolia and Solana Devnet. One EVM receiving address is used across the three EVM chains. Mainnet networks and a production facilitator are configuration, not code changes.
 
 ```bash
 npm ci
@@ -23,7 +23,7 @@ Live mode requires server-side environment values:
 ```text
 X402_MODE=live
 X402_FACILITATOR_URL=https://...
-X402_EVM_NETWORK=eip155:8453
+X402_EVM_NETWORKS=eip155:8453,eip155:1,eip155:42161
 X402_SVM_NETWORK=solana:5eykt4UsFv8P8NJdTREpY1vzqKZKvdp
 X402_EVM_PAY_TO=0x...
 X402_SVM_PAY_TO=...
