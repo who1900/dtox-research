@@ -38,7 +38,7 @@ STORES = {
                   "tables": ["claim_nodes", "claim_judgments", "claim_links"]},
     "state": {"path": "/opt/dtox-research/state.db", "keep": 7,
               "tables": ["papers", "citations", "harvest_cursor"]},
-    "fts": {"path": "/opt/dtox-research/fts.db", "keep": 2, "weekly": True,
+    "fts": {"path": "/opt/dtox-research/fts.db", "keep": 1, "weekly": True,
             "tables": ["chunks"]},
 }
 
@@ -88,12 +88,13 @@ def qdrant_snapshot():
                                  method="POST")
     with urllib.request.urlopen(req, timeout=1800) as r:
         result = json.loads(r.read())["result"]
-    # keep the two newest and drop the rest: they are 4 GB each
+    # keep only the snapshot just taken: each is ~26 GB and they share the
+    # disk with the live collection, so an older one buys no extra safety
     with urllib.request.urlopen(f"{QDRANT}/collections/{COLLECTION}/snapshots",
                                 timeout=120) as r:
         snaps = sorted(json.loads(r.read())["result"],
                        key=lambda s: s["creation_time"], reverse=True)
-    for old in snaps[2:]:
+    for old in snaps[1:]:
         req = urllib.request.Request(
             f"{QDRANT}/collections/{COLLECTION}/snapshots/{old['name']}",
             method="DELETE")
