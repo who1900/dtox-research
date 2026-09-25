@@ -21,6 +21,8 @@ try:
 except ImportError:
     from search_core import fts_query, merge_layer_hits, reciprocal_rank_fusion
 
+ATTESTOR_URL = os.getenv("ATTESTOR_URL", "http://127.0.0.1:8013")
+ATTESTOR_INTERNAL_TOKEN = os.getenv("ATTESTOR_INTERNAL_TOKEN", "")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
 COLLECTION = os.getenv("QDRANT_COLLECTION", "papers_fulltext")
 EMBED_URL = os.getenv("EMBED_URL", "http://127.0.0.1:8006/embed")
@@ -2188,7 +2190,10 @@ def _judgments_conn():
     cols = {r[1] for r in conn.execute("PRAGMA table_info(claim_judgments)").fetchall()}
     for name, decl in (("claim_id", "TEXT"), ("score", "REAL"), ("band", "TEXT"),
                        ("layer", "TEXT"), ("section_type", "TEXT"),
-                       ("niche_score", "INTEGER"), ("judged_by_model", "TEXT")):
+                       ("niche_score", "INTEGER"), ("judged_by_model", "TEXT"),
+                       # set only for verdicts backed by a wallet signature verified
+                       # by attestor and written on-chain as a SAS attestation
+                       ("attestation_pda", "TEXT"), ("attestation_tx", "TEXT")):
         if name not in cols:
             conn.execute(f"ALTER TABLE claim_judgments ADD COLUMN {name} {decl}")
     return conn
@@ -2224,13 +2229,20 @@ def _judgment_status(counts, readers=None, models=None):
     "Independent readers agree" meant two API keys. If both are the same model,
     the second reading repeats the first one's mistakes with the same
     confidence, which is correlation dressed up as confirmation. Agreement
-    within one model is reported as agreed_same_model, one step below settled."""
+    within one model is reported as agreed_same_model, one step below settled.
+
+    A wallet-signed verdict (judged_by = "wallet:<pubkey>") is a verified
+    identity in its own right -- the signature is checked by attestor and the
+    verdict is anchored on-chain, so it does not need a self-declared model
+    name to be trusted. Two or more distinct wallets are independent readers
+    on their own, regardless of what models (if any) they report."""
     asserts = counts.get("asserts", 0)
     denies = counts.get("does_not_assert", 0)
     # only identities the server established itself count towards diversity;
     # an unattributed reading cannot be the second opinion that settles a claim
     known = {m for m in (models or []) if m and m != JUDGMENT_MODEL_UNKNOWN}
-    diverse = models is None or len(known) > 1
+    wallets = {r for r in (readers or []) if isinstance(r, str) and r.startswith("wallet:")}
+    diverse = models is None or len(known) > 1 or len(wallets) >= CONFIRMATION_QUORUM
     if asserts >= CONFIRMATION_QUORUM and denies == 0:
         return "confirmed_prior_art" if diverse else "agreed_same_model"
     if denies >= CONFIRMATION_QUORUM and asserts == 0:
@@ -2385,7 +2397,7 @@ def _registry_for_claim(claim):
         models, readers = e.pop("models"), e.pop("readers")
         e["readers"] = len(readers)
         e["distinct_models"] = sorted(models)
-        e["status"] = _judgment_status(e["counts"], len(readers), models)
+        e["status"] = _judgment_status(e["counts"], readers, models)
         if e.get("from_claim"):
             # read from a neighbour, not from this node: never settled here
             e["status"] = "reported_on_similar_claim"
@@ -2404,7 +2416,8 @@ def _prior_readings(claim, paper_ids):
         claim_id, _ = _canonical_claim(conn, claim)
         placeholders = ",".join("?" * len(paper_ids))
         rows = conn.execute(
-            f"SELECT paper_id, verdict, reason, judged_by, judged_by_model, judged_at "
+            f"SELECT paper_id, verdict, reason, judged_by, judged_by_model, judged_at, "
+            f"attestation_pda "
             f"FROM claim_judgments WHERE (claim_id=? OR claim_norm=?) "
             f"AND paper_id IN ({placeholders})",
             [claim_id, _norm_claim(claim)] + list(paper_ids),
@@ -2415,18 +2428,30 @@ def _prior_readings(claim, paper_ids):
     for r in rows:
         entry = out.setdefault(r["paper_id"],
                                {"counts": {}, "reasons": [], "readers_set": set(),
-                                "models": set()})
+                                "models": set(), "onchain": []})
         entry["counts"][r["verdict"]] = entry["counts"].get(r["verdict"], 0) + 1
         entry["readers_set"].add(r["judged_by"])
         entry["models"].add(r["judged_by_model"] or JUDGMENT_MODEL_UNKNOWN)
         if r["reason"]:
             entry["reasons"].append(_clip(r["reason"], 400))
+        # a wallet-signed verdict carries a live SAS attestation: surface it so
+        # a caller can verify the signature themselves instead of trusting us
+        pda = r["attestation_pda"]
+        if pda:
+            judged_by = r["judged_by"] or ""
+            reviewer = judged_by[len("wallet:"):] if judged_by.startswith("wallet:") else judged_by
+            entry["onchain"].append({
+                "reviewer": reviewer,
+                "verdict": r["verdict"],
+                "attestation": pda,
+                "explorer_url": f"https://explorer.solana.com/address/{pda}?cluster=devnet",
+            })
     for pid, entry in out.items():
         models = entry.pop("models")
         readers = entry.pop("readers_set")
         entry["readers"] = len(readers)
         entry["distinct_models"] = sorted(models)
-        entry["status"] = _judgment_status(entry["counts"], len(readers), models)
+        entry["status"] = _judgment_status(entry["counts"], readers, models)
     return out
 
 
@@ -2511,6 +2536,209 @@ def adjudicate(body: AdjudicateBody, x_api_key: Optional[str] = Header(default=N
         "quorum": CONFIRMATION_QUORUM,
         "note": ("A verdict is settled once independent readers agree. Until then it is "
                  "one reader's opinion and is reported as such."),
+    }
+
+
+# ---------------- wallet-signed verdicts (attestor / Solana Attestation Service) ----------------
+#
+# /v1/adjudicate trusts the caller's API key as the reader's identity. A
+# public, keyless MCP endpoint shares one API key across every anonymous
+# caller, so that identity cannot tell readers apart -- nothing stops it from
+# filing contradictory verdicts against itself. These two endpoints let a
+# caller anchor a verdict to its own wallet instead: it signs the exact
+# message /v1/verdict/message hands back, attestor checks the signature and
+# writes it on devnet as a SAS attestation, and only then does it land here.
+
+def _attestor_headers():
+    return {"X-Internal-Token": ATTESTOR_INTERNAL_TOKEN, "Content-Type": "application/json"}
+
+
+def _attestor_error_detail(resp):
+    try:
+        return resp.json().get("error", resp.text)
+    except ValueError:
+        return resp.text
+
+
+class VerdictMessageBody(BaseModel):
+    claim: str
+    paper_id: str
+    verdict: str
+    evidence_sha256: Optional[str] = None
+    # left for the caller to pass through if it already has one (e.g. re-signing
+    # a stale message); attestor stamps it itself when omitted
+    issued_at: Optional[str] = None
+
+
+@app.post("/v1/verdict/message")
+def verdict_message(body: VerdictMessageBody, x_api_key: Optional[str] = Header(default=None)):
+    """Canonical message to sign for a wallet-backed verdict.
+
+    claim_id is resolved through the same claim-node lookup /v1/adjudicate
+    uses (_canonical_claim), so the same question asked in different words
+    still signs against the one node it belongs to -- the caller never has to
+    know the registry's internal id scheme. The returned message is exactly
+    what /v1/adjudicate/signed -> attestor will rebuild and check the
+    signature against, so signing anything else will fail verification.
+    """
+    auth_and_limit(x_api_key, "adjudicate")
+    claim = (body.claim or "").strip()
+    if not claim:
+        raise HTTPException(status_code=400, detail="claim must not be empty")
+    paper_id = (body.paper_id or "").strip()
+    if not paper_id:
+        raise HTTPException(status_code=400, detail="paper_id must not be empty")
+    if body.verdict not in JUDGMENT_VERDICTS:
+        raise HTTPException(status_code=400,
+                            detail=f"verdict must be one of {sorted(JUDGMENT_VERDICTS)}")
+
+    conn = _judgments_conn()
+    try:
+        claim_id, _ = _canonical_claim(conn, claim)
+    finally:
+        conn.close()
+
+    payload = {
+        "claim_id": claim_id,
+        "claim_text": claim,
+        "paper_id": paper_id,
+        "verdict": body.verdict,
+    }
+    if body.evidence_sha256:
+        payload["evidence_sha256"] = body.evidence_sha256
+    if body.issued_at:
+        payload["issued_at"] = body.issued_at
+
+    try:
+        resp = requests.post(f"{ATTESTOR_URL}/message", headers=_attestor_headers(),
+                             json=payload, timeout=10)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=503, detail=f"attestor unavailable: {e}")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"attestor error: {_attestor_error_detail(resp)}")
+    return resp.json()
+
+
+class SignedJudgmentItem(BaseModel):
+    id: str  # paper id
+    verdict: str
+    reason: Optional[str] = None
+    evidence_sha256: Optional[str] = None
+    reviewer: str  # base58 ed25519 pubkey
+    signature: str  # base58 ed25519 signature over the /v1/verdict/message canonical message
+    issued_at: str
+
+
+class AdjudicateSignedBody(BaseModel):
+    claim: str
+    layer: Optional[str] = None
+    judgments: List[SignedJudgmentItem] = Field(..., min_length=1, max_length=20)
+
+
+@app.post("/v1/adjudicate/signed")
+def adjudicate_signed(body: AdjudicateSignedBody, x_api_key: Optional[str] = Header(default=None)):
+    """Wallet-signed /v1/adjudicate: the reviewer identity is a signature, not an API key.
+
+    Each judgment is sent to attestor, which recomputes the canonical message
+    from claim_id/paper_id/verdict/evidence, verifies the ed25519 signature
+    against the given reviewer pubkey, and -- only once that checks out --
+    writes a SAS attestation on devnet. Nothing is written to this registry
+    without a matching on-chain attestation: a bad signature fails that one
+    item with a 400 and the rest of the batch is still processed; attestor
+    being unreachable fails the whole call with 503 and nothing is recorded.
+
+    judged_by is stored as "wallet:<reviewer>", so two different wallets are
+    two independent readers for quorum purposes even with no declared model,
+    while the same wallet repeating itself is still one reader (see
+    _judgment_status).
+    """
+    auth_and_limit(x_api_key, "adjudicate")
+    claim = (body.claim or "").strip()
+    if not claim:
+        raise HTTPException(status_code=400, detail="claim must not be empty")
+
+    conn = _judgments_conn()
+    try:
+        claim_id, is_new = _canonical_claim(conn, claim)
+    finally:
+        conn.close()
+
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    results = []
+    for j in body.judgments:
+        item_result = {"id": j.id}
+        if j.verdict not in JUDGMENT_VERDICTS:
+            item_result["status"] = 400
+            item_result["error"] = f"verdict must be one of {sorted(JUDGMENT_VERDICTS)}"
+            results.append(item_result)
+            continue
+
+        payload = {
+            "claim_id": claim_id,
+            "claim_text": claim,
+            "paper_id": j.id,
+            "verdict": j.verdict,
+            "reviewer": j.reviewer,
+            "signature": j.signature,
+            "issued_at": j.issued_at,
+        }
+        if j.evidence_sha256:
+            payload["evidence_sha256"] = j.evidence_sha256
+
+        try:
+            resp = requests.post(f"{ATTESTOR_URL}/attest", headers=_attestor_headers(),
+                                 json=payload, timeout=20)
+        except requests.RequestException as e:
+            # a partial batch already attested cannot be undone, but nothing
+            # further gets written without its own attestation
+            raise HTTPException(status_code=503, detail=f"attestor unavailable: {e}")
+
+        if resp.status_code in (400, 429):
+            item_result["status"] = resp.status_code
+            item_result["error"] = _attestor_error_detail(resp)
+            results.append(item_result)
+            continue
+        if resp.status_code != 200:
+            raise HTTPException(status_code=503,
+                                detail=f"attestor error: {_attestor_error_detail(resp)}")
+
+        attestation = resp.json()
+        identity = f"wallet:{j.reviewer}"
+        conn = _judgments_conn()
+        try:
+            conn.execute(
+                "INSERT INTO claim_judgments "
+                "(claim_norm, claim_text, claim_id, paper_id, verdict, reason, judged_by, "
+                " judged_by_model, judged_at, layer, attestation_pda, attestation_tx) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(claim_norm, paper_id, judged_by) DO UPDATE SET "
+                "verdict=excluded.verdict, reason=excluded.reason, judged_at=excluded.judged_at, "
+                "claim_id=excluded.claim_id, attestation_pda=excluded.attestation_pda, "
+                "attestation_tx=excluded.attestation_tx",
+                (_norm_claim(claim), claim, claim_id, j.id, j.verdict, (j.reason or "")[:600],
+                 identity, JUDGMENT_MODEL_UNKNOWN, now, body.layer,
+                 attestation.get("attestation"), attestation.get("signature")),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        item_result["status"] = 200
+        item_result["attestation_pda"] = attestation.get("attestation")
+        item_result["attestation_tx"] = attestation.get("signature")
+        item_result["explorer_url"] = attestation.get("explorer_url")
+        results.append(item_result)
+
+    readings = _prior_readings(claim, [j.id for j in body.judgments])
+    return {
+        "claim": claim,
+        "claim_id": claim_id,
+        "new_claim_node": is_new,
+        "results": results,
+        "papers": {pid: {"status": r["status"], "readers": r["readers"], "counts": r["counts"],
+                         "onchain": r["onchain"]}
+                   for pid, r in readings.items()},
+        "quorum": CONFIRMATION_QUORUM,
     }
 
 

@@ -80,6 +80,10 @@ callers share the server identity and can poison the claim registry.
 
 The pipeline is designed to be killed. Every stage commits per paper, so a crash or a reboot resumes from the last committed status rather than starting over.
 
+## Verifiable verdicts on Solana
+
+The public MCP is read-only by default because every anonymous caller shares one server identity, and a shared identity can't be trusted to judge claims against itself. `attestor` (see `attestor/README.md`) fixes this by moving the trust anchor from "the API key" to "the caller's own wallet": an agent signs its verdict with an ed25519 keypair it controls, and the signed verdict is written to Solana devnet as a Solana Attestation Service (SAS) attestation that anyone can verify independently of dtox. Two MCP tools are always available, unsigned-write restrictions notwithstanding: `get_verdict_message` returns the exact canonical string to sign for a given claim/paper/verdict, and `record_signed_verdict` submits the signature for verification and on-chain attestation. The flow is search → read the candidates → `get_verdict_message` → sign it with your wallet → `record_signed_verdict` → the verdict lands as a SAS attestation on devnet, with your pubkey and signature embedded in the attested data. This does not by itself stop sybil attacks (a wallet is free to create), which is why quorum still requires multiple distinct wallets; the planned mitigation is an x402 payment gate on writes, making each identity cost something.
+
 ## Tests
 
 ```bash

@@ -1,0 +1,19 @@
+[Unit]
+Description=dtox attestor (signed claim verdicts -> Solana Attestation Service, devnet)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dtox-attestor
+EnvironmentFile=/opt/dtox-attestor/internal.env
+Environment=ATTESTOR_PORT=8013
+Environment=ATTESTOR_KEYPAIR_PATH=/opt/dtox-attestor/authority.json
+Environment=SOLANA_RPC_URL=https://api.devnet.solana.com
+ExecStart=/usr/bin/node dist/src/server.js
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

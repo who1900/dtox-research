@@ -264,6 +264,108 @@ def compare_methods(
     return resp.json()
 
 
+@mcp.tool()
+def get_verdict_message(
+    claim: str,
+    paper_id: str,
+    verdict: str,
+    evidence_sha256: Optional[str] = None,
+) -> dict:
+    """Get the exact message to sign for a verifiable, on-chain verdict.
+
+    Step one of filing a wallet-backed verdict; it writes nothing. It returns
+    the canonical UTF-8 string this claim/paper/verdict combination hashes
+    to. Sign it with the ed25519 secret key of a Solana wallet you control --
+    the same primitive any Solana wallet already uses -- then pass the
+    base58 signature and your base58 public key to record_signed_verdict.
+    That call sends both to attestor, which recomputes this exact message
+    server-side, verifies your signature against it, and only then writes
+    the verdict to Solana devnet as a Solana Attestation Service (SAS)
+    attestation. Anyone can independently verify your signature against the
+    attested on-chain data without trusting dtox at all.
+
+    Args:
+        claim: The claim, in your own words. Wordings that mean the same
+            thing resolve to one claim_id, returned here and required by
+            record_signed_verdict.
+        paper_id: The paper you are ruling on, e.g. "2401.12345".
+        verdict: "asserts", "does_not_assert" or "partial".
+        evidence_sha256: Optional hex sha256 of the evidence text backing
+            the verdict. Leave unset if you have none.
+
+    Returns:
+        dict with "message" (the exact string to sign), "claim_id",
+        "claim_sha256", "paper_id", "verdict", "evidence_sha256" and
+        "issued_at" (stamped by the server -- pass it through unchanged to
+        record_signed_verdict, since your signature covers it).
+    """
+    try:
+        payload = {"claim": claim, "paper_id": paper_id, "verdict": verdict}
+        if evidence_sha256:
+            payload["evidence_sha256"] = evidence_sha256
+        resp = requests.post(f"{RESEARCH_API_BASE}/v1/verdict/message", headers=_headers(),
+                             json=payload, timeout=15)
+    except requests.RequestException as e:
+        return {"error": f"research api unavailable: {e}"}
+    err = _handle_error(resp)
+    if err:
+        return err
+    return resp.json()
+
+
+@mcp.tool()
+def record_signed_verdict(
+    claim: str,
+    judgments: List[dict],
+    layer: Optional[str] = None,
+) -> dict:
+    """File a verdict signed by your own Solana wallet -- verifiable on-chain.
+
+    Always available on this public endpoint, unlike record_claim_judgment:
+    your identity here is your wallet's ed25519 signature, not a shared API
+    key, so an anonymous caller cannot use it to poison the registry under
+    someone else's name. Get the message to sign from get_verdict_message
+    first, sign it with the ed25519 secret key of a Solana wallet, and pass
+    the result here. attestor verifies the signature and writes a Solana
+    Attestation Service (SAS) attestation on devnet before anything lands in
+    the registry: a bad signature is rejected for that one item (status 400
+    in its result entry) while the rest of the batch is still processed; if
+    attestor itself cannot be reached the whole call fails and nothing is
+    written.
+
+    Args:
+        claim: The exact claim text you called get_verdict_message with.
+        judgments: One entry per paper, each
+            {"id": "2401.12345", "verdict": "asserts", "reason": "...",
+             "evidence_sha256": "<hex, optional>",
+             "reviewer": "<your base58 Solana public key>",
+             "signature": "<base58 ed25519 signature over the message
+                             get_verdict_message returned>",
+             "issued_at": "<the issued_at get_verdict_message returned>"}.
+            verdict is "asserts", "does_not_assert" or "partial".
+        layer: The layer the claim was audited in, if you used one.
+
+    Returns:
+        dict with per-item "results" (status 200 with attestation_pda /
+        attestation_tx / explorer_url on success, or status 400/429 with an
+        error otherwise), plus "papers" with each paper's confirmation
+        status and an "onchain" list of its verified attestations
+        ({reviewer, verdict, attestation, explorer_url}).
+    """
+    try:
+        payload = {"claim": claim, "judgments": judgments}
+        if layer:
+            payload["layer"] = layer
+        resp = requests.post(f"{RESEARCH_API_BASE}/v1/adjudicate/signed", headers=_headers(),
+                             json=payload, timeout=60)
+    except requests.RequestException as e:
+        return {"error": f"research api unavailable: {e}"}
+    err = _handle_error(resp)
+    if err:
+        return err
+    return resp.json()
+
+
 def record_claim_judgment(claim: str, judgments: List[dict],
                           layer: Optional[str] = None,
                           judged_by_model: Optional[str] = None) -> dict:

@@ -1,0 +1,30 @@
+{
+  "name": "dtox-attestor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20 <23"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/server.ts",
+    "start": "node dist/src/server.js",
+    "test": "tsx --test test/*.test.ts",
+    "demo-sign": "tsx scripts/demo-sign.ts"
+  },
+  "dependencies": {
+    "@noble/ed25519": "3.2.0",
+    "@noble/hashes": "2.4.0",
+    "bs58": "6.0.0",
+    "express": "5.1.0",
+    "sas-lib": "1.0.10",
+    "@solana/kit": "5.0.0"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.3",
+    "@types/node": "22.18.0",
+    "tsx": "4.20.5",
+    "typescript": "5.9.2"
+  }
+}

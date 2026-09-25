@@ -26,13 +26,21 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: x402-gateway/package-lock.json
+          cache-dependency-path: |
+            x402-gateway/package-lock.json
+            attestor/package-lock.json
       - run: npm ci
         working-directory: x402-gateway
       - run: npm test
         working-directory: x402-gateway
       - run: npm run build
         working-directory: x402-gateway
+      - run: npm ci
+        working-directory: attestor
+      - run: npm test
+        working-directory: attestor
+      - run: npm run build
+        working-directory: attestor
 
   image:
     runs-on: ubuntu-24.04
