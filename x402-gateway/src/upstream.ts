@@ -38,6 +38,8 @@ export function createResearchUpstream(config: GatewayConfig) {
     spec: (body: Record<string, unknown>) => call("get_code_or_math_spec", body),
     compare: (body: Record<string, unknown>) => call("compare_methods", body),
     trends: (body: Record<string, unknown>) => call("research_trends", body),
-    validate: (body: Record<string, unknown>) => call("validate_project", body)
+    validate: (body: Record<string, unknown>) => call("validate_project", body),
+    verdictMessage: (body: Record<string, unknown>) => call("get_verdict_message", body),
+    recordSignedVerdict: (body: Record<string, unknown>) => call("record_signed_verdict", body)
   };
 }

@@ -56,6 +56,7 @@ export interface PaidWrappers {
   compare: Paid | null;
   trends: Paid | null;
   audit: Paid | null;
+  verdict: Paid | null;
 }
 
 export function registerTools(
@@ -70,15 +71,16 @@ export function registerTools(
       mode: config.mode,
       networks: [...config.evmNetworks, config.svmNetwork],
       settlement_asset: "USDC",
-      free_tools: ["dtox_service_info", "search_research_preview"],
+      free_tools: ["dtox_service_info", "search_research_preview", "get_verdict_message"],
       paid_tools: {
         get_evidence_bundle: config.prices.evidence,
         get_code_or_math_spec: config.prices.spec,
         compare_methods: config.prices.compare,
         research_trends: config.prices.trends,
-        validate_project: config.prices.audit
+        validate_project: config.prices.audit,
+        record_signed_verdict: config.prices.verdict
       },
-      note: "Prices are quoted before execution. Payment does not grant permission to write to the claim registry."
+      note: "Prices are quoted before execution. The only write this gateway exposes is record_signed_verdict, gated both by payment and by the caller's own wallet signature over the verdict text -- it never proxies the shared-API-key claim-registry mutation tools."
     })
   );
 
@@ -168,5 +170,36 @@ export function registerTools(
       deep: z.boolean().default(true)
     },
     paidOrShadow(config, wrappers.audit, config.prices.audit, async (args) => api.validate(args))
+  );
+
+  server.tool(
+    "get_verdict_message",
+    "Free: the exact canonical message to sign for a wallet-backed, on-chain claim verdict. Writes nothing.",
+    {
+      claim: z.string().min(3).max(1000),
+      paper_id: z.string().min(3).max(100),
+      verdict: z.enum(["asserts", "does_not_assert", "partial"]),
+      evidence_sha256: z.string().max(64).optional()
+    },
+    handler(async (args) => api.verdictMessage(args))
+  );
+
+  server.tool(
+    "record_signed_verdict",
+    `File a claim verdict signed by your own Solana wallet as a Solana Attestation Service attestation on devnet. Payment is a sybil mitigation: every write costs money. Price: ${config.prices.verdict} USDC. Never mutates dtox's shared claim registry directly -- only wallet-signed, individually attested verdicts.`,
+    {
+      claim: z.string().min(3).max(1000),
+      judgments: z.array(z.object({
+        id: z.string().min(3).max(100),
+        verdict: z.enum(["asserts", "does_not_assert", "partial"]),
+        reason: z.string().max(2000).optional(),
+        evidence_sha256: z.string().max(64).optional(),
+        reviewer: z.string().min(32).max(44),
+        signature: z.string().min(1),
+        issued_at: z.string().min(1)
+      })).min(1).max(20),
+      layer: z.enum(["llm-slm", "ai-agents", "web3"]).optional()
+    },
+    paidOrShadow(config, wrappers.verdict, config.prices.verdict, async (args) => api.recordSignedVerdict(args))
   );
 }

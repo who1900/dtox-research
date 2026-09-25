@@ -11,11 +11,17 @@ import { registerTools, type PaidWrappers } from "./tools.js";
 import { createResearchUpstream } from "./upstream.js";
 
 async function createWrappers(config: GatewayConfig): Promise<PaidWrappers> {
-  const empty: PaidWrappers = { evidence: null, spec: null, compare: null, trends: null, audit: null };
+  const empty: PaidWrappers = { evidence: null, spec: null, compare: null, trends: null, audit: null, verdict: null };
   if (config.mode !== "live") return empty;
 
+  // Solana-only live mode (see config.ts): no EVM payTo means no EVM scheme is registered at
+  // all, so a caller can never be offered an EVM payment option it has no address to settle to.
+  const evmEnabled = config.evmNetworks.length > 0 && Boolean(config.evmPayTo);
+
   const resourceServer = new x402ResourceServer(new HTTPFacilitatorClient({ url: config.facilitatorUrl }));
-  for (const network of config.evmNetworks) resourceServer.register(network, new ExactEvmScheme());
+  if (evmEnabled) {
+    for (const network of config.evmNetworks) resourceServer.register(network, new ExactEvmScheme());
+  }
   resourceServer.register(config.svmNetwork, new ExactSvmScheme());
   await resourceServer.initialize();
 
@@ -27,13 +33,13 @@ async function createWrappers(config: GatewayConfig): Promise<PaidWrappers> {
     example: Record<string, unknown>
   ) {
     const requirements = await Promise.all([
-      ...config.evmNetworks.map((network) => resourceServer.buildPaymentRequirements({
+      ...(evmEnabled ? config.evmNetworks.map((network) => resourceServer.buildPaymentRequirements({
         scheme: "exact",
         network,
         payTo: config.evmPayTo,
         price,
         extra: { name: "USDC", version: "2" }
-      })),
+      })) : []),
       resourceServer.buildPaymentRequirements({
         scheme: "exact",
         network: config.svmNetwork,
@@ -60,7 +66,7 @@ async function createWrappers(config: GatewayConfig): Promise<PaidWrappers> {
     });
   }
 
-  const [evidence, spec, compare, trends, audit] = await Promise.all([
+  const [evidence, spec, compare, trends, audit, verdict] = await Promise.all([
     wrapper("get_evidence_bundle", config.prices.evidence,
       "Search structured full-text research evidence with sources and provenance.",
       { type: "object", properties: { query: { type: "string" }, layer: { enum: ["llm-slm", "ai-agents", "web3"] } }, required: ["query"] },
@@ -80,9 +86,13 @@ async function createWrappers(config: GatewayConfig): Promise<PaidWrappers> {
     wrapper("validate_project", config.prices.audit,
       "Audit technical claims against source-backed literature evidence.",
       { type: "object", properties: { idea: { type: "string" }, claims: { type: "array", items: { type: "string" } }, layer: { enum: ["llm-slm", "ai-agents", "web3"] } }, required: ["idea", "claims"] },
-      { idea: "An autonomous payment agent", claims: ["uses zero knowledge proofs to aggregate state-channel settlements"], layer: "web3" })
+      { idea: "An autonomous payment agent", claims: ["uses zero knowledge proofs to aggregate state-channel settlements"], layer: "web3" }),
+    wrapper("record_signed_verdict", config.prices.verdict,
+      "File a wallet-signed claim verdict as a Solana Attestation Service attestation on devnet. Payment is a sybil mitigation on this anonymous write path.",
+      { type: "object", properties: { claim: { type: "string" }, judgments: { type: "array", items: { type: "object" } }, layer: { enum: ["llm-slm", "ai-agents", "web3"] } }, required: ["claim", "judgments"] },
+      { claim: "the protocol tolerates byzantine faults under partial synchrony", judgments: [{ id: "2401.12345", verdict: "asserts", reviewer: "<base58 pubkey>", signature: "<base58 signature>", issued_at: "2026-09-26T00:00:00Z" }] })
   ]);
-  return { evidence, spec, compare, trends, audit };
+  return { evidence, spec, compare, trends, audit, verdict };
 }
 
 async function createMcpServer(config: GatewayConfig, wrappers: PaidWrappers): Promise<McpServer> {
