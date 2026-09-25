@@ -16,3 +16,5 @@ node_modules/
 dist/
 monitor_state.json
 harness_baseline.json
+*.log
+*.log.*

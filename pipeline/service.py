@@ -356,6 +356,18 @@ FRESH_WINDOW_DAYS = 5
 FRESH_POLL_SECONDS = 60 * 60
 SPEC_REFRESH_SECONDS = 24 * 60 * 60
 OPENALEX_FRESH_MAX_PAGES = 10
+# Optional API key (unlocks a much higher daily credit budget). Never logged.
+OPENALEX_API_KEY = os.getenv("OPENALEX_API_KEY", "")
+# Without a key OpenAlex meters a per-IP daily credit budget that resets at
+# midnight UTC; a 429 carries Retry-After (seconds to that reset). Hitting
+# openalex_gate.penalize(60) on that response just re-attacks the wall every
+# minute for hours, burning a request each time. This pause is instead
+# persisted in scheduler_state (restart-safe, like _poll_due) and checked
+# before spending a request at all.
+OPENALEX_PAUSE_KEY = "openalex:paused_until"
+OPENALEX_RETRY_AFTER_FALLBACK = 3600
+OPENALEX_RETRY_AFTER_MIN = 60
+OPENALEX_RETRY_AFTER_MAX = 86400
 OPENALEX_QUERIES = (
     "zero knowledge proof blockchain", "zk rollup", "blockchain rollup",
     "maximal extractable value blockchain", "smart contract security",
@@ -1905,7 +1917,10 @@ def iacr_twin_step(conn):
             raw = resp.content
         except requests.RequestException as e:
             status = getattr(getattr(e, "response", None), "status_code", None)
-            if status in (406, 429, 503):
+            # 406 is export.arxiv.org's standing IP block, not a transient
+            # rate signal (see fetch_page); penalizing on it pauses e-print
+            # downloads that share arxiv_gate for no reason.
+            if status in (429, 503):
                 arxiv_gate.penalize()
             continue
         try:
@@ -2186,7 +2201,10 @@ def fetch_abstract_fallback(arxiv_id: str, session: requests.Session = None):
         return " ".join(summary_el.text.split())
     except Exception as e:
         status = getattr(getattr(e, "response", None), "status_code", None)
-        if status in (406, 429, 503):
+        # 406 is export.arxiv.org's standing IP block, not a transient rate
+        # signal (see fetch_page); penalizing on it pauses e-print downloads
+        # that share arxiv_gate for no reason.
+        if status in (429, 503):
             arxiv_gate.penalize()
         log.warning(f"fulltext: abstract fallback failed for {arxiv_id}: {e}")
         return None
@@ -2961,6 +2979,29 @@ def _openalex_abstract(inverted):
     return " ".join(token for _, token in sorted(words)) or None
 
 
+def _openalex_pause_active(conn):
+    """True (silently, no log) if a persisted 429 backoff has not elapsed yet."""
+    raw = _sched_get(conn, OPENALEX_PAUSE_KEY)
+    try:
+        return time.time() < float(raw)
+    except (TypeError, ValueError):
+        return False
+
+
+def _openalex_set_pause(conn, retry_after_raw):
+    """Persist a 'not before' timestamp from a 429's Retry-After header so the
+    pause survives a service restart, and log once (not on every request)."""
+    try:
+        seconds = float(retry_after_raw)
+    except (TypeError, ValueError):
+        seconds = OPENALEX_RETRY_AFTER_FALLBACK
+    seconds = max(OPENALEX_RETRY_AFTER_MIN, min(OPENALEX_RETRY_AFTER_MAX, seconds))
+    until = time.time() + seconds
+    _sched_set(conn, OPENALEX_PAUSE_KEY, until)
+    until_str = datetime.fromtimestamp(until, timezone.utc).isoformat()
+    log.warning(f"openalex: 429 rate limited, pausing all requests until {until_str}")
+
+
 def openalex_seed_cursors(conn):
     added = 0
     for idx, _ in enumerate(OPENALEX_QUERIES):
@@ -2978,6 +3019,8 @@ def openalex_seed_cursors(conn):
 
 def openalex_harvest_step(conn, session):
     """Discover OA Web3 papers outside arXiv, one durable page at a time."""
+    if _openalex_pause_active(conn):
+        return 0
     openalex_seed_cursors(conn)
     if _poll_due(conn, "openalex:fresh", FRESH_POLL_SECONDS):
         conn.execute(
@@ -2989,7 +3032,10 @@ def openalex_harvest_step(conn, session):
         "SELECT query_key,next_start FROM harvest_cursor "
         "WHERE (query_key LIKE 'openalex@%' OR query_key LIKE 'openalex-fresh@%') "
         "AND done=0 "
-        "ORDER BY COALESCE(last_run_at,''), query_key LIMIT 1").fetchone()
+        # fresh cursors (recent papers) go first; within each group, oldest
+        # last_run_at first for round-robin fairness.
+        "ORDER BY (query_key NOT LIKE 'openalex-fresh@%'), COALESCE(last_run_at,''), query_key "
+        "LIMIT 1").fetchone()
     if row is None:
         return 0
     key = row["query_key"]
@@ -3000,23 +3046,29 @@ def openalex_harvest_step(conn, session):
     from_date = ((datetime.now(timezone.utc) - timedelta(days=FRESH_WINDOW_DAYS)).date().isoformat()
                  if fresh else f"{OPENALEX_START_YEAR}-01-01")
     openalex_gate.wait()
+    params = {
+        "search": query,
+        "filter": (f"from_publication_date:{from_date},"
+                   "is_oa:true,has_abstract:true"),
+        "sort": "publication_date:desc" if fresh else "cited_by_count:desc",
+        "page": page,
+        "per-page": OPENALEX_PAGE_SIZE,
+        "select": ("id,title,publication_year,cited_by_count,ids,"
+                   "abstract_inverted_index,best_oa_location,primary_location"),
+    }
+    if OPENALEX_API_KEY:
+        params["api_key"] = OPENALEX_API_KEY
     try:
-        resp = session.get(OPENALEX_API_URL, params={
-            "search": query,
-            "filter": (f"from_publication_date:{from_date},"
-                       "is_oa:true,has_abstract:true"),
-            "sort": "publication_date:desc" if fresh else "cited_by_count:desc",
-            "page": page,
-            "per-page": OPENALEX_PAGE_SIZE,
-            "select": ("id,title,publication_year,cited_by_count,ids,"
-                       "abstract_inverted_index,best_oa_location,primary_location"),
-        }, timeout=60, headers={"User-Agent": ARXIV_CONTACT_UA})
+        resp = session.get(OPENALEX_API_URL, params=params, timeout=60,
+                            headers={"User-Agent": ARXIV_CONTACT_UA})
     except requests.RequestException as e:
-        log.warning(f"openalex: request failed for {query!r}: {e}")
+        # str(e) can embed the full request URL (e.g. connection errors), which
+        # would leak api_key -- never let a bare exception into the log.
+        msg = str(e).replace(OPENALEX_API_KEY, "***") if OPENALEX_API_KEY else str(e)
+        log.warning(f"openalex: request failed for {query!r}: {msg}")
         return 0
     if resp.status_code == 429:
-        openalex_gate.penalize(60)
-        log.warning("openalex: 429 rate limited, backing off")
+        _openalex_set_pause(conn, resp.headers.get("Retry-After"))
         return 0
     if resp.status_code != 200:
         log.warning(f"openalex: status {resp.status_code}: {resp.text[:200]}")
