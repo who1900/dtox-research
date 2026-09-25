@@ -6,7 +6,8 @@ import re
 import sqlite3
 import time
 import threading
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Union
@@ -15,6 +16,10 @@ import requests
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+try:
+    from .search_core import fts_query, merge_layer_hits, reciprocal_rank_fusion
+except ImportError:
+    from search_core import fts_query, merge_layer_hits, reciprocal_rank_fusion
 
 QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
 COLLECTION = os.getenv("QDRANT_COLLECTION", "papers_fulltext")
@@ -28,6 +33,25 @@ SPEC_SECTION_TYPES = {"method", "architecture"}
 SPEC_TITLE_KEYWORDS = ("algorithm", "model", "method")
 
 app = FastAPI(title="dtox-research-api")
+search_latencies = deque(maxlen=500)
+
+
+@app.middleware("http")
+async def record_search_latency(request: Request, call_next):
+    started = time.monotonic()
+    try:
+        return await call_next(request)
+    finally:
+        if request.url.path == "/v1/search":
+            search_latencies.append(time.monotonic() - started)
+
+
+def _latency_percentile(values, percentile):
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, math.ceil(percentile * len(ordered)) - 1)
+    return round(ordered[max(0, index)], 3)
 
 # ---------------- API keys ----------------
 
@@ -142,14 +166,16 @@ qdrant_result_cache = TTLCache(ttl_seconds=600, max_size=1000)
 # already holds; sparse vectors inside Qdrant would have meant recreating a
 # collection of 820k points for the same effect.
 FTS_DB_PATH = os.getenv("FTS_DB_PATH", "/opt/dtox-research/fts.db")
-RRF_K = 60                 # standard reciprocal rank fusion constant
 BM25_CANDIDATES = 40
+LEXICAL_QUERY_TIMEOUT = float(os.getenv("LEXICAL_QUERY_TIMEOUT", "2"))
+SEARCH_EMBED_WAIT_TIMEOUT = float(os.getenv("SEARCH_EMBED_WAIT_TIMEOUT", "2"))
+SEARCH_EMBED_HTTP_TIMEOUT = float(os.getenv("SEARCH_EMBED_HTTP_TIMEOUT", "4"))
+SEARCH_QDRANT_TIMEOUT = float(os.getenv("SEARCH_QDRANT_TIMEOUT", "6"))
 
 
 def _fts_query(text):
     """FTS5 MATCH string: words ANDed, operators stripped, phrases quoted."""
-    words = [w for w in re.findall(r"[A-Za-z0-9][A-Za-z0-9\-]*", text or "") if len(w) > 1]
-    return " AND ".join(f'"{w}"' for w in words[:12])
+    return fts_query(text)
 
 
 def _bm25_candidates(query, layer=None, section_type=None, element_type=None,
@@ -181,6 +207,8 @@ def _bm25_candidates(query, layer=None, section_type=None, element_type=None,
     except sqlite3.Error:
         return []
     try:
+        deadline = time.monotonic() + LEXICAL_QUERY_TIMEOUT
+        conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
         rows = conn.execute(sql, params + [limit * 3]).fetchall()
     except sqlite3.Error:
         return []
@@ -264,12 +292,7 @@ def _rrf(*ranked_lists, weights=None):
     lexical one is there to add what it misses; fused at equal weight the two
     tie at every rank and the tie-break is arbitrary, which cost two harness
     cases their verdict the moment hybrid search was switched on."""
-    weights = weights or [1.0] * len(ranked_lists)
-    scores = {}
-    for lst, w in zip(ranked_lists, weights):
-        for rank, key in enumerate(lst):
-            scores[key] = scores.get(key, 0.0) + w / (RRF_K + rank + 1)
-    return scores
+    return reciprocal_rank_fusion(*ranked_lists, weights=weights)
 
 
 # ---------------- helpers ----------------
@@ -285,17 +308,19 @@ API_EMBED_SLOTS = threading.Semaphore(2)
 EMBED_WAIT_TIMEOUT = 25
 
 
-def embed_query(text: str) -> List[float]:
+def embed_query(text: str, wait_timeout=EMBED_WAIT_TIMEOUT,
+                request_timeout=30) -> List[float]:
     text = (text or "").strip()
     cached = embedding_cache.get(text)
     if cached is not None:
         return cached
-    if not API_EMBED_SLOTS.acquire(timeout=EMBED_WAIT_TIMEOUT):
+    if not API_EMBED_SLOTS.acquire(timeout=wait_timeout):
         raise HTTPException(
             status_code=503,
             detail="the embedding service is busy building the index; retry shortly")
     try:
-        resp = requests.post(EMBED_URL, json={"text": text, "query": True}, timeout=30)
+        resp = requests.post(EMBED_URL, json={"text": text, "query": True},
+                             timeout=request_timeout)
         resp.raise_for_status()
         vector = resp.json()["vector"]
         embedding_cache.set(text, vector)
@@ -385,7 +410,7 @@ def prime_qdrant_searches(texts, layer, limit=80):
     try:
         resp = requests.post(
             f"{QDRANT_URL}/collections/{COLLECTION}/points/search/batch",
-            json={"searches": searches}, timeout=60,
+            json={"searches": searches}, timeout=min(12, SEARCH_QDRANT_TIMEOUT * 2),
         )
         resp.raise_for_status()
         result_sets = resp.json().get("result") or []
@@ -397,7 +422,7 @@ def prime_qdrant_searches(texts, layer, limit=80):
         return
 
 
-def qdrant_search(vector, qfilter, limit):
+def qdrant_search(vector, qfilter, limit, timeout=45):
     cache_key = _qdrant_cache_key(vector, qfilter)
     cached = qdrant_result_cache.get(cache_key)
     if cached is not None and cached["limit"] >= limit:
@@ -406,13 +431,41 @@ def qdrant_search(vector, qfilter, limit):
     if qfilter:
         body["filter"] = qfilter
     try:
-        resp = requests.post(f"{QDRANT_URL}/collections/{COLLECTION}/points/search", json=body, timeout=45)
+        resp = requests.post(f"{QDRANT_URL}/collections/{COLLECTION}/points/search",
+                             json=body, timeout=timeout)
         resp.raise_for_status()
         results = resp.json()["result"]
         qdrant_result_cache.set(cache_key, {"limit": limit, "results": results})
         return results
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"qdrant error: {e}")
+
+
+def qdrant_search_layers(vector, base_filter, limit, timeout=SEARCH_QDRANT_TIMEOUT):
+    """Search each topical payload index and RRF the lists.
+
+    A global HNSW request over millions of chunks became the slowest public
+    path as the corpus grew. Per-layer filters use the payload indexes and stop
+    the LLM-heavy layer from suppressing smaller Web3 and builder-tech layers.
+    """
+    def search_layer(layer):
+        must = list((base_filter or {}).get("must") or [])
+        must.append({"key": "layers", "match": {"any": [layer]}})
+        return qdrant_search(vector, {"must": must}, limit, timeout=timeout)
+
+    result_sets, failed = [], []
+    with ThreadPoolExecutor(max_workers=len(ALLOWED_LAYERS)) as pool:
+        futures = {pool.submit(search_layer, layer): layer
+                   for layer in sorted(ALLOWED_LAYERS)}
+        for future in as_completed(futures):
+            layer = futures[future]
+            try:
+                result_sets.append(future.result())
+            except HTTPException:
+                failed.append(layer)
+    if not result_sets:
+        raise HTTPException(status_code=502, detail="qdrant layer searches timed out")
+    return merge_layer_hits(result_sets, limit), sorted(failed)
 
 
 def qdrant_scroll_by_arxiv(arxiv_id: str, limit=1000):
@@ -570,6 +623,120 @@ def license_of(paper_id):
     return LICENSE_INFO.get(source_of(paper_id), LICENSE_INFO["arxiv"])
 
 
+def _result_from_hit(hit):
+    payload = hit.get("payload") or {}
+    paper_id = payload.get("arxiv_id")
+    return {
+        "arxiv_id": paper_id,
+        "source": SOURCE_LABELS[source_of(paper_id)],
+        "url": source_url(paper_id, payload),
+        "license": license_of(paper_id),
+        "title": payload.get("title"),
+        "section_type": payload.get("section_type"),
+        "section_title": payload.get("section_title"),
+        "element_type": payload.get("element_type"),
+        "year": payload.get("year"),
+        "repos": payload.get("repos") or [],
+        "terms": payload.get("terms") or [],
+        "text": (payload.get("text") or "")[:500],
+        "score": hit.get("score"),
+        "layers": payload.get("layers"),
+        "venue": payload.get("venue"),
+        "citation_count": payload.get("citation_count"),
+        "fulltext": source_of(paper_id) in FULLTEXT_SOURCES,
+        "arxiv_url": source_url(paper_id, payload),
+    }
+
+
+def _lexical_fallback_results(query, paper_ids, limit):
+    """Hydrate exact FTS hits without waiting for the vector service.
+
+    These carry no cosine score and therefore cannot become direct evidence in
+    validate_project. They keep exact identifiers and protocol terms visible
+    when dense retrieval is temporarily unavailable.
+    """
+    ids = list(dict.fromkeys(pid for pid in paper_ids if pid))[:limit]
+    if not ids:
+        return []
+    match = _fts_query(query)
+    if not match:
+        return []
+    marks = ",".join("?" * len(ids))
+    fts = None
+    try:
+        fts = sqlite3.connect(f"file:{FTS_DB_PATH}?mode=ro", uri=True, timeout=2)
+        deadline = time.monotonic() + LEXICAL_QUERY_TIMEOUT
+        fts.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
+        rows = fts.execute(
+            f"SELECT text, arxiv_id, section_type, element_type, layers, year "
+            f"FROM chunks WHERE chunks MATCH ? AND arxiv_id IN ({marks}) "
+            f"ORDER BY bm25(chunks) LIMIT ?", [match, *ids, limit * 3]
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        if fts is not None:
+            fts.close()
+    best = {}
+    for row in rows:
+        best.setdefault(row[1], row)
+    try:
+        state = sqlite3.connect(f"file:{STATE_DB_PATH}?mode=ro", uri=True, timeout=2)
+        meta = {row[0]: row[1:] for row in state.execute(
+            f"SELECT arxiv_id,title,citation_count,venue,niche_score,matched_terms,source_url "
+            f"FROM papers WHERE arxiv_id IN ({marks})", ids).fetchall()}
+        state.close()
+    except sqlite3.Error:
+        meta = {}
+    results = []
+    for paper_id in ids:
+        row = best.get(paper_id)
+        if not row:
+            continue
+        title, citations, venue, niche, matched, stored_url = meta.get(
+            paper_id, (None, None, None, None, None, None))
+        try:
+            terms = json.loads(matched) if matched else []
+        except (TypeError, json.JSONDecodeError):
+            terms = []
+        layers = [layer for layer in sorted(ALLOWED_LAYERS) if layer in (row[4] or "")]
+        payload = {"source_url": stored_url}
+        results.append({
+            "arxiv_id": paper_id,
+            "source": SOURCE_LABELS[source_of(paper_id)],
+            "url": source_url(paper_id, payload),
+            "license": license_of(paper_id),
+            "title": title,
+            "section_type": row[2],
+            "section_title": None,
+            "element_type": row[3],
+            "year": row[5],
+            "repos": [],
+            "terms": terms,
+            "text": (row[0] or "")[:500],
+            "score": None,
+            "layers": layers,
+            "venue": venue,
+            "citation_count": citations,
+            "fulltext": source_of(paper_id) in FULLTEXT_SOURCES,
+            "arxiv_url": source_url(paper_id, payload),
+            "found_via": "lexical fallback",
+            "channels": ["lexical"],
+            "niche_score": niche,
+        })
+    return results
+
+
+def _scored_results_for_audit(payload):
+    scored = [hit for hit in payload.get("results", [])
+              if isinstance(hit.get("score"), (int, float))]
+    if payload.get("partial") and not scored:
+        raise HTTPException(
+            status_code=503,
+            detail="dense retrieval unavailable; refusing to audit from lexical-only matches")
+    return scored
+
+
 # ---------------- request/response models ----------------
 
 MIN_RELEVANCE_SCORE = 0.79
@@ -640,7 +807,10 @@ def search(body: SearchBody, x_api_key: Optional[str] = Header(default=None)):
     return _run_search(body, x_api_key)
 
 
-def _run_search(body: SearchBody, x_api_key=None):
+def _run_search(body: SearchBody, x_api_key=None,
+                dense_timeout=SEARCH_QDRANT_TIMEOUT,
+                embed_wait_timeout=SEARCH_EMBED_WAIT_TIMEOUT,
+                embed_http_timeout=SEARCH_EMBED_HTTP_TIMEOUT):
     """The search itself, without the rate limiter.
 
     /v1/validate runs several searches per claim (each phrasing, the corpus
@@ -659,7 +829,7 @@ def _run_search(body: SearchBody, x_api_key=None):
     terms = [t.strip().lower() for t in (body.terms or []) if t and t.strip()]
     cache_key = (query, body.layer, body.section_type, body.element_type,
                  tuple(sorted(terms)), body.dedupe, body.min_score,
-                 body.year_from, body.year_to, limit)
+                 body.year_from, body.year_to, limit, body.hybrid)
     cached = search_cache.get(cache_key)
     if cached is not None:
         return cached
@@ -682,9 +852,31 @@ def _run_search(body: SearchBody, x_api_key=None):
         must.append({"key": "year", "range": rng})
     qfilter = {"must": must} if must else None
 
-    vector = embed_query(query)
-    # over-fetch when deduping, since several chunks may share one paper
-    hits = qdrant_search(vector, qfilter, limit * 4 if body.dedupe else limit)
+    lexical_executor = ThreadPoolExecutor(max_workers=1) if body.hybrid else None
+    lexical_future = (lexical_executor.submit(
+        _bm25_candidates, query, body.layer, body.section_type,
+        body.element_type, body.year_from, body.year_to)
+        if lexical_executor else None)
+    vector, hits, dense_error, dense_partial = None, [], None, []
+    dense_limit = limit * 4 if body.dedupe else limit
+    try:
+        vector = embed_query(query, wait_timeout=embed_wait_timeout,
+                             request_timeout=embed_http_timeout)
+        if body.layer:
+            hits = qdrant_search(vector, qfilter, dense_limit,
+                                  timeout=dense_timeout)
+        else:
+            hits, dense_partial = qdrant_search_layers(
+                vector, qfilter, dense_limit, timeout=dense_timeout)
+    except HTTPException as error:
+        dense_error = error
+    try:
+        lexical = lexical_future.result() if lexical_future else []
+    finally:
+        if lexical_executor:
+            lexical_executor.shutdown(wait=False, cancel_futures=True)
+    if dense_error and not lexical:
+        raise dense_error
 
     results = []
     seen_papers = set()
@@ -707,38 +899,11 @@ def _run_search(body: SearchBody, x_api_key=None):
             seen_papers.add(aid)
         if len(results) >= limit:
             break
-        text = p.get("text", "")
-        results.append({
-            "arxiv_id": p.get("arxiv_id"),
-            "source": SOURCE_LABELS[source_of(p.get("arxiv_id"))],
-            "url": source_url(p.get("arxiv_id"), p),
-            "license": license_of(p.get("arxiv_id")),
-            "title": p.get("title"),
-            "section_type": p.get("section_type"),
-            "section_title": p.get("section_title"),
-            "element_type": p.get("element_type"),
-            "year": p.get("year"),
-            "repos": p.get("repos") or [],
-            # the indexed technical vocabulary that fired on this chunk: the
-            # raw material for rephrasing a claim in the field's own words
-            "terms": p.get("terms") or [],
-            "text": text[:500],
-            "score": h.get("score"),
-            "layers": p.get("layers"),
-            "venue": p.get("venue"),
-            "citation_count": p.get("citation_count"),
-            # IACR is indexed by abstract only, so section/element filters do
-            # not reach inside those records; say so rather than let the caller
-            # assume every hit is full text
-            "fulltext": source_of(p.get("arxiv_id")) in FULLTEXT_SOURCES,
-            "arxiv_url": source_url(p.get("arxiv_id"), p),  # kept for compatibility
-        })
+        results.append(_result_from_hit(h))
 
     # lexical candidates the vectors missed, scored by the same vector search so
     # the two halves stay comparable, then fused by rank rather than by score
-    if body.hybrid and results:
-        lexical = _bm25_candidates(query, body.layer, body.section_type,
-                                   body.element_type, body.year_from, body.year_to)
+    if body.hybrid and lexical:
         known = {r["arxiv_id"] for r in results}
         # label every result, not only the runs that gained a lexical extra:
         # otherwise the channel is invisible exactly when the two agree
@@ -746,32 +911,52 @@ def _run_search(body: SearchBody, x_api_key=None):
         for r in results:
             r["channels"] = ["dense", "lexical"] if r["arxiv_id"] in lex_all else ["dense"]
         extra_ids = [pid for pid in lexical if pid not in known][:BM25_CANDIDATES]
-        if extra_ids:
-            scored = _score_specific_papers(query, extra_ids, body.layer)
+        scored = []
+        if extra_ids and vector is not None and dense_error is None:
+            scored = _score_specific_papers(query, extra_ids, body.layer,
+                                             vector=vector,
+                                             timeout=dense_timeout,
+                                             constraints=must)
             for h in scored:
                 h["found_via"] = "lexical match"
                 h["channels"] = ["lexical"]
-            dense_order = [r["arxiv_id"] for r in results]
-            lex_order = [pid for pid in lexical]
-            fused = _rrf(dense_order, lex_order, weights=[1.0, 0.6])
-            lex_set = set(lexical)
-            for r in results:
-                # which channel found it, so the lexical half is visible from
-                # outside instead of being inferred from suspicious hits
-                r["channels"] = (["dense", "lexical"] if r["arxiv_id"] in lex_set
-                                 else ["dense"])
-            pool = {r["arxiv_id"]: r for r in results}
-            for h in scored:
-                pool.setdefault(h["arxiv_id"], h)
-            results = sorted(pool.values(),
-                             key=lambda r: -fused.get(r["arxiv_id"], 0))[:limit]
+        scored_ids = {item["arxiv_id"] for item in scored}
+        raw = ([] if terms else _lexical_fallback_results(
+            query, [pid for pid in extra_ids if pid not in scored_ids], limit))
+        dense_order = [r["arxiv_id"] for r in results]
+        fused = _rrf(dense_order, lexical, weights=[1.0, 0.6])
+        lex_set = set(lexical)
+        for r in results:
+            r["channels"] = (["dense", "lexical"] if r["arxiv_id"] in lex_set
+                             else ["dense"])
+        pool = {r["arxiv_id"]: r for r in results}
+        for item in [*scored, *raw]:
+            pool.setdefault(item["arxiv_id"], item)
+        for item in pool.values():
+            item["fusion_score"] = round(fused.get(item["arxiv_id"], 0), 6)
+        results = sorted(pool.values(),
+                         key=lambda r: -r.get("fusion_score", 0))[:limit]
+    elif results:
+        for result in results:
+            result["channels"] = ["dense"]
 
     facts = _paper_facts([r["arxiv_id"] for r in results])
     for r in results:
         r["niche_score"] = facts.get(r["arxiv_id"])
         r["rank_score"] = round(_rank_score(r), 4)
-    results.sort(key=lambda r: -r["rank_score"])
+    if not any("fusion_score" in result for result in results):
+        results.sort(key=lambda r: -r["rank_score"])
     payload = {"results": results, "count": len(results), "usage": USAGE_NOTICE}
+    if dense_error:
+        payload["partial"] = True
+        payload["retrieval_warning"] = (
+            "dense retrieval exceeded its latency budget; exact lexical matches "
+            "are returned without cosine scores")
+    elif dense_partial:
+        payload["partial"] = True
+        payload["retrieval_warning"] = (
+            "dense retrieval exceeded its latency budget in layers: "
+            + ", ".join(dense_partial))
     lookup = _lookup_note(query, results)
     if lookup:
         payload["title_lookup"] = lookup
@@ -781,7 +966,7 @@ def _run_search(body: SearchBody, x_api_key=None):
                                  ("min_score", body.min_score)) if v is not None}
     if applied:
         payload["filters_applied"] = applied
-    if not results and applied and body.diagnose:
+    if not results and applied and body.diagnose and not dense_error:
         relaxations = []
         for name in applied:
             probe = body.model_copy(update={name: None, "diagnose": False, "limit": 3})
@@ -796,7 +981,8 @@ def _run_search(body: SearchBody, x_api_key=None):
             {"relax_one_of": relaxations} if relaxations else
             {"relax_one_of": [], "note": "no single filter explains it: the query itself "
                                          "has no match above the relevance floor"})
-    search_cache.set(cache_key, payload)
+    if not dense_error and not dense_partial:
+        search_cache.set(cache_key, payload)
     return payload
 
 
@@ -1509,7 +1695,8 @@ def _foreign_scope_domain(text):
     return None
 
 
-def _topic_coverage(text, layer=None, strict=False, probe_limit=None):
+def _topic_coverage(text, layer=None, strict=False, probe_limit=None,
+                    timeout=SEARCH_QDRANT_TIMEOUT):
     """How many papers this index holds on the subject of one claim, per layer.
 
     "No match" means one thing over 800 papers and another over 3, and that
@@ -1542,7 +1729,7 @@ def _topic_coverage(text, layer=None, strict=False, probe_limit=None):
         try:
             hits = qdrant_search(vector, {"must": [{"key": "layers",
                                                     "match": {"any": [lay]}}]},
-                                 probe_limit)
+                                 probe_limit, timeout=timeout)
         except HTTPException:
             continue
         papers, reaches_band = set(), False
@@ -1718,16 +1905,20 @@ def _citation_neighbours(paper_ids):
     return dict(sorted(out.items(), key=lambda kv: -kv[1]["weight"])[:GRAPH_MAX_NEIGHBOURS])
 
 
-def _score_specific_papers(query, paper_ids, layer=None):
+def _score_specific_papers(query, paper_ids, layer=None, vector=None, timeout=45,
+                           constraints=None):
     """Best chunk of each named paper against the query, scored the usual way,
     so a paper reached through the graph is comparable to one found by search."""
     if not paper_ids:
         return []
     must = [{"key": "arxiv_id", "match": {"any": list(paper_ids)}}]
-    if layer:
+    must.extend(constraints or [])
+    if layer and not any(item.get("key") == "layers" for item in must):
         must.append({"key": "layers", "match": {"any": [layer]}})
     try:
-        hits = qdrant_search(embed_query(query), {"must": must}, len(paper_ids) * 8)
+        query_vector = vector or embed_query(query)
+        hits = qdrant_search(query_vector, {"must": must}, len(paper_ids) * 8,
+                             timeout=timeout)
     except HTTPException:
         return []
     best = {}
@@ -2419,6 +2610,9 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
     if body.depth not in {"fast", "full"}:
         raise HTTPException(status_code=400, detail="depth must be 'fast' or 'full'")
     fast_mode = body.depth == "fast"
+    audit_qdrant_timeout = 12 if fast_mode else 30
+    audit_embed_wait = 4 if fast_mode else 10
+    audit_embed_http = 8 if fast_mode else 20
 
     corpus = _corpus_stats()
     corpus["as_of"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -2451,12 +2645,13 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
         [idea] + [text for text, _ in claim_specs] +
         [phrasing for _, phrasings in claim_specs for phrasing in phrasings]
     )
-    prime_qdrant_searches(
-        [idea] + [text for text, _ in claim_specs] +
-        [phrasing for _, phrasings in claim_specs for phrasing in phrasings],
-        body.layer,
-        FAST_COVERAGE_PROBE_LIMIT if fast_mode else COVERAGE_PROBE_LIMIT,
-    )
+    if not fast_mode:
+        prime_qdrant_searches(
+            [idea] + [text for text, _ in claim_specs] +
+            [phrasing for _, phrasings in claim_specs for phrasing in phrasings],
+            body.layer,
+            COVERAGE_PROBE_LIMIT,
+        )
 
     # Scope check before anything else: a robotics or biotech idea would
     # otherwise collect a page of "no match in corpus" and read as a clean bill.
@@ -2472,6 +2667,7 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
             coverage_cache[key] = _topic_coverage(
                 text, body.layer, strict,
                 FAST_COVERAGE_PROBE_LIMIT if fast_mode else COVERAGE_PROBE_LIMIT,
+                timeout=audit_qdrant_timeout,
             )
         return coverage_cache[key]
 
@@ -2525,8 +2721,11 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
         # A paper that also matches in its own method section deserves to be
         # represented by that section instead of by its opening paragraph.
         b = SearchBody(query=query, layer=body.layer, limit=min(50, limit * 3),
-                       min_score=0.60, dedupe=False, **extra)
-        hits = _run_search(b, x_api_key).get("results", [])
+                       min_score=0.60, dedupe=False, diagnose=False, **extra)
+        hits = _scored_results_for_audit(
+            _run_search(b, x_api_key, dense_timeout=audit_qdrant_timeout,
+                        embed_wait_timeout=audit_embed_wait,
+                        embed_http_timeout=audit_embed_http))
         best = {}
         for h in hits:
             pid = h["arxiv_id"]
@@ -3079,7 +3278,7 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
                         "industry whitepapers"],
             "not_covered": ["patents and patent applications", "journal and conference "
                             "papers never posted to arXiv", "books", "anything outside "
-                            "the three indexed niches"],
+                            "the indexed AI, Web3 and builder-technology scopes"],
             "patent_note": "This is not a patent search and holds no patent literature. "
                            "For a filing decision, search USPTO/EPO/WIPO separately; a "
                            "quiet result here says nothing about what is patented.",
@@ -3090,11 +3289,9 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
             for c in claim_reports for l in c["known_limitations"]
             if l.get("from_cited_paper") and l.get("still_a_candidate")
         ][:6],
-        "next_step": ("Read the snippets, decide which candidates actually assert each "
-                      "claim, then file your verdicts with the adjudication tool "
-                      "(record_claim_judgment over MCP, POST /v1/adjudicate over REST). "
-                      "That is what turns a list of candidates into an answer, and it is "
-                      "remembered for whoever asks next."),
+        "next_step": ("Read the snippets and decide which candidates actually assert each "
+                      "claim. The public MCP is read-only; authenticated deployments can "
+                      "submit adjudications that are remembered for later audits."),
         "claims": claim_reports,
         "field_dynamics": field,
         "usage": USAGE_NOTICE,
@@ -3128,4 +3325,12 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
 
 @app.get("/v1/health")
 def health():
-    return {"status": "ok"}
+    samples = list(search_latencies)
+    return {
+        "status": "ok",
+        "search_latency_seconds": {
+            "samples": len(samples),
+            "p50": _latency_percentile(samples, 0.50),
+            "p95": _latency_percentile(samples, 0.95),
+        },
+    }

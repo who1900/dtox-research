@@ -1,7 +1,7 @@
 """
 dtox research MCP server.
 
-Exposes 3 tools over MCP (streamable-http transport) that proxy to the
+Exposes five public read-only tools over MCP (streamable-http transport) that proxy to the
 internal dtox-research-api (127.0.0.1:8010), which serves semantic search
 over a full-text database of curated AI/LLM/Web3 arxiv papers.
 
@@ -264,7 +264,6 @@ def compare_methods(
     return resp.json()
 
 
-@mcp.tool()
 def record_claim_judgment(claim: str, judgments: List[dict],
                           layer: Optional[str] = None,
                           judged_by_model: Optional[str] = None) -> dict:
@@ -328,7 +327,6 @@ def record_claim_judgment(claim: str, judgments: List[dict],
         return {"error": f"research api unavailable: {e}"}
 
 
-@mcp.tool()
 def link_claim_nodes(claim: str, same_as_claim_id: str, reason: str = "") -> dict:
     """Declare that two wordings of a claim ask the same question.
 
@@ -365,6 +363,11 @@ def link_claim_nodes(claim: str, same_as_claim_id: str, reason: str = "") -> dic
         return resp.json()
     except requests.RequestException as e:
         return {"error": f"research api unavailable: {e}"}
+
+
+if REGISTRY_WRITES_ENABLED:
+    mcp.tool()(record_claim_judgment)
+    mcp.tool()(link_claim_nodes)
 
 
 @mcp.tool()
@@ -432,6 +435,7 @@ def validate_project(
     claims: List[Union[str, dict]],
     layer: Optional[str] = None,
     evidence_per_claim: int = 4,
+    deep: bool = False,
 ) -> dict:
     """Audit a project or research idea against the literature: prior art,
     known limitations, supporting math, and where the field is heading.
@@ -449,10 +453,10 @@ def validate_project(
     a top venue. A false "nothing found" is the worst answer this tool can give,
     and you are the one who can prevent it.
 
-    This tool is half of a loop. It finds candidates; you decide; you file the
-    decision with record_claim_judgment so the next caller starts from a
-    reading instead of a cosine score. A claim whose candidates nobody has
-    read yet says so in "settled".
+    The public endpoint reads earlier claim judgments but is deliberately
+    read-only. Registry mutations are exposed only by an authenticated private
+    deployment. A claim whose candidates nobody has read yet says so in
+    "settled".
 
     Two channels feed the answer. Retrieval depends on wording, so pass
     rephrasings. The citation graph does not: papers one hop from the best hits
@@ -496,6 +500,9 @@ def validate_project(
             setting for blockchain work, which the LLM-heavy corpus would
             otherwise drown out.
         evidence_per_claim: Papers cited per claim (1-10, default 4).
+        deep: False returns retrieval, registry and coverage quickly. True also
+            expands the citation graph, reranks candidates and extracts
+            limitations and supporting equations.
 
     Returns:
         dict with "headline", "corpus" (index size and coverage), "scope"
@@ -507,7 +514,8 @@ def validate_project(
         "recall_note" whenever a claim found nothing strong. Cite only the ids
         it returns.
     """
-    body = {"idea": idea, "claims": claims, "evidence_per_claim": evidence_per_claim}
+    body = {"idea": idea, "claims": claims, "evidence_per_claim": evidence_per_claim,
+            "depth": "full" if deep else "fast"}
     if layer:
         body["layer"] = layer
     try:
