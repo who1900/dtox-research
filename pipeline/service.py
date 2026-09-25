@@ -61,6 +61,13 @@ ARXIV_DELAY_SECONDS = 3
 ARXIV_FETCH_TIMEOUT = 60
 ARXIV_FETCH_RETRIES = 5
 PAGE_SIZE = 100
+# export.arxiv.org has answered every request from this host with 406 since
+# 2026-09-24 -- an IP-level block, not a transient error. The OAI-PMH endpoint
+# and e-print downloads are unaffected. Flip this off in prod until the block
+# lifts; harvest_step then leaves every export-API cursor (bq:/kw:/cat: and
+# bare keyword queries) untouched -- no done flag, no offset change -- so
+# lifting the block resumes discovery exactly where it stopped.
+ARXIV_EXPORT_API_ENABLED = os.getenv("ARXIV_EXPORT_API_ENABLED", "1") == "1"
 # arXiv refuses to paginate past ~10k results for one query: start=9900 answers,
 # start=10000 returns "Rate exceeded" and start=12000 a 500. Ten of our queries
 # had walked their cursor to exactly 10000 and were re-failing every cycle --
@@ -399,6 +406,30 @@ OAI_NS = {
     "o": "http://www.openarchives.org/OAI/2.0/",
     "dc": "http://purl.org/dc/elements/1.1/",
 }
+
+# arXiv's own OAI-PMH mirror. export.arxiv.org (used for search/pagination) is
+# IP-blocked (406, see ARXIV_EXPORT_API_ENABLED above); this endpoint and the
+# e-print PDF host are not, so it stands in as the discovery source while the
+# block lasts. It gives no keyword search, only metadataPrefix=arXiv dumps by
+# set and day, so upsert_discovered's lexical niche filter -- which already
+# reclassifies every paper regardless of which query found it -- does all the
+# relevance work here; this source just needs to hand it everything.
+ARXIV_OAI_URL = "https://oaipmh.arxiv.org/oai"
+ARXIV_OAI_META_NS = "{http://arxiv.org/OAI/arXiv/}"
+# "cs" alone already covers the CR/DC/CL/LG/AI/MA/IR categories the boolean and
+# category-sweep queries target. q-fin/econ were considered for the web3 layer
+# but excluded by default: on-chain/protocol work essentially never lands in
+# those OAI sets (it publishes to cs.CR/cs.DC, cross-posts to IACR, or skips
+# arXiv for EIP/SIMD specs), so adding them would mostly cost extra daily
+# requests for near-zero niche yield. Override via env if that changes.
+ARXIV_OAI_SETS = tuple(s.strip() for s in os.getenv("ARXIV_OAI_SETS", "cs").split(",") if s.strip())
+ARXIV_OAI_START = os.getenv("ARXIV_OAI_START", "2026-09-20")
+ARXIV_OAI_MIN_INTERVAL = float(os.getenv("ARXIV_OAI_MIN_INTERVAL", "5"))
+# Scheduling bucket only (round-robin fairness in pick_next_query) -- it does
+# not influence a paper's final layers, which upsert_discovered assigns from
+# the lexical niche filter regardless of which query/layer discovered it.
+ARXIV_OAI_LAYER = "llm-slm"
+arxiv_oai_gate = _ArxivGate(ARXIV_OAI_MIN_INTERVAL)
 
 
 # ---------------------------------------------------------------------------
@@ -763,6 +794,133 @@ def fetch_iacr_month(query_key: str):
     return entries
 
 
+def _year_from_arxiv_id(arxiv_id):
+    m = re.match(r"^(?:[a-z\-]+(?:\.[A-Z]{2})?/)?(\d{2})(\d{2})", arxiv_id or "")
+    if not m or not 1 <= int(m.group(2)) <= 12:
+        return None
+    yy = int(m.group(1))
+    return 1900 + yy if yy >= 91 else 2000 + yy
+
+
+def _arxiv_oai_parse_records(xml_bytes):
+    """Returns (entries, resumption_token, restart).
+
+    restart=True means the provider rejected our resumptionToken (it expired
+    or the server restarted its listing) -- the caller should drop the saved
+    token and re-start the day from page 1 rather than treat this as data.
+    Re-reading a day is harmless: upsert_discovered is idempotent.
+    """
+    root = ET.fromstring(xml_bytes)
+    err_el = root.find(".//o:error", OAI_NS)
+    if err_el is not None:
+        code = err_el.get("code")
+        if code == "noRecordsMatch":
+            return [], None, False  # a genuinely empty day
+        if code == "badResumptionToken":
+            return [], None, True
+        raise ET.ParseError(f"OAI error '{code}': {(err_el.text or '').strip()}")
+    entries = []
+    ns = ARXIV_OAI_META_NS
+    for rec in root.findall(".//o:record", OAI_NS):
+        header = rec.find("o:header", OAI_NS)
+        if header is not None and header.get("status") == "deleted":
+            continue
+        meta = rec.find(f"o:metadata/{ns}arXiv", OAI_NS)
+        if meta is None:
+            continue
+        id_el = meta.find(f"{ns}id")
+        if id_el is None or not (id_el.text or "").strip():
+            continue
+        arxiv_id = id_el.text.strip()
+        title_el = meta.find(f"{ns}title")
+        title = " ".join((title_el.text or "").split()) if title_el is not None else ""
+        if not title:
+            continue
+        abstract_el = meta.find(f"{ns}abstract")
+        abstract = " ".join((abstract_el.text or "").split()) if abstract_el is not None and abstract_el.text else None
+        # arXiv's OAI mirror puts the metadata-update date in <created> for old
+        # papers (1110.0569 came back as 2026-09-23), and paper age drives the
+        # quality gate, so the id is trusted first: YYMM.NNNNN or archive/YYMMNNN.
+        year = _year_from_arxiv_id(arxiv_id)
+        created_el = meta.find(f"{ns}created")
+        if year is None and created_el is not None and created_el.text:
+            try:
+                year = int(created_el.text.strip()[:4])
+            except ValueError:
+                year = None
+        entries.append({"arxiv_id": arxiv_id, "title": title, "year": year, "abstract": abstract})
+    token_el = root.find(".//o:resumptionToken", OAI_NS)
+    token = token_el.text.strip() if token_el is not None and token_el.text and token_el.text.strip() else None
+    return entries, token, False
+
+
+def fetch_arxiv_oai_page(set_name: str, day: str, resume_token):
+    """One page of arXiv's own OAI-PMH ListRecords for one (set, day).
+
+    export.arxiv.org search is IP-blocked; this mirror is not, so it is the
+    discovery path while that lasts. One page per call (not the whole day in
+    one loop, unlike fetch_iacr_month) so a kill -9 mid-day loses nothing: the
+    resumptionToken is committed to harvest_cursor after every successful page,
+    and re-fetching the same page on restart is a harmless duplicate, never a
+    gap. Returns (entries, next_token, restart) -- next_token None means the
+    day is exhausted -- or None on a transient failure (network error, 406,
+    429, an unparsed response): the caller must retry later without touching
+    the saved token.
+    """
+    if resume_token:
+        params = {"verb": "ListRecords", "resumptionToken": resume_token}
+    else:
+        params = {"verb": "ListRecords", "metadataPrefix": "arXiv", "set": set_name,
+                  "from": day, "until": day}
+    url = f"{ARXIV_OAI_URL}?{urllib.parse.urlencode(params)}"
+    arxiv_oai_gate.wait()
+    try:
+        response = requests.get(url, timeout=ARXIV_FETCH_TIMEOUT, headers=ARXIV_HEADERS)
+    except requests.RequestException as e:
+        log.warning(f"arxiv_oai: request error for {set_name}@{day}: {e}")
+        return None
+    if response.status_code == 503:
+        # OAI-PMH flow control: the provider is asking us to slow down, not
+        # refusing the request -- arXiv's OAI mirror sends Retry-After for this.
+        try:
+            wait = max(1, int(float(response.headers.get("Retry-After", 20))))
+        except (TypeError, ValueError):
+            wait = 20
+        log.info(f"arxiv_oai: 503 flow control for {set_name}@{day}, retry-after {wait}s")
+        arxiv_oai_gate.penalize(wait)
+        return None
+    if response.status_code in (406, 429):
+        log.warning(f"arxiv_oai: {response.status_code} for {set_name}@{day}")
+        arxiv_oai_gate.penalize(60)
+        return None
+    if response.status_code != 200:
+        log.warning(f"arxiv_oai: status {response.status_code} for {set_name}@{day}")
+        return None
+    try:
+        return _arxiv_oai_parse_records(response.content)
+    except ET.ParseError as e:
+        log.warning(f"arxiv_oai: XML parse/protocol error for {set_name}@{day}: {e}")
+        return None
+
+
+def arxiv_oai_day_keys() -> list:
+    """query_key = oai:<set>@YYYY-MM-DD, one per set per day since
+    ARXIV_OAI_START through today (UTC). New days beyond the ones seeded here
+    at import time are opened by refresh_live_cursors as they arrive."""
+    try:
+        start = datetime.strptime(ARXIV_OAI_START, "%Y-%m-%d").date()
+    except ValueError:
+        start = datetime.now(timezone.utc).date()
+    today = datetime.now(timezone.utc).date()
+    keys = []
+    for oai_set in ARXIV_OAI_SETS:
+        d = start
+        while d <= today:
+            keys.append(f"oai:{oai_set}@{d.isoformat()}")
+            d += timedelta(days=1)
+    return keys
+
+
 # Whole categories, swept year by year. The keyword and boolean queries were
 # built to find papers already known to be on subject, and they worked: 534
 # cursors, every one of them exhausted. What they cannot do is turn up a paper
@@ -807,7 +965,12 @@ def build_layer_query_groups() -> list:
         sliced = []
         for idx in range(len(BOOLEAN_QUERIES.get(layer, []))):
             sliced.extend(bool_date_slice_keys(layer, idx))
-        extra = (iacr_month_keys() + list(SPEC_SOURCES)) if layer == "web3" else []
+        if layer == "web3":
+            extra = iacr_month_keys() + list(SPEC_SOURCES)
+        elif layer == ARXIV_OAI_LAYER:
+            extra = arxiv_oai_day_keys()
+        else:
+            extra = []
         # Category-wide sweeps are appropriate for our three narrow research
         # domains.  For builder-tech they would ingest the whole SE/PL corpus;
         # explicit boolean queries provide controlled, relevant coverage.
@@ -970,6 +1133,12 @@ def init_db(conn):
         conn.execute("ALTER TABLE papers ADD COLUMN refs_fetched INTEGER NOT NULL DEFAULT 0")
     if "refined" not in ccols:
         conn.execute("ALTER TABLE harvest_cursor ADD COLUMN refined INTEGER NOT NULL DEFAULT 0")
+    # migration: resume_token, for arXiv OAI-PMH day cursors (oai:<set>@YYYY-MM-DD).
+    # A day is paginated one page per harvest_step call; committing the
+    # resumptionToken here after every page means a kill -9 mid-day loses no
+    # progress -- the next run resumes the same page instead of restarting the day.
+    if "resume_token" not in ccols:
+        conn.execute("ALTER TABLE harvest_cursor ADD COLUMN resume_token TEXT")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS scheduler_state (
@@ -1085,6 +1254,19 @@ def mark_query_run(conn, query_key):
     conn.commit()
 
 
+def get_resume_token(conn, query_key):
+    row = conn.execute("SELECT resume_token FROM harvest_cursor WHERE query_key=?", (query_key,)).fetchone()
+    return row["resume_token"] if row else None
+
+
+def set_oai_cursor(conn, query_key, next_start, done, resume_token):
+    conn.execute(
+        "UPDATE harvest_cursor SET next_start=?, done=?, resume_token=? WHERE query_key=?",
+        (next_start, done, resume_token, query_key),
+    )
+    conn.commit()
+
+
 def _sched_get(conn, key, default=None):
     row = conn.execute("SELECT value FROM scheduler_state WHERE key=?", (key,)).fetchone()
     return row["value"] if row else default
@@ -1177,7 +1359,12 @@ def fetch_page(query_key: str, start: int, max_results: int):
         except requests.RequestException as e:
             last_err = e
             status = getattr(getattr(e, "response", None), "status_code", None)
-            if status in (406, 429, 503):
+            # 406 here is export.arxiv.org's standing IP block (see
+            # ARXIV_EXPORT_API_ENABLED), not a transient rate signal -- penalizing
+            # the shared gate on every 406 was pausing e-print downloads, which
+            # share arxiv_gate, for 60s per occurrence while the block lasted.
+            # 429/503 are real rate-limit signals and still pause everyone.
+            if status in (429, 503):
                 arxiv_gate.penalize()
             wait = min(3 * (2 ** attempt), 24)
             log.warning(f"arXiv fetch error (attempt {attempt+1}/{ARXIV_FETCH_RETRIES}): {e}. Retrying in {wait}s...")
@@ -1293,10 +1480,27 @@ def refresh_live_cursors(conn):
             "UPDATE harvest_cursor SET done=0,last_run_at=NULL "
             "WHERE query_key=? AND done=1", (f"iacr@{month}",))
         reopened += cur.rowcount
+        # arXiv OAI: today and yesterday keep gaining/revising records (the
+        # announcement window plus a metadata-correction lag), so both are
+        # (re)seeded and reopened every hour instead of trusted as exhausted
+        # once first read empty. Also picks up "today" as the clock rolls over
+        # without needing a service restart.
+        today_s = now.strftime("%Y-%m-%d")
+        yesterday_s = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        for oai_set in ARXIV_OAI_SETS:
+            for day in (today_s, yesterday_s):
+                qk = f"oai:{oai_set}@{day}"
+                conn.execute(
+                    "INSERT OR IGNORE INTO harvest_cursor (query_key,next_start,done,layer) "
+                    "VALUES (?,0,0,?)", (qk, ARXIV_OAI_LAYER))
+                cur = conn.execute(
+                    "UPDATE harvest_cursor SET done=0,last_run_at=NULL,resume_token=NULL "
+                    "WHERE query_key=? AND done=1", (qk,))
+                reopened += cur.rowcount
         conn.commit()
         _mark_polled(conn, "fresh:hourly")
         if reopened:
-            log.info(f"fresh: reopened {reopened} live arXiv/IACR cursors")
+            log.info(f"fresh: reopened {reopened} live arXiv/IACR/OAI cursors")
 
     if _poll_due(conn, "fresh:daily", SPEC_REFRESH_SECONDS):
         # GitHub specs and current ACL XML files are mutable snapshots, not
@@ -1385,6 +1589,46 @@ def harvest_step(conn):
             month_suffix = query_key.split("@", 1)[1]
             set_cursor(conn, query_key, len(entries), 1)
             log.info(f"harvest: {query_key} -> {len(entries)} records")
+            continue
+
+        if query_key.startswith("oai:"):
+            set_name, day = query_key[len("oai:"):].split("@", 1)
+            # A day that has not started yet has nothing to give; today and
+            # yesterday are reopened separately in refresh_live_cursors once
+            # they are real (late-published metadata keeps trickling in).
+            if day > time.strftime("%Y-%m-%d", time.gmtime()):
+                set_cursor(conn, query_key, 0, 1)
+                continue
+            resume_token = get_resume_token(conn, query_key)
+            result = fetch_arxiv_oai_page(set_name, day, resume_token)
+            if result is None:
+                continue  # transient failure: resume_token untouched, retried next cycle
+            entries, next_token, restart = result
+            if restart:
+                # the saved resumptionToken expired server-side: restart the day
+                # from page 1 instead of losing it. Re-reading is a harmless
+                # duplicate thanks to upsert_discovered's idempotency.
+                set_oai_cursor(conn, query_key, 0, 0, None)
+                log.info(f"harvest: {query_key} resumptionToken expired, restarting day")
+                continue
+            for e in entries:
+                upsert_discovered(conn, e["arxiv_id"], e["title"], e["year"], layer,
+                                  abstract=e.get("abstract"))
+                new_count += 1
+            new_total = next_start + len(entries)
+            set_oai_cursor(conn, query_key, new_total, 0 if next_token else 1, next_token)
+            log.info(f"harvest: {query_key} -> {len(entries)} records"
+                     f"{' (more pages queued)' if next_token else ' (day complete)'}")
+            continue
+
+        if not ARXIV_EXPORT_API_ENABLED:
+            # Only bq:/kw:/cat: and bare keyword queries reach here -- the ones
+            # that go through export.arxiv.org's search API, which is IP-blocked
+            # (see ARXIV_EXPORT_API_ENABLED above). Skip untouched: no done
+            # flag, no offset change, no refine-split. mark_query_run() above
+            # still rotates the fair scheduler past it, so a disabled cursor
+            # does not repeatedly eat a harvest slot this cycle.
+            touched -= 1
             continue
 
         if next_start > ARXIV_MAX_START:
