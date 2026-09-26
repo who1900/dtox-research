@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -8,6 +9,7 @@ import time
 import threading
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Union
@@ -25,6 +27,29 @@ ATTESTOR_URL = os.getenv("ATTESTOR_URL", "http://127.0.0.1:8013")
 ATTESTOR_INTERNAL_TOKEN = os.getenv("ATTESTOR_INTERNAL_TOKEN", "")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
 COLLECTION = os.getenv("QDRANT_COLLECTION", "papers_fulltext")
+log = logging.getLogger("dtox-research.api")
+
+# ---------------- hierarchical (two-tier) search ----------------
+# papers_fulltext is 9.2M chunks; the canonical paper that introduced an idea
+# is one chunk drowning among thousands of descendants' chunks that describe
+# the same idea in passing. papers_coarse (pipeline/coarse_index.py) is one
+# small in-RAM vector per paper (title+abstract); shortlisting articles there
+# first, then searching chunks only within that shortlist, is what actually
+# separates the origin paper from its citations. Flagged off by default so it
+# can be A/B'd against the existing single-tier path in production.
+HIER_SEARCH = os.getenv("HIER_SEARCH", "0") == "1"
+COARSE_COLLECTION = os.getenv("COARSE_COLLECTION", "papers_coarse")
+HIER_PAPERS = int(os.getenv("HIER_PAPERS", "40"))
+HIER_CHUNKS = int(os.getenv("HIER_CHUNKS", "120"))
+# in_citations is in-corpus in-degree (see pipeline/coarse_index.build_payload);
+# capped at log1p(1000) so the prior can never exceed HIER_PRIOR_WEIGHT itself.
+HIER_PRIOR_WEIGHT = float(os.getenv("HIER_PRIOR_WEIGHT", "0.03"))
+HIER_MIX = float(os.getenv("HIER_MIX", "0.5"))
+# how long to wait, after stage A+B finish, for the old global chunk channel
+# before giving up on it -- it only ever adds a handful of extra papers, never
+# gates the response.
+HIER_GLOBAL_GRACE = float(os.getenv("HIER_GLOBAL_GRACE", "1.0"))
+HIER_GLOBAL_EXTRA = int(os.getenv("HIER_GLOBAL_EXTRA", "3"))
 EMBED_URL = os.getenv("EMBED_URL", "http://127.0.0.1:8006/embed")
 EMBED_BATCH_URL = os.getenv("EMBED_BATCH_URL", "http://127.0.0.1:8006/embed_batch")
 QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
@@ -371,14 +396,16 @@ def prime_query_embeddings(texts):
             API_EMBED_SLOTS.release()
 
 
-def _qdrant_cache_key(vector, qfilter, with_payload=True):
+def _qdrant_cache_key(vector, qfilter, with_payload=True, collection=None):
     vector_key = hashlib.sha1(
         json.dumps(vector, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     filter_key = json.dumps(qfilter, sort_keys=True, separators=(",", ":")) if qfilter else ""
     # with_payload is part of the identity: a cached no-payload result must
     # never be handed to a caller that expects hit["payload"] to be usable.
-    return vector_key, filter_key, with_payload
+    # collection likewise, so a papers_coarse search can never answer a
+    # papers_fulltext one from cache.
+    return vector_key, filter_key, with_payload, collection or COLLECTION
 
 
 def prime_qdrant_searches(texts, layer, limit=80):
@@ -426,8 +453,9 @@ def prime_qdrant_searches(texts, layer, limit=80):
         return
 
 
-def qdrant_search(vector, qfilter, limit, timeout=45, with_payload=True):
-    cache_key = _qdrant_cache_key(vector, qfilter, with_payload)
+def qdrant_search(vector, qfilter, limit, timeout=45, with_payload=True, collection=None):
+    collection = collection or COLLECTION
+    cache_key = _qdrant_cache_key(vector, qfilter, with_payload, collection)
     cached = qdrant_result_cache.get(cache_key)
     if cached is not None and cached["limit"] >= limit:
         return cached["results"][:limit]
@@ -435,7 +463,7 @@ def qdrant_search(vector, qfilter, limit, timeout=45, with_payload=True):
     if qfilter:
         body["filter"] = qfilter
     try:
-        resp = requests.post(f"{QDRANT_URL}/collections/{COLLECTION}/points/search",
+        resp = requests.post(f"{QDRANT_URL}/collections/{collection}/points/search",
                              json=body, timeout=timeout)
         resp.raise_for_status()
         results = resp.json()["result"]
@@ -532,6 +560,138 @@ def two_phase_dense_search(vector, qfilter, dense_limit, final_limit, timeout, l
     k = min(final_limit * 3, total_candidates)
     hydrated = _hydrate_hits(merged_pool[:k], timeout)
     return hydrated, merged_pool[:k], merged_pool[k:], sorted(failed)
+
+
+# ---------------- hierarchical (two-tier) search: stages A/B/C ----------------
+
+def _coarse_paper_search(vector, layer, year_from, year_to, limit, timeout):
+    """Stage A: shortlist articles from the small in-RAM papers_coarse index.
+
+    Only layer/year are applied here -- section_type/element_type/terms are
+    chunk-level facets that papers_coarse's one-point-per-paper payload can't
+    answer. Returns papers best-first by paper_score = cosine + a small prior
+    for in-corpus citation in-degree (see pipeline/coarse_index.build_payload),
+    so a paper the corpus itself treats as canonical (e.g. LoRA, cited by
+    thousands of its own descendants) outranks a near-tied chunk-level match
+    from one of those descendants.
+    """
+    must = []
+    if layer:
+        must.append({"key": "layers", "match": {"any": [layer]}})
+    if year_from is not None or year_to is not None:
+        rng = {}
+        if year_from is not None:
+            rng["gte"] = year_from
+        if year_to is not None:
+            rng["lte"] = year_to
+        must.append({"key": "year", "range": rng})
+    qfilter = {"must": must} if must else None
+    hits = qdrant_search(vector, qfilter, limit, timeout=timeout, with_payload=True,
+                         collection=COARSE_COLLECTION)
+    cap = math.log1p(1000)
+    papers = []
+    for h in hits:
+        payload = h.get("payload") or {}
+        aid = payload.get("arxiv_id")
+        if not aid:
+            continue
+        cosine = h.get("score") or 0
+        in_citations = payload.get("in_citations") or 0
+        # min(1.0, ...) is the clamp: the prior can never exceed HIER_PRIOR_WEIGHT.
+        factor = min(1.0, math.log1p(max(in_citations, 0)) / cap) if cap else 0.0
+        papers.append({"arxiv_id": aid, "paper_score": cosine + HIER_PRIOR_WEIGHT * factor})
+    papers.sort(key=lambda p: -p["paper_score"])
+    return papers
+
+
+def _hier_stage_b_hits(vector, must, arxiv_ids, dense_limit, timeout):
+    """Stage B: chunk evidence for exactly the stage-A shortlist.
+
+    One filtered two_phase_dense_search over papers_fulltext -- arxiv_id in
+    the shortlist, plus every other filter the caller applied (section_type,
+    element_type, terms, year, layer) -- through the ordinary single-filter
+    path (layers=None), never the per-layer one.
+    """
+    filt = {"must": list(must) + [{"key": "arxiv_id", "match": {"any": arxiv_ids}}]}
+    final_limit = max(len(arxiv_ids), 1)
+    hits, _, _, _ = two_phase_dense_search(vector, filt, dense_limit, final_limit, timeout,
+                                           layers=None)
+    return hits
+
+
+def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, layers):
+    """Stages A+B+C of HIER_SEARCH, sharing _run_search's old dense-retrieval
+    shape so the caller doesn't need to know which path ran.
+
+    Stage C (the old global per-layer chunk search) is fired first so it is
+    already in flight while A and B run; that same in-flight call also serves
+    as the silent fallback if stage A errors or comes back empty, so a coarse
+    outage costs nothing beyond the wasted stage-A round trip -- never extra
+    latency on top of the old path.
+
+    Returns (hits, leftover_pool, dense_partial, extra). `extra` is None when
+    stage A failed and the old path was used instead (nothing hier-specific to
+    report); otherwise a dict with `paper_scores` (arxiv_id -> rounded
+    paper_score), `global_channel` ("skipped" when stage C didn't finish
+    within HIER_GLOBAL_GRACE, else None), and `global_extra` (up to
+    HIER_GLOBAL_EXTRA raw hydrated hits from stage C not already covered by
+    A+B, oldest-path order preserved).
+    """
+    global_pool = ThreadPoolExecutor(max_workers=1)
+    global_future = global_pool.submit(
+        two_phase_dense_search, vector, qfilter, dense_limit, limit, dense_timeout,
+        layers=layers)
+    try:
+        papers = _coarse_paper_search(vector, body.layer, body.year_from, body.year_to,
+                                      HIER_PAPERS, dense_timeout)
+        if not papers:
+            raise RuntimeError("papers_coarse returned no candidates")
+        arxiv_ids = [p["arxiv_id"] for p in papers]
+        stage_b_hits = _hier_stage_b_hits(vector, must, arxiv_ids, HIER_CHUNKS, dense_timeout)
+        best_chunk = {}
+        for h in stage_b_hits:
+            aid = (h.get("payload") or {}).get("arxiv_id")
+            if not aid:
+                continue
+            if aid not in best_chunk or (h.get("score") or 0) > (best_chunk[aid].get("score") or 0):
+                best_chunk[aid] = h
+        merged = []
+        for p in papers:
+            chunk = best_chunk.get(p["arxiv_id"])
+            if chunk is None:
+                continue  # no chunk survived stage B's filters for this paper
+            final_score = HIER_MIX * p["paper_score"] + (1 - HIER_MIX) * (chunk.get("score") or 0)
+            merged.append((final_score, p["paper_score"], chunk))
+        if not merged:
+            raise RuntimeError("no stage-B chunk evidence for any shortlisted paper")
+        merged.sort(key=lambda t: -t[0])
+        hits = [chunk for _, _, chunk in merged]
+        paper_scores = {chunk["payload"]["arxiv_id"]: round(pscore, 4)
+                        for _, pscore, chunk in merged}
+    except Exception as exc:
+        log.warning(f"HIER_SEARCH: stage A/B failed, falling back to the old path: {exc}")
+        try:
+            hits, _, leftover_pool, dense_partial = global_future.result(timeout=dense_timeout)
+        finally:
+            global_pool.shutdown(wait=False)
+        return hits, leftover_pool, dense_partial, None
+
+    known_ids = {chunk["payload"]["arxiv_id"] for chunk in hits}
+    extra = {"paper_scores": paper_scores, "global_channel": None, "global_extra": []}
+    try:
+        c_hits, _, _, _c_partial = global_future.result(timeout=HIER_GLOBAL_GRACE)
+        for h in c_hits:
+            if len(extra["global_extra"]) >= HIER_GLOBAL_EXTRA:
+                break
+            aid = (h.get("payload") or {}).get("arxiv_id")
+            if aid and aid not in known_ids:
+                extra["global_extra"].append(h)
+                known_ids.add(aid)
+    except (FuturesTimeoutError, HTTPException):
+        extra["global_channel"] = "skipped"
+    finally:
+        global_pool.shutdown(wait=False)
+    return hits, [], [], extra
 
 
 def qdrant_search_layers(vector, base_filter, limit, timeout=SEARCH_QDRANT_TIMEOUT):
@@ -957,12 +1117,17 @@ def _run_search(body: SearchBody, x_api_key=None,
         if lexical_executor else None)
     vector, hits, leftover_pool, dense_error, dense_partial = None, [], [], None, []
     dense_limit = limit * 4 if body.dedupe else limit
+    hier_extra = None
     try:
         vector = embed_query(query, wait_timeout=embed_wait_timeout,
                              request_timeout=embed_http_timeout)
         layers = sorted(ALLOWED_LAYERS) if not body.layer else None
-        hits, _hydrated_slice, leftover_pool, dense_partial = two_phase_dense_search(
-            vector, qfilter, dense_limit, limit, dense_timeout, layers=layers)
+        if HIER_SEARCH:
+            hits, leftover_pool, dense_partial, hier_extra = _hier_run(
+                vector, qfilter, must, body, limit, dense_limit, dense_timeout, layers)
+        else:
+            hits, _hydrated_slice, leftover_pool, dense_partial = two_phase_dense_search(
+                vector, qfilter, dense_limit, limit, dense_timeout, layers=layers)
     except HTTPException as error:
         dense_error = error
     try:
@@ -1013,6 +1178,28 @@ def _run_search(body: SearchBody, x_api_key=None,
         if extra_hits:
             results = _filter_and_dedupe(hits + extra_hits)
 
+    hier_global_skipped = False
+    if hier_extra:
+        for r in results:
+            r["paper_score"] = hier_extra["paper_scores"].get(r["arxiv_id"])
+            r["found_via"] = "paper"
+        hier_global_skipped = hier_extra["global_channel"] == "skipped"
+        if hier_extra["global_extra"]:
+            known_arxiv = {r["arxiv_id"] for r in results}
+            added = 0
+            for h in hier_extra["global_extra"]:
+                if added >= HIER_GLOBAL_EXTRA:
+                    break
+                if (h.get("score") or 0) < floor:
+                    continue
+                extra_result = _result_from_hit(h)
+                aid = extra_result["arxiv_id"]
+                if aid in known_arxiv:
+                    continue
+                results.append(extra_result)
+                known_arxiv.add(aid)
+                added += 1
+
     # lexical candidates the vectors missed, scored by the same vector search so
     # the two halves stay comparable, then fused by rank rather than by score
     if body.hybrid and lexical:
@@ -1021,7 +1208,8 @@ def _run_search(body: SearchBody, x_api_key=None,
         # otherwise the channel is invisible exactly when the two agree
         lex_all = set(lexical)
         for r in results:
-            r["channels"] = ["dense", "lexical"] if r["arxiv_id"] in lex_all else ["dense"]
+            base = "paper" if r.get("found_via") == "paper" else "dense"
+            r["channels"] = [base, "lexical"] if r["arxiv_id"] in lex_all else [base]
         extra_ids = [pid for pid in lexical if pid not in known][:BM25_CANDIDATES]
         scored = []
         if extra_ids and vector is not None and dense_error is None:
@@ -1039,8 +1227,9 @@ def _run_search(body: SearchBody, x_api_key=None,
         fused = _rrf(dense_order, lexical, weights=[1.0, 0.6])
         lex_set = set(lexical)
         for r in results:
-            r["channels"] = (["dense", "lexical"] if r["arxiv_id"] in lex_set
-                             else ["dense"])
+            base = "paper" if r.get("found_via") == "paper" else "dense"
+            r["channels"] = ([base, "lexical"] if r["arxiv_id"] in lex_set
+                             else [base])
         pool = {r["arxiv_id"]: r for r in results}
         for item in [*scored, *raw]:
             pool.setdefault(item["arxiv_id"], item)
@@ -1050,15 +1239,23 @@ def _run_search(body: SearchBody, x_api_key=None,
                          key=lambda r: -r.get("fusion_score", 0))[:limit]
     elif results:
         for result in results:
-            result["channels"] = ["dense"]
+            result["channels"] = (["paper"] if result.get("found_via") == "paper"
+                                  else ["dense"])
 
     facts = _paper_facts([r["arxiv_id"] for r in results])
     for r in results:
         r["niche_score"] = facts.get(r["arxiv_id"])
         r["rank_score"] = round(_rank_score(r), 4)
-    if not any("fusion_score" in result for result in results):
+    # hier_extra means stage A/B actually produced the dense order (paper_score
+    # mixed with best-chunk cosine, plus any stage-C tail preserved in its own
+    # order) -- re-sorting by chunk-only rank_score here would undo exactly the
+    # ranking HIER_SEARCH exists to produce, and would splice the stage-C tail
+    # back into the middle of it.
+    if not any("fusion_score" in result for result in results) and not hier_extra:
         results.sort(key=lambda r: -r["rank_score"])
     payload = {"results": results, "count": len(results), "usage": USAGE_NOTICE}
+    if hier_global_skipped:
+        payload["global_channel"] = "skipped"
     if dense_error:
         payload["partial"] = True
         payload["retrieval_warning"] = (
