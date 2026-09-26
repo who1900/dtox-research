@@ -31,8 +31,15 @@ BACKUP_DIR = pathlib.Path("/opt/backups")
 
 SERVICES = ("dtox-research", "dtox-research-api", "dtox-mcp")
 CONTAINERS = ("qdrant", "embed-small")
-STALL_MINUTES = 90          # the pipeline should finish a paper far more often
-MIN_DISK_GB = 20
+STALL_MINUTES = 90
+REMIND_HOURS = 6            # keep repeating while a check stays red          # the pipeline should finish a paper far more often
+# 20 GB is 5% of this disk and left no room to react: by the time the alert
+# fired the volume was already full, Qdrant had gone red refusing to optimise,
+# and the pipeline had stopped. The base itself grows by gigabytes a week
+# (fts.db 4.6 GB, state.db 1.2 GB, Qdrant 9.8 GB, latex_cache 4.6 GB) and a
+# weekly backup adds a copy on top, so the warning has to come while there is
+# still headroom to clear.
+MIN_DISK_GB = 40
 BACKUP_MAX_AGE_H = 36
 
 
@@ -127,7 +134,7 @@ def run_checks(state):
 
     try:
         with urllib.request.urlopen(
-                "http://127.0.0.1:6333/collections/papers_fulltext", timeout=20) as r:
+                os.getenv("QDRANT_URL", "http://127.0.0.1:6333") + "/collections/papers_fulltext", timeout=20) as r:
             status = json.loads(r.read())["result"]["status"]
         # yellow means it is optimising, which is a healthy busy state and
         # happens after every snapshot and every large upsert. Only red or an
@@ -196,7 +203,15 @@ def digest_text():
     except sqlite3.Error:
         pass
 
-    checks = run_checks({})
+    # run_checks({}) looked harmless and was the whole bug: with no saved state
+    # the progress check has nothing to compare against, counts that as movement
+    # and reports green. The digest was announcing a healthy pipeline while it
+    # had been stopped for a day.
+    try:
+        saved = json.loads(STATE_FILE.read_text())
+    except (OSError, ValueError):
+        saved = {}
+    checks = run_checks(saved)
     failing = [f"{n} ({d})" for n, (ok, d) in checks.items() if not ok]
     lines.append("  checks: all green" if not failing
                  else "  FAILING: " + "; ".join(failing))
@@ -236,15 +251,35 @@ def main():
             print(f"{'ok  ' if ok else 'FAIL'} {name:26} {detail}")
         return 0
 
-    broke = [f"{n}: {d}" for n, (ok, d) in checks.items()
-             if not ok and previous.get(n, True)]
+    # Alerting only on the transition made a lasting failure indistinguishable
+    # from health: the pipeline died, one message went out, and then silence for
+    # 29 hours while the daily digest reported all green. Anything still broken
+    # is repeated every REMIND_HOURS.
+    reminded_at = state.get("reminded_at", {})
+    now = time.time()
+    broke, still = [], []
+    for n, (ok, d) in checks.items():
+        if ok:
+            reminded_at.pop(n, None)
+            continue
+        if previous.get(n, True):
+            broke.append(f"{n}: {d}")
+            reminded_at[n] = now
+        elif now - reminded_at.get(n, 0) >= REMIND_HOURS * 3600:
+            still.append(f"{n}: {d} (unresolved for "
+                         f"{(now - reminded_at.get(n, now)) / 3600 + REMIND_HOURS:.0f}h+)")
+            reminded_at[n] = now
+    state["reminded_at"] = reminded_at
     fixed = [n for n, (ok, _d) in checks.items() if ok and previous.get(n) is False]
 
-    if broke or fixed:
+    if broke or still or fixed:
         lines = []
         if broke:
             lines.append("dtox: " + str(len(broke)) + " check(s) failing")
             lines += ["  " + b for b in broke]
+        if still:
+            lines.append("STILL FAILING:")
+            lines += ["  " + b for b in still]
         if fixed:
             lines.append("recovered: " + ", ".join(fixed))
         telegram(env, "\n".join(lines))

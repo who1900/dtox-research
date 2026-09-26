@@ -30,7 +30,7 @@ import sys
 import urllib.request
 
 DEST = pathlib.Path("/opt/backups")
-QDRANT = "http://localhost:6333"
+QDRANT = os.getenv("QDRANT_URL", "http://localhost:6333")
 COLLECTION = "papers_fulltext"
 
 STORES = {

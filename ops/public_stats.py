@@ -6,7 +6,7 @@ db = sqlite3.connect("file:/opt/dtox-research/state.db?mode=ro", uri=True, timeo
 docs = db.execute("select count(*) from papers where status='done'").fetchone()[0]
 web3 = db.execute("select count(*) from papers where status='done' and layers like '%web3%'").fetchone()[0]
 edges = db.execute("select count(*) from citations").fetchone()[0]
-with urllib.request.urlopen("http://127.0.0.1:6333/collections/papers_fulltext", timeout=30) as r:
+with urllib.request.urlopen(os.getenv("QDRANT_URL", "http://127.0.0.1:6333") + "/collections/papers_fulltext", timeout=30) as r:
     chunks = json.load(r)["result"]["points_count"]
 out = {"documents": docs, "chunks": chunks, "citation_edges": edges, "web3_documents": web3,
        "as_of": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")}
