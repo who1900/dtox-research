@@ -41,6 +41,10 @@ log = logging.getLogger("dtox-research.api")
 HIER_SEARCH = os.getenv("HIER_SEARCH", "0") == "1"
 COARSE_COLLECTION = os.getenv("COARSE_COLLECTION", "papers_coarse")
 HIER_PAPERS = int(os.getenv("HIER_PAPERS", "40"))
+# How many extra article candidates the article-level lexical index (see
+# PAPER_LEXICAL below) contributes to the stage-A shortlist. Only used when
+# both HIER_SEARCH and PAPER_LEXICAL are on.
+HIER_LEXICAL_PAPERS = int(os.getenv("HIER_LEXICAL_PAPERS", "15"))
 HIER_CHUNKS = int(os.getenv("HIER_CHUNKS", "120"))
 # in_citations is in-corpus in-degree (see pipeline/coarse_index.build_payload);
 # capped at log1p(1000) so the prior can never exceed HIER_PRIOR_WEIGHT itself.
@@ -196,6 +200,15 @@ qdrant_result_cache = TTLCache(ttl_seconds=600, max_size=1000)
 FTS_DB_PATH = os.getenv("FTS_DB_PATH", "/opt/dtox-research/fts.db")
 BM25_CANDIDATES = 40
 LEXICAL_QUERY_TIMEOUT = float(os.getenv("LEXICAL_QUERY_TIMEOUT", "2"))
+# papers_fts.db (see pipeline/build_paper_fts.py): title+abstract only,
+# ~164k rows, small enough to sit entirely in the OS page cache -- unlike
+# fts.db (9.2M chunks, 13GB, on the slow disk that makes _bm25_candidates
+# miss its own LEXICAL_QUERY_TIMEOUT). Off by default so it changes nothing
+# until it has actually been built (pipeline/build_paper_fts.py --rebuild).
+PAPER_LEXICAL = os.getenv("PAPER_LEXICAL", "0") == "1"
+PAPER_FTS_PATH = os.getenv(
+    "PAPER_FTS_PATH", os.path.join(os.path.dirname(FTS_DB_PATH) or ".", "papers_fts.db"))
+PAPER_BM25_CANDIDATES = 40
 SEARCH_EMBED_WAIT_TIMEOUT = float(os.getenv("SEARCH_EMBED_WAIT_TIMEOUT", "2"))
 SEARCH_EMBED_HTTP_TIMEOUT = float(os.getenv("SEARCH_EMBED_HTTP_TIMEOUT", "4"))
 SEARCH_QDRANT_TIMEOUT = float(os.getenv("SEARCH_QDRANT_TIMEOUT", "6"))
@@ -284,6 +297,48 @@ def _bm25_candidates(query, layer=None, section_type=None, element_type=None,
         if len(out) >= limit:
             break
     return out
+
+
+def _paper_bm25(query, layer=None, year_from=None, year_to=None, limit=PAPER_BM25_CANDIDATES):
+    """Article ids whose title/abstract contain the query's words, best first.
+
+    Reads papers_fts.db (title+abstract, ~164k rows) instead of the 9.2M-row
+    chunk-level fts.db -- small enough to live in the OS page cache, so this
+    is meant to answer even when _bm25_candidates misses its own timeout on
+    the slow disk under fts.db. Weighted bm25(papers_fts, 0, 3.0, 1.0, 0, 0):
+    columns are (arxiv_id, title, abstract, layers, year) in that order, so a
+    hit in the title outweighs the same term only in the abstract.
+    """
+    match = _fts_query(query)
+    if not match:
+        return []
+    where, params = ["papers_fts MATCH ?"], [match]
+    if layer:
+        where.append("layers LIKE ?")
+        params.append(f"%{layer}%")
+    if year_from is not None:
+        where.append("CAST(year AS INTEGER) >= ?")
+        params.append(year_from)
+    if year_to is not None:
+        where.append("CAST(year AS INTEGER) <= ?")
+        params.append(year_to)
+    sql = (f"SELECT arxiv_id, bm25(papers_fts, 0, 3.0, 1.0, 0, 0) AS rank FROM papers_fts "
+           f"WHERE {' AND '.join(where)} ORDER BY rank LIMIT ?")
+    try:
+        conn = _ro_conn(PAPER_FTS_PATH)
+        rows = conn.execute(sql, params + [limit]).fetchall()
+    except sqlite3.OperationalError:
+        # cached connection may have gone stale, or the file doesn't exist yet
+        # (PAPER_LEXICAL flipped on before the first --rebuild); reconnect once.
+        _ro_conn_drop(PAPER_FTS_PATH)
+        try:
+            conn = _ro_conn(PAPER_FTS_PATH)
+            rows = conn.execute(sql, params + [limit]).fetchall()
+        except sqlite3.Error:
+            return []
+    except sqlite3.Error:
+        return []
+    return [row[0] for row in rows if row[0]]
 
 
 # Asking for a specific paper and asking about a subject look identical to a
@@ -643,6 +698,34 @@ def _coarse_paper_search(vector, layer, year_from, year_to, limit, timeout):
     return papers
 
 
+def _lexical_paper_shortlist(papers, query, layer, year_from, year_to,
+                             limit=HIER_LEXICAL_PAPERS):
+    """Stage A extra: articles found by exact title/abstract term match that
+    the coarse dense shortlist didn't surface (e.g. an exact acronym like
+    "GRPO" that the coarse embedding doesn't place near the query vector).
+
+    papers_coarse never scored these ids, so there is no cosine to mix in for
+    them. Chosen here: give each one the shortlist's own minimum paper_score
+    (a point cosine lookup into papers_coarse for just these ids would be
+    more precise, but costs another Qdrant round trip on the search hot path
+    for a value stage B's chunk evidence -- HIER_MIX -- already dominates
+    the final ranking with). A lexical-only paper therefore never outranks
+    the dense shortlist on paper_score alone; it only surfaces at all if
+    stage B finds it a real, on-topic chunk.
+    """
+    lexical_ids = _paper_bm25(query, layer, year_from, year_to, limit=limit)
+    if not lexical_ids:
+        return papers
+    existing = {p["arxiv_id"] for p in papers}
+    floor = min((p["paper_score"] for p in papers), default=0.0)
+    for aid in lexical_ids:
+        if aid in existing:
+            continue
+        papers.append({"arxiv_id": aid, "paper_score": floor})
+        existing.add(aid)
+    return papers
+
+
 def _hier_stage_b_hits(vector, must, arxiv_ids, dense_limit, timeout):
     """Stage B: chunk evidence for exactly the stage-A shortlist.
 
@@ -658,7 +741,7 @@ def _hier_stage_b_hits(vector, must, arxiv_ids, dense_limit, timeout):
     return hits
 
 
-def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, layers):
+def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, layers, query=""):
     """Stages A+B+C of HIER_SEARCH, sharing _run_search's old dense-retrieval
     shape so the caller doesn't need to know which path ran.
 
@@ -683,6 +766,9 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
     try:
         papers = _coarse_paper_search(vector, body.layer, body.year_from, body.year_to,
                                       HIER_PAPERS, dense_timeout)
+        if PAPER_LEXICAL:
+            papers = _lexical_paper_shortlist(papers, query, body.layer,
+                                              body.year_from, body.year_to)
         if not papers:
             raise RuntimeError("papers_coarse returned no candidates")
         arxiv_ids = [p["arxiv_id"] for p in papers]
@@ -1171,11 +1257,15 @@ def _run_search(body: SearchBody, x_api_key=None,
         must.append({"key": "year", "range": rng})
     qfilter = {"must": must} if must else None
 
-    lexical_executor = ThreadPoolExecutor(max_workers=1) if body.hybrid else None
+    lexical_executor = (ThreadPoolExecutor(max_workers=2 if PAPER_LEXICAL else 1)
+                       if body.hybrid else None)
     lexical_future = (lexical_executor.submit(
         _bm25_candidates, query, body.layer, body.section_type,
         body.element_type, body.year_from, body.year_to)
         if lexical_executor else None)
+    paper_lexical_future = (lexical_executor.submit(
+        _paper_bm25, query, body.layer, body.year_from, body.year_to)
+        if lexical_executor and PAPER_LEXICAL else None)
     vector, hits, leftover_pool, dense_error, dense_partial = None, [], [], None, []
     dense_limit = limit * 4 if body.dedupe else limit
     hier_extra = None
@@ -1185,13 +1275,15 @@ def _run_search(body: SearchBody, x_api_key=None,
         layers = sorted(ALLOWED_LAYERS) if not body.layer else None
         if HIER_SEARCH:
             hits, leftover_pool, dense_partial, hier_extra = _hier_run(
-                vector, qfilter, must, body, limit, dense_limit, dense_timeout, layers)
+                vector, qfilter, must, body, limit, dense_limit, dense_timeout, layers,
+                query=query)
         else:
             hits, _hydrated_slice, leftover_pool, dense_partial = two_phase_dense_search(
                 vector, qfilter, dense_limit, limit, dense_timeout, layers=layers)
     except HTTPException as error:
         dense_error = error
     lexical_skipped = False
+    lexical = []
     try:
         lexical = lexical_future.result(timeout=LEXICAL_QUERY_TIMEOUT) if lexical_future else []
     except FuturesTimeoutError:
@@ -1199,11 +1291,40 @@ def _run_search(body: SearchBody, x_api_key=None,
         # results already stand on their own, so answer with those rather
         # than blocking the request on a thread that is already overrunning.
         lexical, lexical_skipped = [], True
+    # papers_fts.db is small enough to live in page cache and is meant to
+    # survive exactly the case above -- give it its own timeout rather than
+    # letting it inherit whatever time _bm25_candidates already burned.
+    paper_lexical, paper_lexical_skipped = [], False
+    try:
+        paper_lexical = (paper_lexical_future.result(timeout=LEXICAL_QUERY_TIMEOUT)
+                         if paper_lexical_future else [])
+    except FuturesTimeoutError:
+        paper_lexical, paper_lexical_skipped = [], True
     finally:
         if lexical_executor:
-            # the FTS thread finishes on its own time; cancel_futures only
+            # the FTS thread(s) finish on their own time; cancel_futures only
             # drops futures that hadn't started yet.
             lexical_executor.shutdown(wait=False, cancel_futures=True)
+
+    # PAPER_LEXICAL off (default): `lexical` is untouched, exactly the old
+    # chunk-only BM25 list -- no behavior change below this point.
+    lexical_channel = None
+    if PAPER_LEXICAL and paper_lexical_future is not None:
+        chunk_available = not lexical_skipped
+        if not paper_lexical_skipped:
+            fused_lexical = reciprocal_rank_fusion(
+                paper_lexical, lexical if chunk_available else [], weights=[1.0, 0.6])
+            lexical = sorted(fused_lexical, key=lambda pid: -fused_lexical[pid])
+            lexical_skipped = False
+            lexical_channel = "paper+chunk" if chunk_available else "paper"
+        else:
+            # the article-level index is the safety net this feature exists
+            # for; if it also missed its deadline there is nothing exact-term
+            # left to offer regardless of what the chunk channel did.
+            lexical = []
+            lexical_skipped = True
+            lexical_channel = "skipped"
+
     if dense_error and not lexical:
         raise dense_error
 
@@ -1325,7 +1446,9 @@ def _run_search(body: SearchBody, x_api_key=None,
     payload = {"results": results, "count": len(results), "usage": USAGE_NOTICE}
     if hier_global_skipped:
         payload["global_channel"] = "skipped"
-    if lexical_skipped:
+    if lexical_channel is not None:
+        payload["lexical_channel"] = lexical_channel
+    elif lexical_skipped:
         # dense results are complete on their own -- this is not "partial",
         # only missing the exact-term channel hybrid search adds on top
         payload["lexical_channel"] = "skipped"

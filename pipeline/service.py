@@ -142,6 +142,10 @@ UPSERT_BATCH_SIZE = 64
 # article-level index for two-tier search and must never be able to hold up
 # or break the chunk pipeline above. Flip on once it has been backfilled.
 COARSE_INDEX_ENABLED = os.getenv("COARSE_INDEX_ENABLED", "0") == "1"
+# Off by default: papers_fts.db (see build_paper_fts.py) is a separate,
+# additive article-level lexical index and must never be able to hold up or
+# break the chunk pipeline above. Flip on once it has been rebuilt once.
+PAPER_FTS_ENABLED = os.getenv("PAPER_FTS_ENABLED", "0") == "1"
 
 # --- speed tuning (fulltext/chunk/embed only; harvest/quality untouched) ---
 FULLTEXT_CYCLE_LIMIT = 150       # quality_checked papers considered per cycle
@@ -2521,6 +2525,20 @@ def _sync_coarse_index(conn, arxiv_ids):
         log.warning(f"coarse-index: sync failed for {arxiv_ids}: {e}")
 
 
+def _sync_paper_fts(arxiv_ids):
+    """Best-effort mirror into papers_fts.db right after papers hit status='done'.
+    Imported lazily (build_paper_fts.py has no other import-time side effects,
+    but this keeps the same shape as _sync_coarse_index) and never allowed to
+    cost a paper: any failure here is a warning, not a pipeline error."""
+    if not PAPER_FTS_ENABLED or not arxiv_ids:
+        return
+    try:
+        import build_paper_fts
+        build_paper_fts.upsert_papers(arxiv_ids)
+    except Exception as e:
+        log.warning(f"paper-fts: sync failed for {arxiv_ids}: {e}")
+
+
 def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT):
     rows = conn.execute(
         "SELECT arxiv_id, title, year, layers, citation_count, venue, niche_score, matched_terms, "
@@ -2549,6 +2567,7 @@ def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT):
             conn.commit()
             processed += 1
             _sync_coarse_index(conn, [arxiv_id])
+            _sync_paper_fts([arxiv_id])
             continue
         paper_meta[arxiv_id] = row
         for c in embeddable:
@@ -2649,6 +2668,7 @@ def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT):
         conn.commit()
         processed += 1
         _sync_coarse_index(conn, [arxiv_id])
+        _sync_paper_fts([arxiv_id])
 
     # Batches run concurrently against embed-small; qdrant upsert + status commit
     # happen per-paper, sequentially, in this (main) thread as soon as a paper's
