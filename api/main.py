@@ -55,6 +55,14 @@ HIER_MIX = float(os.getenv("HIER_MIX", "0.5"))
 # gates the response.
 HIER_GLOBAL_GRACE = float(os.getenv("HIER_GLOBAL_GRACE", "1.0"))
 HIER_GLOBAL_EXTRA = int(os.getenv("HIER_GLOBAL_EXTRA", "3"))
+# "mix" (default) is the HIER_MIX paper_score/chunk-score blend plus stage-C
+# tail splice, byte-for-byte the original behavior. "rrf" instead fuses three
+# paper-level rankings (dense/mix shortlist, article-lexical, old global
+# chunk channel) by weighted reciprocal rank fusion -- see _hier_run.
+HIER_FUSION = os.getenv("HIER_FUSION", "mix")
+HIER_W_DENSE = float(os.getenv("HIER_W_DENSE", "1.0"))
+HIER_W_LEX = float(os.getenv("HIER_W_LEX", "0.8"))
+HIER_W_GLOBAL = float(os.getenv("HIER_W_GLOBAL", "0.5"))
 EMBED_URL = os.getenv("EMBED_URL", "http://127.0.0.1:8006/embed")
 EMBED_BATCH_URL = os.getenv("EMBED_BATCH_URL", "http://127.0.0.1:8006/embed_batch")
 QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
@@ -712,10 +720,14 @@ def _lexical_paper_shortlist(papers, query, layer, year_from, year_to,
     the final ranking with). A lexical-only paper therefore never outranks
     the dense shortlist on paper_score alone; it only surfaces at all if
     stage B finds it a real, on-topic chunk.
+
+    Returns (papers, lexical_ids): lexical_ids is the raw _paper_bm25 order,
+    best-first, kept around for HIER_FUSION="rrf" (see _hier_run) to build
+    its own lexical ranking without a second BM25 round trip.
     """
     lexical_ids = _paper_bm25(query, layer, year_from, year_to, limit=limit)
     if not lexical_ids:
-        return papers
+        return papers, []
     existing = {p["arxiv_id"] for p in papers}
     floor = min((p["paper_score"] for p in papers), default=0.0)
     for aid in lexical_ids:
@@ -723,7 +735,7 @@ def _lexical_paper_shortlist(papers, query, layer, year_from, year_to,
             continue
         papers.append({"arxiv_id": aid, "paper_score": floor})
         existing.add(aid)
-    return papers
+    return papers, lexical_ids
 
 
 def _hier_stage_b_hits(vector, must, arxiv_ids, dense_limit, timeout):
@@ -755,9 +767,18 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
     stage A failed and the old path was used instead (nothing hier-specific to
     report); otherwise a dict with `paper_scores` (arxiv_id -> rounded
     paper_score), `global_channel` ("skipped" when stage C didn't finish
-    within HIER_GLOBAL_GRACE, else None), and `global_extra` (up to
-    HIER_GLOBAL_EXTRA raw hydrated hits from stage C not already covered by
-    A+B, oldest-path order preserved).
+    within HIER_GLOBAL_GRACE, else None), and `global_extra`.
+
+    HIER_FUSION="mix" (default): `global_extra` is up to HIER_GLOBAL_EXTRA raw
+    hydrated hits from stage C not already covered by A+B, old-path order
+    preserved; the caller splices them onto the tail.
+
+    HIER_FUSION="rrf": stage C is folded into the ranking itself instead of
+    being spliced onto the tail, so `global_extra` is always []. `extra` also
+    carries `fusion_ranks` (arxiv_id -> {"dense", "lex", "global"} 1-based
+    ranks or None) and `found_via` (arxiv_id -> "paper" | "paper lexical") and
+    `lex_exempt` (arxiv_ids ranked <=3 in the lexical list, which the caller's
+    relevance floor must not drop even below-floor).
     """
     global_pool = ThreadPoolExecutor(max_workers=1)
     global_future = global_pool.submit(
@@ -766,9 +787,10 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
     try:
         papers = _coarse_paper_search(vector, body.layer, body.year_from, body.year_to,
                                       HIER_PAPERS, dense_timeout)
+        lexical_ids = []
         if PAPER_LEXICAL:
-            papers = _lexical_paper_shortlist(papers, query, body.layer,
-                                              body.year_from, body.year_to)
+            papers, lexical_ids = _lexical_paper_shortlist(papers, query, body.layer,
+                                                            body.year_from, body.year_to)
         if not papers:
             raise RuntimeError("papers_coarse returned no candidates")
         arxiv_ids = [p["arxiv_id"] for p in papers]
@@ -802,9 +824,18 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
         return hits, leftover_pool, dense_partial, None
 
     known_ids = {chunk["payload"]["arxiv_id"] for chunk in hits}
-    extra = {"paper_scores": paper_scores, "global_channel": None, "global_extra": []}
+    global_channel = None
+    c_hits = []
     try:
         c_hits, _, _, _c_partial = global_future.result(timeout=HIER_GLOBAL_GRACE)
+    except (FuturesTimeoutError, HTTPException):
+        global_channel = "skipped"
+    finally:
+        global_pool.shutdown(wait=False)
+
+    if HIER_FUSION != "rrf":
+        extra = {"paper_scores": paper_scores, "global_channel": global_channel,
+                 "global_extra": []}
         for h in c_hits:
             if len(extra["global_extra"]) >= HIER_GLOBAL_EXTRA:
                 break
@@ -812,10 +843,54 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
             if aid and aid not in known_ids:
                 extra["global_extra"].append(h)
                 known_ids.add(aid)
-    except (FuturesTimeoutError, HTTPException):
-        extra["global_channel"] = "skipped"
-    finally:
-        global_pool.shutdown(wait=False)
+        return hits, [], [], extra
+
+    # HIER_FUSION == "rrf": weighted RRF over three paper-level rankings
+    # instead of the mix blend + tail splice above.
+    l_dense = [chunk["payload"]["arxiv_id"] for _, _, chunk in merged]
+    l_lex = [aid for aid in lexical_ids if aid in best_chunk]
+    global_chunk = {}
+    l_global = []
+    for h in c_hits:
+        aid = (h.get("payload") or {}).get("arxiv_id")
+        if not aid:
+            continue
+        if aid not in l_global:
+            l_global.append(aid)
+        if aid not in best_chunk and aid not in global_chunk:
+            global_chunk[aid] = h
+
+    fused = reciprocal_rank_fusion(
+        l_dense, l_lex, l_global,
+        weights=[HIER_W_DENSE, HIER_W_LEX, HIER_W_GLOBAL])
+
+    dense_rank = {aid: i + 1 for i, aid in enumerate(l_dense)}
+    lex_rank = {aid: i + 1 for i, aid in enumerate(l_lex)}
+    global_rank = {aid: i + 1 for i, aid in enumerate(l_global)}
+
+    chunk_by_id = dict(best_chunk)
+    for aid, h in global_chunk.items():
+        chunk_by_id.setdefault(aid, h)
+
+    all_ids = set(l_dense) | set(l_lex) | set(l_global)
+    ordered_ids = sorted(all_ids, key=lambda aid: -fused.get(aid, 0.0))
+
+    lex_exempt = {aid for aid in l_lex if lex_rank[aid] <= 3}
+    found_via = {aid: ("paper lexical" if aid in lex_exempt else "paper")
+                for aid in ordered_ids}
+    fusion_ranks = {aid: {"dense": dense_rank.get(aid), "lex": lex_rank.get(aid),
+                          "global": global_rank.get(aid)}
+                    for aid in ordered_ids}
+
+    hits = [chunk_by_id[aid] for aid in ordered_ids if aid in chunk_by_id]
+    extra = {
+        "paper_scores": paper_scores,
+        "global_channel": global_channel,
+        "global_extra": [],
+        "fusion_ranks": fusion_ranks,
+        "lex_exempt": lex_exempt,
+        "found_via": found_via,
+    }
     return hits, [], [], extra
 
 
@@ -1337,15 +1412,21 @@ def _run_search(body: SearchBody, x_api_key=None,
         # ranking sort it out rather than dropping a whole layer's answers
         floor = min([MIN_RELEVANCE_SCORE] + list(MIN_RELEVANCE_BY_LAYER.values()))
 
+    # HIER_FUSION="rrf" only: an article ranked <=3 by exact title/abstract
+    # match is its own sufficient evidence and must clear the floor check
+    # below even when its best chunk scores under it. Empty (thus a no-op)
+    # for every other path, including HIER_FUSION="mix".
+    lex_exempt_ids = (hier_extra or {}).get("lex_exempt") or set()
+
     def _filter_and_dedupe(candidate_hits):
         picked = []
         seen = set()
         for h in candidate_hits:
-            if (h.get("score") or 0) < floor:
-                continue
             p = h["payload"]
+            aid = p.get("arxiv_id")
+            if (h.get("score") or 0) < floor and aid not in lex_exempt_ids:
+                continue
             if body.dedupe:
-                aid = p.get("arxiv_id")
                 if aid in seen:
                     continue
                 seen.add(aid)
@@ -1370,9 +1451,16 @@ def _run_search(body: SearchBody, x_api_key=None,
 
     hier_global_skipped = False
     if hier_extra:
+        # only set (non-None) under HIER_FUSION="rrf"; both .get()s fall back
+        # to the old "paper"/no-field behavior everywhere else.
+        found_via_map = hier_extra.get("found_via")
+        fusion_ranks_map = hier_extra.get("fusion_ranks")
         for r in results:
             r["paper_score"] = hier_extra["paper_scores"].get(r["arxiv_id"])
-            r["found_via"] = "paper"
+            r["found_via"] = (found_via_map.get(r["arxiv_id"], "paper")
+                              if found_via_map is not None else "paper")
+            if fusion_ranks_map is not None:
+                r["fusion_ranks"] = fusion_ranks_map.get(r["arxiv_id"])
         hier_global_skipped = hier_extra["global_channel"] == "skipped"
         if hier_extra["global_extra"]:
             known_arxiv = {r["arxiv_id"] for r in results}
