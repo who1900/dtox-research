@@ -17,9 +17,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 try:
-    from .search_core import fts_query, merge_layer_hits, reciprocal_rank_fusion
+    from .search_core import fts_query, merge_layer_hits, merge_layer_hits_calibrated, reciprocal_rank_fusion
 except ImportError:
-    from search_core import fts_query, merge_layer_hits, reciprocal_rank_fusion
+    from search_core import fts_query, merge_layer_hits, merge_layer_hits_calibrated, reciprocal_rank_fusion
 
 ATTESTOR_URL = os.getenv("ATTESTOR_URL", "http://127.0.0.1:8013")
 ATTESTOR_INTERNAL_TOKEN = os.getenv("ATTESTOR_INTERNAL_TOKEN", "")
@@ -371,12 +371,14 @@ def prime_query_embeddings(texts):
             API_EMBED_SLOTS.release()
 
 
-def _qdrant_cache_key(vector, qfilter):
+def _qdrant_cache_key(vector, qfilter, with_payload=True):
     vector_key = hashlib.sha1(
         json.dumps(vector, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     filter_key = json.dumps(qfilter, sort_keys=True, separators=(",", ":")) if qfilter else ""
-    return vector_key, filter_key
+    # with_payload is part of the identity: a cached no-payload result must
+    # never be handed to a caller that expects hit["payload"] to be usable.
+    return vector_key, filter_key, with_payload
 
 
 def prime_qdrant_searches(texts, layer, limit=80):
@@ -424,12 +426,12 @@ def prime_qdrant_searches(texts, layer, limit=80):
         return
 
 
-def qdrant_search(vector, qfilter, limit, timeout=45):
-    cache_key = _qdrant_cache_key(vector, qfilter)
+def qdrant_search(vector, qfilter, limit, timeout=45, with_payload=True):
+    cache_key = _qdrant_cache_key(vector, qfilter, with_payload)
     cached = qdrant_result_cache.get(cache_key)
     if cached is not None and cached["limit"] >= limit:
         return cached["results"][:limit]
-    body = {"vector": vector, "limit": limit, "with_payload": True}
+    body = {"vector": vector, "limit": limit, "with_payload": with_payload}
     if qfilter:
         body["filter"] = qfilter
     try:
@@ -443,8 +445,102 @@ def qdrant_search(vector, qfilter, limit, timeout=45):
         raise HTTPException(status_code=502, detail=f"qdrant error: {e}")
 
 
+def qdrant_fetch_payloads(ids, timeout=45):
+    """Phase 2 of two-phase retrieval: one batch payload fetch for winners only.
+
+    Reading payload for every dense_limit candidate per layer is what makes
+    cold public search slow against the disk-backed 9.2M-point collection
+    (11GB of on_disk_payload); only a handful of the 128 candidates ever reach
+    the response. Phase 1 fetches id+score only; this fetches payload once,
+    for the merged top-K ids.
+    """
+    if not ids:
+        return {}
+    try:
+        resp = requests.post(
+            f"{QDRANT_URL}/collections/{COLLECTION}/points",
+            json={"ids": ids, "with_payload": True, "with_vector": False},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        points = resp.json().get("result") or []
+        return {p["id"]: (p.get("payload") or {}) for p in points}
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"qdrant error: {e}")
+
+
+def _hydrate_hits(hits, timeout):
+    """Attach payload to a slice of phase-1 (no-payload) hits, one batch call."""
+    ids = [h["id"] for h in hits if h.get("id") is not None]
+    if not ids:
+        return []
+    payload_map = qdrant_fetch_payloads(ids, timeout=timeout)
+    hydrated = []
+    for h in hits:
+        payload = payload_map.get(h.get("id"))
+        if payload is None:
+            continue
+        hit = dict(h)
+        hit["payload"] = payload
+        hydrated.append(hit)
+    return hydrated
+
+
+def two_phase_dense_search(vector, qfilter, dense_limit, final_limit, timeout, layers=None):
+    """Two-phase dense retrieval shared by the single-layer and all-layer paths.
+
+    Phase 1 asks Qdrant for id+score only (with_payload=False), per layer when
+    `layers` is given (merged by score above each layer's median, see
+    merge_layer_hits_calibrated), or as one filtered search otherwise. Phase 2 hydrates only the merged top-K ids -- K =
+    final_limit*3, capped by however many candidates phase 1 actually returned
+    -- with a single POST /points batch call, preserving phase 1's order and
+    score.
+
+    Returns (hydrated_hits, merged_pool, failed_layers). merged_pool is the
+    full ranked, still-payload-less candidate list so a caller whose dedupe
+    comes up short after phase 2 can hydrate one further slice without paying
+    for another Qdrant vector search.
+    """
+    if layers:
+        def search_layer(layer):
+            must = list((qfilter or {}).get("must") or [])
+            must.append({"key": "layers", "match": {"any": [layer]}})
+            return qdrant_search(vector, {"must": must}, dense_limit, timeout=timeout,
+                                  with_payload=False)
+
+        result_sets, failed = [], []
+        with ThreadPoolExecutor(max_workers=len(layers)) as pool:
+            futures = {pool.submit(search_layer, layer): layer
+                       for layer in sorted(layers)}
+            for future in as_completed(futures):
+                layer = futures[future]
+                try:
+                    result_sets.append((layer, future.result()))
+                except HTTPException:
+                    failed.append(layer)
+        if not result_sets:
+            raise HTTPException(status_code=502, detail="qdrant layer searches timed out")
+        total_candidates = sum(len(r) for _, r in result_sets)
+        merged_pool = merge_layer_hits_calibrated(result_sets, LAYER_SCORE_MEDIAN,
+                                                  LAYER_SCORE_MEDIAN_DEFAULT, total_candidates)
+    else:
+        merged_pool = qdrant_search(vector, qfilter, dense_limit, timeout=timeout,
+                                    with_payload=False)
+        failed = []
+        total_candidates = len(merged_pool)
+
+    k = min(final_limit * 3, total_candidates)
+    hydrated = _hydrate_hits(merged_pool[:k], timeout)
+    return hydrated, merged_pool[:k], merged_pool[k:], sorted(failed)
+
+
 def qdrant_search_layers(vector, base_filter, limit, timeout=SEARCH_QDRANT_TIMEOUT):
-    """Search each topical payload index and RRF the lists.
+    """Search each topical payload index and RRF the lists (payload included).
+
+    Kept, with payload, for callers that need a single-shot result set (e.g.
+    the audit/validate paths going through qdrant_search directly per layer
+    would duplicate this). The public search endpoint uses the two-phase
+    variant above instead; this one is unchanged.
 
     A global HNSW request over millions of chunks became the slowest public
     path as the corpus grew. Per-layer filters use the payload indexes and stop
@@ -859,17 +955,14 @@ def _run_search(body: SearchBody, x_api_key=None,
         _bm25_candidates, query, body.layer, body.section_type,
         body.element_type, body.year_from, body.year_to)
         if lexical_executor else None)
-    vector, hits, dense_error, dense_partial = None, [], None, []
+    vector, hits, leftover_pool, dense_error, dense_partial = None, [], [], None, []
     dense_limit = limit * 4 if body.dedupe else limit
     try:
         vector = embed_query(query, wait_timeout=embed_wait_timeout,
                              request_timeout=embed_http_timeout)
-        if body.layer:
-            hits = qdrant_search(vector, qfilter, dense_limit,
-                                  timeout=dense_timeout)
-        else:
-            hits, dense_partial = qdrant_search_layers(
-                vector, qfilter, dense_limit, timeout=dense_timeout)
+        layers = sorted(ALLOWED_LAYERS) if not body.layer else None
+        hits, _hydrated_slice, leftover_pool, dense_partial = two_phase_dense_search(
+            vector, qfilter, dense_limit, limit, dense_timeout, layers=layers)
     except HTTPException as error:
         dense_error = error
     try:
@@ -880,8 +973,6 @@ def _run_search(body: SearchBody, x_api_key=None,
     if dense_error and not lexical:
         raise dense_error
 
-    results = []
-    seen_papers = set()
     if body.min_score is not None:
         floor = body.min_score
     elif body.layer:
@@ -890,18 +981,37 @@ def _run_search(body: SearchBody, x_api_key=None,
         # unfiltered search spans every topic, so use the gentler bar and let
         # ranking sort it out rather than dropping a whole layer's answers
         floor = min([MIN_RELEVANCE_SCORE] + list(MIN_RELEVANCE_BY_LAYER.values()))
-    for h in hits:
-        if (h.get("score") or 0) < floor:
-            continue
-        p = h["payload"]
-        if body.dedupe:
-            aid = p.get("arxiv_id")
-            if aid in seen_papers:
+
+    def _filter_and_dedupe(candidate_hits):
+        picked = []
+        seen = set()
+        for h in candidate_hits:
+            if (h.get("score") or 0) < floor:
                 continue
-            seen_papers.add(aid)
-        if len(results) >= limit:
-            break
-        results.append(_result_from_hit(h))
+            p = h["payload"]
+            if body.dedupe:
+                aid = p.get("arxiv_id")
+                if aid in seen:
+                    continue
+                seen.add(aid)
+            if len(picked) >= limit:
+                break
+            picked.append(_result_from_hit(h))
+        return picked
+
+    results = _filter_and_dedupe(hits)
+    # dedupe (same arxiv_id across chunks/layers) can leave phase 2's top-K
+    # short of `limit` even though phase 1 had more candidates ranked below
+    # it; hydrate one further slice rather than re-querying Qdrant. Capped at
+    # a single extra round so a pathological query can't cascade into many
+    # payload fetches.
+    if len(results) < limit and dense_error is None and leftover_pool:
+        try:
+            extra_hits = _hydrate_hits(leftover_pool, dense_timeout)
+        except HTTPException:
+            extra_hits = []
+        if extra_hits:
+            results = _filter_and_dedupe(hits + extra_hits)
 
     # lexical candidates the vectors missed, scored by the same vector search so
     # the two halves stay comparable, then fused by rank rather than by score
@@ -1407,6 +1517,10 @@ SCORE_ADJACENT = 0.80    # same problem area, different approach
 # noise and must not be called evidence -- the previous offset-based pair put
 # web3's floor at 0.71, which quietly promoted 0.759 hits into evidence and
 # made "nothing here" read as "adjacent work exists".
+# p50 of on-topic hits per layer (table above); builder-tech is not calibrated
+# yet and sits at the midpoint rather than at either extreme.
+LAYER_SCORE_MEDIAN = {"llm-slm": 0.898, "ai-agents": 0.860, "web3": 0.806}
+LAYER_SCORE_MEDIAN_DEFAULT = 0.860
 SCORE_BANDS_BY_LAYER = {
     "llm-slm": (0.879, 0.843),
     "ai-agents": (0.848, 0.821),

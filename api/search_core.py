@@ -19,6 +19,29 @@ def reciprocal_rank_fusion(*ranked_lists, weights=None):
     return scores
 
 
+def merge_layer_hits_calibrated(tagged_result_sets, layer_medians, default_median, limit):
+    """Fuse per-layer rankings by how far each hit sits above its layer's median.
+
+    Rank fusion treated every layer's first hit as equal, so a 0.788 hit that
+    tops llm-slm (median 0.898) tied with a 0.920 web3 hit (median 0.806), and
+    the tie broke arbitrarily. Offsetting by the layer median keeps the small
+    layers from being drowned by LLM wording without discarding the score.
+    """
+    best = {}
+    for layer, hits in tagged_result_sets:
+        median = layer_medians.get(layer, default_median)
+        for hit in hits:
+            point_id = hit.get("id")
+            if point_id is None:
+                continue
+            relative = (hit.get("score") or 0) - median
+            previous = best.get(point_id)
+            if previous is None or relative > previous[0]:
+                best[point_id] = (relative, hit)
+    ordered = sorted(best.values(), key=lambda pair: -pair[0])
+    return [hit for _, hit in ordered[:limit]]
+
+
 def merge_layer_hits(result_sets, limit):
     """Fuse per-layer Qdrant rankings without favouring the largest layer."""
     ranked = [[hit.get("id") for hit in hits if hit.get("id") is not None]

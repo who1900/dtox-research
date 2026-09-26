@@ -54,3 +54,21 @@ class SearchCoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CalibratedLayerMergeTests(unittest.TestCase):
+    def test_strong_small_layer_hit_beats_weak_large_layer_top(self):
+        from api.search_core import merge_layer_hits_calibrated
+        merged = merge_layer_hits_calibrated(
+            [("llm-slm", [{"id": "weak-llm", "score": 0.788}]),
+             ("web3", [{"id": "povd", "score": 0.920}])],
+            {"llm-slm": 0.898, "web3": 0.806}, 0.86, 10)
+        self.assertEqual([h["id"] for h in merged], ["povd", "weak-llm"])
+
+    def test_point_in_two_layers_keeps_its_best_offset(self):
+        from api.search_core import merge_layer_hits_calibrated
+        merged = merge_layer_hits_calibrated(
+            [("llm-slm", [{"id": "a", "score": 0.90}, {"id": "b", "score": 0.91}]),
+             ("web3", [{"id": "a", "score": 0.90}])],
+            {"llm-slm": 0.898, "web3": 0.806}, 0.86, 10)
+        self.assertEqual([h["id"] for h in merged], ["a", "b"])
