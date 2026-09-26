@@ -1194,8 +1194,8 @@ def upsert_discovered(conn, arxiv_id, title, year, layer, abstract=None,
     matched_layers = sorted(l for l, d in scores.items() if d["score"] > 0)
     # A protocol spec is Web3 by construction, but it is written in opcodes and
     # gas rather than "blockchain": the lexical gate had thrown out 237 of 686
-    # EIPs, EIP-1559 and EIP-155 among them.
-    if str(arxiv_id).startswith((EIP_ID_PREFIX, SIMD_ID_PREFIX)) and "web3" not in matched_layers:
+    # EIPs, EIP-1559 and EIP-155 among them, and the Aave whitepaper.
+    if str(arxiv_id).startswith((EIP_ID_PREFIX, SIMD_ID_PREFIX, WHITEPAPER_ID_PREFIX)) and "web3" not in matched_layers:
         matched_layers = sorted(matched_layers + ["web3"])
     _, primary_score = niche_filter.primary_layer(scores)
     matched_terms_json = json.dumps(niche_filter.all_matched_terms(scores))
