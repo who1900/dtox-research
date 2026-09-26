@@ -20,9 +20,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 try:
-    from .search_core import fts_query, merge_layer_hits, merge_layer_hits_calibrated, reciprocal_rank_fusion
+    from .search_core import fts_query, fts_query_any, merge_layer_hits, merge_layer_hits_calibrated, reciprocal_rank_fusion
 except ImportError:
-    from search_core import fts_query, merge_layer_hits, merge_layer_hits_calibrated, reciprocal_rank_fusion
+    from search_core import fts_query, fts_query_any, merge_layer_hits, merge_layer_hits_calibrated, reciprocal_rank_fusion
 
 ATTESTOR_URL = os.getenv("ATTESTOR_URL", "http://127.0.0.1:8013")
 ATTESTOR_INTERNAL_TOKEN = os.getenv("ATTESTOR_INTERNAL_TOKEN", "")
@@ -317,7 +317,7 @@ def _paper_bm25(query, layer=None, year_from=None, year_to=None, limit=PAPER_BM2
     columns are (arxiv_id, title, abstract, layers, year) in that order, so a
     hit in the title outweighs the same term only in the abstract.
     """
-    match = _fts_query(query)
+    match = fts_query_any(query)
     if not match:
         return []
     where, params = ["papers_fts MATCH ?"], [match]

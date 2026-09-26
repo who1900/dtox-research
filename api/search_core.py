@@ -10,6 +10,30 @@ def fts_query(text):
     return " AND ".join(f'"{w}"' for w in words[:12])
 
 
+_FTS_STOPWORDS = frozenset("""
+a an and are as at be been but by can do does for from has have how in into is it its
+of on or our such that the their them then there these they this to use used uses using
+was we were what when where which while who why will with within without you your
+""".split())
+
+
+def fts_query_any(text, max_terms=16):
+    """OR of the content words, for ranking rather than filtering.
+
+    fts_query ANDs up to twelve words, which a whole sentence almost never
+    satisfies against one title and abstract: the paper-level channel came back
+    empty for nearly every benchmark query. BM25 over an OR still ranks the
+    paper sharing the most rare terms first.
+    """
+    words, seen = [], set()
+    for w in re.findall(r"[A-Za-z0-9][A-Za-z0-9\-]*", text or ""):
+        lw = w.lower()
+        if len(lw) > 2 and lw not in _FTS_STOPWORDS and lw not in seen:
+            seen.add(lw)
+            words.append(w)
+    return " OR ".join(f'"{w}"' for w in words[:max_terms])
+
+
 def reciprocal_rank_fusion(*ranked_lists, weights=None):
     weights = weights or [1.0] * len(ranked_lists)
     scores = {}

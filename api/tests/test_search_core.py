@@ -72,3 +72,15 @@ class CalibratedLayerMergeTests(unittest.TestCase):
              ("web3", [{"id": "a", "score": 0.90}])],
             {"llm-slm": 0.898, "web3": 0.806}, 0.86, 10)
         self.assertEqual([h["id"] for h in merged], ["a", "b"])
+
+
+class FtsQueryAnyTests(unittest.TestCase):
+    def test_ors_content_words_and_drops_stopwords(self):
+        from api.search_core import fts_query_any
+        q = fts_query_any("The model is trained with GRPO for the math reasoning")
+        self.assertEqual(q, '"model" OR "trained" OR "GRPO" OR "math" OR "reasoning"')
+
+    def test_dedupes_and_caps_terms(self):
+        from api.search_core import fts_query_any
+        q = fts_query_any(" ".join(f"term{i} term{i}" for i in range(30)), max_terms=5)
+        self.assertEqual(q.count(" OR "), 4)
