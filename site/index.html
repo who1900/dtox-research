@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>dtox research</title>
+<meta name="description" content="Web3-first evidence engine for AI agents over the full text of papers, protocol specs and whitepapers. Free MCP endpoint, paid x402 surface, verdicts attested on Solana.">
+<meta property="og:title" content="dtox research">
+<meta property="og:description" content="Web3-first evidence engine for AI agents over the full text of papers, protocol specs and whitepapers.">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%231a1a1a'/%3E%3Crect x='8' y='8' width='16' height='4' fill='%23fafaf3'/%3E%3Crect x='8' y='14' width='10' height='4' fill='%23fafaf3'/%3E%3Crect x='8' y='20' width='16' height='4' fill='%23fafaf3'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #fafaf3;
+    --bg-panel: #f0f0e7;
+    --ink: #1a1a1a;
+    --muted: #686860;
+    --shadow: rgba(27,28,24,0.04);
+    --shadow-strong: rgba(27,28,24,0.08);
+    --ok: #1a1a1a;
+    --link: #1a1a1a;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #171814;
+      --bg-panel: #202119;
+      --ink: #fafaf3;
+      --muted: #a3a398;
+      --shadow: rgba(0,0,0,0.28);
+      --shadow-strong: rgba(0,0,0,0.4);
+      --ok: #fafaf3;
+      --link: #fafaf3;
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  html { -webkit-text-size-adjust: 100%; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Inter", -apple-system, sans-serif;
+    line-height: 1.55;
+    overflow-x: hidden;
+  }
+
+  ::selection { background: var(--ink); color: var(--bg); }
+
+  a { color: var(--link); }
+  a:not(.btn) { text-decoration-thickness: 1px; text-underline-offset: 3px; }
+
+  :focus-visible {
+    outline: 2px solid var(--ink);
+    outline-offset: 3px;
+  }
+
+  code, pre, .mono {
+    font-family: "Roboto Mono", ui-monospace, monospace;
+  }
+
+  .wrap {
+    max-width: 920px;
+    margin: 0 auto;
+    padding: 0 16px;
+  }
+
+  header.top {
+    padding: 28px 0 0;
+  }
+
+  .top .wrap {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+
+  .brand {
+    font-family: "Roboto Mono", monospace;
+    font-size: 13px;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    text-decoration: none;
+  }
+
+  nav.top-links {
+    display: flex;
+    gap: 20px;
+    font-family: "Roboto Mono", monospace;
+    font-size: 12px;
+    letter-spacing: 0.02em;
+  }
+
+  nav.top-links a { text-decoration: none; color: var(--muted); }
+  nav.top-links a:hover { color: var(--ink); }
+
+  section {
+    padding: 64px 0;
+  }
+
+  section.hero { padding: 72px 0 56px; }
+
+  h1 {
+    font-family: "Inter", sans-serif;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    font-size: clamp(38px, 7vw, 64px);
+    line-height: 1.02;
+    margin: 0 0 20px;
+  }
+
+  h2 {
+    font-family: "Inter", sans-serif;
+    font-weight: 600;
+    letter-spacing: -0.015em;
+    font-size: clamp(22px, 3.4vw, 28px);
+    margin: 0 0 28px;
+  }
+
+  h3 {
+    font-family: "Inter", sans-serif;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    font-size: 17px;
+    margin: 0 0 8px;
+  }
+
+  .lede {
+    font-size: clamp(17px, 2.4vw, 20px);
+    color: var(--muted);
+    max-width: 62ch;
+    margin: 0 0 40px;
+  }
+
+  .section-label {
+    font-family: "Roboto Mono", monospace;
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 16px;
+  }
+
+  .install {
+    background: var(--bg-panel);
+    padding: 20px;
+    box-shadow: 0 0 24px var(--shadow);
+    max-width: 640px;
+  }
+
+  .install-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+
+  .install-row:last-child { margin-bottom: 0; }
+
+  .install pre {
+    margin: 0;
+    padding: 12px 14px;
+    background: var(--bg);
+    font-size: 12.5px;
+    overflow-x: auto;
+    flex: 1;
+    box-shadow: inset 0 0 0 var(--shadow);
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+
+  .copy-btn {
+    font-family: "Roboto Mono", monospace;
+    font-size: 11px;
+    letter-spacing: 0.03em;
+    background: var(--ink);
+    color: var(--bg);
+    border: none;
+    padding: 10px 14px;
+    cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .copy-btn:hover { opacity: 0.85; }
+  .copy-btn:active { opacity: 0.7; }
+
+  .install-caption {
+    font-family: "Roboto Mono", monospace;
+    font-size: 11px;
+    color: var(--muted);
+    margin: 14px 0 0;
+  }
+
+  .grid3 {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 2px;
+    background: var(--shadow-strong);
+  }
+
+  .grid3 > div {
+    background: var(--bg-panel);
+    padding: 22px 20px;
+  }
+
+  @media (max-width: 720px) {
+    .grid3 { grid-template-columns: 1fr; }
+  }
+
+  .card-desc { color: var(--muted); font-size: 14.5px; margin: 0; }
+
+  ul.plain { margin: 0; padding: 0; list-style: none; }
+  ul.plain li {
+    padding: 12px 0;
+    color: var(--muted);
+    font-size: 15px;
+  }
+  ul.plain li + li { }
+  ul.plain.divided li {
+    box-shadow: 0 -1px 0 0 transparent;
+  }
+  ul.plain.divided { background: var(--bg-panel); padding: 4px 20px; box-shadow: 0 0 24px var(--shadow); }
+  ul.plain.divided li { padding: 14px 0; }
+  ul.plain.divided li:not(:last-child) { border-bottom: none; box-shadow: inset 0 -1px 0 var(--shadow-strong); }
+
+  .flow {
+    font-family: "Roboto Mono", monospace;
+    font-size: 12.5px;
+    line-height: 2.1;
+    background: var(--bg-panel);
+    padding: 20px 22px;
+    box-shadow: 0 0 24px var(--shadow);
+    overflow-x: auto;
+    white-space: pre;
+    margin: 0 0 28px;
+  }
+
+  .why {
+    max-width: 68ch;
+    color: var(--muted);
+    font-size: 15px;
+    margin: 0 0 32px;
+  }
+  .why strong { color: var(--ink); font-weight: 600; }
+
+  .example {
+    background: var(--bg-panel);
+    padding: 20px 22px;
+    box-shadow: 0 0 24px var(--shadow);
+    margin-bottom: 16px;
+  }
+
+  .example .tag {
+    font-family: "Roboto Mono", monospace;
+    font-size: 10.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 10px;
+  }
+
+  .example p { margin: 0 0 10px; font-size: 14.5px; }
+  .example p:last-child { margin-bottom: 0; }
+
+  .example a.explorer {
+    font-family: "Roboto Mono", monospace;
+    font-size: 12.5px;
+    word-break: break-all;
+  }
+
+  table.pricing {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14.5px;
+    background: var(--bg-panel);
+    box-shadow: 0 0 24px var(--shadow);
+  }
+
+  table.pricing th, table.pricing td {
+    text-align: left;
+    padding: 12px 18px;
+  }
+
+  table.pricing thead th {
+    font-family: "Roboto Mono", monospace;
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 500;
+  }
+
+  table.pricing tbody tr:not(:last-child) td {
+    box-shadow: inset 0 -1px 0 var(--shadow-strong);
+  }
+
+  table.pricing td.price { font-family: "Roboto Mono", monospace; }
+
+  .badge {
+    display: inline-block;
+    font-family: "Roboto Mono", monospace;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    background: var(--bg-panel);
+    padding: 4px 10px;
+    margin-bottom: 20px;
+  }
+
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 2px;
+    background: var(--shadow-strong);
+    margin-bottom: 14px;
+  }
+
+  @media (max-width: 640px) {
+    .stats-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+
+  .stat {
+    background: var(--bg-panel);
+    padding: 22px 18px;
+  }
+
+  .stat .num {
+    font-family: "Roboto Mono", monospace;
+    font-size: clamp(22px, 4vw, 30px);
+    font-weight: 500;
+    display: block;
+    margin-bottom: 6px;
+  }
+
+  .stat .label {
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+
+  .as-of {
+    font-family: "Roboto Mono", monospace;
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  footer {
+    padding: 40px 0 56px;
+  }
+
+  footer .wrap {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+    font-family: "Roboto Mono", monospace;
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  footer a { color: var(--muted); }
+  footer a:hover { color: var(--ink); }
+
+  .foot-links { display: flex; gap: 20px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="#top">dtox research</a>
+    <nav class="top-links">
+      <a href="#returns">what it returns</a>
+      <a href="#verdicts">verdicts</a>
+      <a href="#pricing">pricing</a>
+      <a href="#corpus">corpus</a>
+      <a href="#limits">limits</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+
+<section class="hero" id="top">
+  <div class="wrap">
+    <h1>dtox research</h1>
+    <p class="lede">Web3-first evidence engine for AI agents over the full text of papers, protocol specs and whitepapers.</p>
+
+    <div class="install">
+      <div class="install-row">
+        <pre id="cmd-claude">claude mcp add --transport http dtox https://read.whoim.space/mcp</pre>
+        <button class="copy-btn" data-copy-target="cmd-claude" aria-label="Copy Claude Code install command">copy</button>
+      </div>
+      <div class="install-row">
+        <pre id="cmd-json">{"type":"http","url":"https://read.whoim.space/mcp"}</pre>
+        <button class="copy-btn" data-copy-target="cmd-json" aria-label="Copy generic MCP client config">copy</button>
+      </div>
+      <p class="install-caption">No key, no signup. stdio-only clients can bridge with <code>npx -y mcp-remote https://read.whoim.space/mcp</code>.</p>
+    </div>
+  </div>
+</section>
+
+<section id="returns">
+  <div class="wrap">
+    <p class="section-label">What it returns</p>
+    <h2>Method sections, not paraphrases</h2>
+    <p class="why">Papers are fetched as LaTeX sources and split by structure: equations in raw LaTeX, algorithms, tables and the paragraph where the authors admit what did not work are first-class chunks, not prose a model has to re-derive.</p>
+
+    <div class="grid3">
+      <div>
+        <h3>Dense</h3>
+        <p class="card-desc">bge-small-en-v1.5, int8 ONNX, 384 dim, over millions of structural chunks in Qdrant.</p>
+      </div>
+      <div>
+        <h3>Lexical</h3>
+        <p class="card-desc">BM25 over the same chunks in SQLite FTS5, fused by reciprocal rank. Exact terms like <code>GRPO</code> survive here and drown in embeddings alone.</p>
+      </div>
+      <div>
+        <h3>Citation graph</h3>
+        <p class="card-desc">One hop through the bibliography of the best hits. Does not depend on wording, which is the failure mode the other two channels share.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="verdicts">
+  <div class="wrap">
+    <p class="section-label">Verifiable verdicts on Solana</p>
+    <h2>A retrieval score is not a verdict</h2>
+
+    <pre class="flow">search  -&gt;  read
+        -&gt;  get_verdict_message
+        -&gt;  agent signs with its own Solana wallet
+        -&gt;  record_signed_verdict
+        -&gt;  Solana Attestation Service attestation (devnet)</pre>
+
+    <p class="why">A retrieval score measures wording, never whether a paper makes a claim. Anonymous MCP callers share one server identity, and a shared identity cannot judge claims against itself. So the only public write path is a wallet-signed verdict: an agent signs its verdict with an ed25519 keypair it controls, and the reviewer's signature is embedded inside the on-chain attestation itself, verifiable by anyone without trusting dtox. A claim is only <strong>confirmed_prior_art</strong> when independent wallets agree.</p>
+
+    <div class="example">
+      <p class="tag">Live example, devnet</p>
+      <p>Claim: <em>GRPO removes the separate value critic model...</em>. Paper arXiv 2402.03300. Verdict: asserts. Two independent wallets agree &rarr; confirmed_prior_art.</p>
+      <a class="explorer" href="https://explorer.solana.com/address/729nUikYt2SUJaq1Brx2YwXvgLT5J1eVp9sfo31ncswu?cluster=devnet" target="_blank" rel="noopener">explorer.solana.com/address/729nUikYt2SUJaq1Brx2YwXvgLT5J1eVp9sfo31ncswu</a>
+    </div>
+
+    <div class="example">
+      <p class="tag">Live example, devnet</p>
+      <p>Paper arXiv 2501.12948, verdict written through a paid x402 call.</p>
+      <a class="explorer" href="https://explorer.solana.com/address/6pC4NS96euD9G7jPtjvXbVs1ffaWAjKdJMkX799Mq6eL?cluster=devnet" target="_blank" rel="noopener">explorer.solana.com/address/6pC4NS96euD9G7jPtjvXbVs1ffaWAjKdJMkX799Mq6eL</a>
+    </div>
+  </div>
+</section>
+
+<section id="pricing">
+  <div class="wrap">
+    <p class="section-label">Pay per result with x402</p>
+    <h2>A paid MCP surface, USDC on Solana devnet</h2>
+    <span class="badge">devnet only at this stage</span>
+    <p class="why">Endpoint: <code>https://read.whoim.space/x402/mcp</code>. The buyer's wallet needs devnet USDC and no SOL: the facilitator pays the transaction fee. Prices are per call, independent of each other.</p>
+
+    <table class="pricing">
+      <thead>
+        <tr><th>Tool</th><th>Price</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>get_evidence_bundle</td><td class="price">$0.01</td></tr>
+        <tr><td>get_code_or_math_spec</td><td class="price">$0.03</td></tr>
+        <tr><td>compare_methods</td><td class="price">$0.05</td></tr>
+        <tr><td>research_trends</td><td class="price">$0.03</td></tr>
+        <tr><td>validate_project</td><td class="price">$0.25</td></tr>
+        <tr><td>record_signed_verdict</td><td class="price">$0.01</td></tr>
+      </tbody>
+    </table>
+
+    <p class="why" style="margin-top: 20px;">Example settlement transaction: <a class="explorer" href="https://explorer.solana.com/tx/5DWkk85AFVHSTCqeSEbq8SpxEAtfkSRgQZLPJy9ZyCnTvZczsyD86yKELGWf5xYrDrF5wTvt3txUL19NFLYmrBvG?cluster=devnet" target="_blank" rel="noopener">explorer.solana.com/tx/5DWkk85AFVHSTCqeSEbq8SpxEAtfkSRgQZLPJy9ZyCnTvZczsyD86yKELGWf5xYrDrF5wTvt3txUL19NFLYmrBvG</a></p>
+  </div>
+</section>
+
+<section id="corpus">
+  <div class="wrap">
+    <p class="section-label">Corpus</p>
+    <h2>What is actually indexed</h2>
+
+    <div class="stats-grid">
+      <div class="stat"><span class="num" data-stat="documents">n/a</span><span class="label">documents</span></div>
+      <div class="stat"><span class="num" data-stat="chunks">n/a</span><span class="label">chunks</span></div>
+      <div class="stat"><span class="num" data-stat="citation_edges">n/a</span><span class="label">citation edges</span></div>
+      <div class="stat"><span class="num" data-stat="web3_documents">n/a</span><span class="label">web3 documents</span></div>
+    </div>
+    <p class="as-of">as of <span data-stat="as_of">n/a</span></p>
+  </div>
+</section>
+
+<section id="limits">
+  <div class="wrap">
+    <p class="section-label">What it does not do</p>
+    <h2>Honesty as a feature</h2>
+    <ul class="plain divided">
+      <li>Three subjects only: LLMs and small language models, AI agents, and web3. An idea outside that scope is refused, not force-fit.</li>
+      <li>No patents. There are none in the corpus, and the service says that rather than letting absence read as novelty.</li>
+      <li>No guarantee that any given paper is present, inside the three subjects or otherwise.</li>
+      <li>IACR records are abstract-only and carry <code>fulltext: false</code>.</li>
+      <li>Verdicts and attestations are devnet only.</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>AGPL-3.0</span>
+    <div class="foot-links">
+      <a href="https://github.com/who1900/dtox-research" target="_blank" rel="noopener">github.com/who1900/dtox-research</a>
+      <a href="https://read.whoim.space/mcp">read.whoim.space/mcp</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+  document.querySelectorAll('.copy-btn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var targetId = btn.getAttribute('data-copy-target');
+      var el = document.getElementById(targetId);
+      if (!el) return;
+      var text = el.textContent;
+      var done = function () {
+        var original = btn.textContent;
+        btn.textContent = 'copied';
+        setTimeout(function () { btn.textContent = original; }, 1400);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done).catch(function () { fallbackCopy(text, done); });
+      } else {
+        fallbackCopy(text, done);
+      }
+    });
+  });
+
+  function fallbackCopy(text, done) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta);
+    done();
+  }
+
+  fetch('stats.json').then(function (r) {
+    if (!r.ok) throw new Error('no stats');
+    return r.json();
+  }).then(function (data) {
+    document.querySelectorAll('[data-stat]').forEach(function (el) {
+      var key = el.getAttribute('data-stat');
+      var value = data[key];
+      el.textContent = (value === null || value === undefined || value === '') ? 'n/a' : (typeof value === 'number' ? value.toLocaleString('en-US') : value);
+    });
+  }).catch(function () {
+    document.querySelectorAll('[data-stat]').forEach(function (el) {
+      el.textContent = 'n/a';
+    });
+  });
+</script>
+
+</body>
+</html>
