@@ -53,17 +53,24 @@ def run_one_query(api_base, api_key, row, limit, params, timeout):
     if params:
         body.update(params)
     headers = {"x-api-key": api_key, "Content-Type": "application/json"}
-    start = time.monotonic()
-    try:
-        resp = requests.post(f"{api_base}/v1/search", json=body, headers=headers,
-                             timeout=timeout)
-    except requests.RequestException as e:
-        return {
-            "qid": row["qid"], "target": row["target"], "layer": row["layer"],
-            "bucket": row["bucket"], "named": row["named"], "split": row["split"],
-            "rank": None, "error": True, "error_detail": str(e),
-            "latency_ms": (time.monotonic() - start) * 1000, "partial": False,
-        }
+    # A faster backend pushes the run past the key's 60/min limit, and a 429
+    # scored as a miss made one run look like a quality collapse. Wait it out
+    # and time only the attempt that was actually served.
+    for _attempt in range(6):
+        start = time.monotonic()
+        try:
+            resp = requests.post(f"{api_base}/v1/search", json=body, headers=headers,
+                                 timeout=timeout)
+        except requests.RequestException as e:
+            return {
+                "qid": row["qid"], "target": row["target"], "layer": row["layer"],
+                "bucket": row["bucket"], "named": row["named"], "split": row["split"],
+                "rank": None, "error": True, "error_detail": str(e),
+                "latency_ms": (time.monotonic() - start) * 1000, "partial": False,
+            }
+        if resp.status_code != 429:
+            break
+        time.sleep(10)
     latency_ms = (time.monotonic() - start) * 1000
     if resp.status_code != 200:
         return {
