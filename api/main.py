@@ -992,6 +992,7 @@ def _run_search(body: SearchBody, x_api_key=None,
 # not the whole methods narrative: returning every method chunk of a survey
 # costs ~66k tokens, which defeats the point of the endpoint.
 SPEC_ELEMENT_TYPES = ("algorithm", "equation", "code", "table")
+SPEC_PRIORITY = {"algorithm": 0, "equation": 1, "code": 2, "prose": 3, "table": 4}
 SPEC_MAX_CHARS = 12000
 
 
@@ -1050,7 +1051,11 @@ def paper_spec(
                     " (try include_prose=true for its method prose)",
         }
 
-    elements.sort(key=lambda p: p.get("chunk_index", 0))
+    # Implementable objects first, results tables last: DeepSeekMath's benchmark
+    # tables precede its method, and in paper order they filled the whole
+    # character budget before the GRPO objective was ever reached.
+    elements.sort(key=lambda p: (SPEC_PRIORITY.get((p.get("element_type") or "").lower(), 3),
+                                 p.get("chunk_index", 0)))
     title = elements[0].get("title")
 
     sections, used, truncated = [], 0, False
