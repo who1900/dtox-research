@@ -1,3 +1,4 @@
+import functools
 import hashlib
 import json
 import logging
@@ -205,6 +206,36 @@ def _fts_query(text):
     return fts_query(text)
 
 
+# Every read-only lookup on the /v1/search path used to open its own
+# sqlite3.connect(), and on the production disk a cold connect costs ~0.4s by
+# itself -- source_url()/_paper_facts() alone were burning multiple seconds
+# per request on nothing but connection setup. A read-only connection has
+# nothing to lose by outliving one request, so each worker thread keeps one
+# per database and reuses it across calls.
+_ro_conn_local = threading.local()
+
+
+def _ro_conn(db_path, timeout=10):
+    """Thread-local, reused sqlite3 read-only connection for `db_path`."""
+    conns = getattr(_ro_conn_local, "conns", None)
+    if conns is None:
+        conns = {}
+        _ro_conn_local.conns = conns
+    conn = conns.get(db_path)
+    if conn is None:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True,
+                               timeout=timeout, check_same_thread=False)
+        conns[db_path] = conn
+    return conn
+
+
+def _ro_conn_drop(db_path):
+    """Forget a cached connection so the next call reconnects from scratch."""
+    conns = getattr(_ro_conn_local, "conns", None)
+    if conns is not None:
+        conns.pop(db_path, None)
+
+
 def _bm25_candidates(query, layer=None, section_type=None, element_type=None,
                      year_from=None, year_to=None, limit=BM25_CANDIDATES):
     """Paper ids whose text actually contains the query's words, best first."""
@@ -229,18 +260,22 @@ def _bm25_candidates(query, layer=None, section_type=None, element_type=None,
         params.append(year_to)
     sql = (f"SELECT arxiv_id, bm25(chunks) AS rank FROM chunks "
            f"WHERE {' AND '.join(where)} ORDER BY rank LIMIT ?")
+    deadline = time.monotonic() + LEXICAL_QUERY_TIMEOUT
     try:
-        conn = sqlite3.connect(f"file:{FTS_DB_PATH}?mode=ro", uri=True, timeout=10)
-    except sqlite3.Error:
-        return []
-    try:
-        deadline = time.monotonic() + LEXICAL_QUERY_TIMEOUT
+        conn = _ro_conn(FTS_DB_PATH)
         conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
         rows = conn.execute(sql, params + [limit * 3]).fetchall()
+    except sqlite3.OperationalError:
+        # cached connection may have gone stale; reconnect once and retry
+        _ro_conn_drop(FTS_DB_PATH)
+        try:
+            conn = _ro_conn(FTS_DB_PATH)
+            conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
+            rows = conn.execute(sql, params + [limit * 3]).fetchall()
+        except sqlite3.Error:
+            return []
     except sqlite3.Error:
         return []
-    finally:
-        conn.close()
     seen, out = set(), []
     for arxiv_id, _rank in rows:
         if arxiv_id and arxiv_id not in seen:
@@ -277,14 +312,18 @@ def _title_overlap(query, title):
 
 def _paper_in_index(arxiv_id):
     try:
-        conn = sqlite3.connect(f"file:{STATE_DB_PATH}?mode=ro", uri=True, timeout=10)
-    except sqlite3.Error:
-        return None
-    try:
+        conn = _ro_conn(STATE_DB_PATH)
         row = conn.execute("SELECT status FROM papers WHERE arxiv_id=?",
                            (arxiv_id,)).fetchone()
-    finally:
-        conn.close()
+    except sqlite3.OperationalError:
+        _ro_conn_drop(STATE_DB_PATH)
+        try:
+            row = _ro_conn(STATE_DB_PATH).execute(
+                "SELECT status FROM papers WHERE arxiv_id=?", (arxiv_id,)).fetchone()
+        except sqlite3.Error:
+            return None
+    except sqlite3.Error:
+        return None
     return row[0] if row else None
 
 
@@ -794,12 +833,16 @@ def source_of(paper_id):
     return prefix if prefix in SOURCE_LABELS else "arxiv"
 
 
-def source_url(paper_id, payload=None):
-    """Canonical public URL for a document, by source."""
-    pid = str(paper_id or "")
-    # a whitepaper carries its own origin: it was fetched from a project site
-    if payload and payload.get("url"):
-        return payload["url"]
+@functools.lru_cache(maxsize=20000)
+def _source_url_for_id(pid, has_payload):
+    """The payload-independent half of source_url, cached by paper id.
+
+    A paper's URL never changes, and _result_from_hit calls source_url twice
+    per hit (url + arxiv_url) across up to ~80 hits a search. `has_payload`
+    reproduces the one payload-dependent branch below (oa/pmlr/hal/gh fall
+    back to a formatted URL only when no payload was supplied at all) without
+    needing the whole payload dict in the cache key.
+    """
     if pid.startswith("iacr:"):
         return f"https://eprint.iacr.org/{pid.split(':', 1)[1]}"
     if pid.startswith("eip:"):
@@ -810,14 +853,23 @@ def source_url(paper_id, payload=None):
     if pid.startswith("wp:"):
         return None  # curated document with no stored origin yet
     if pid.startswith("oa:"):
-        return payload.get("url") if payload else f"https://openalex.org/{pid.split(':', 1)[1]}"
+        return None if has_payload else f"https://openalex.org/{pid.split(':', 1)[1]}"
     if pid.startswith("pmlr:"):
-        return payload.get("url") if payload else f"https://proceedings.mlr.press/{pid.split(':', 1)[1]}.html"
+        return None if has_payload else f"https://proceedings.mlr.press/{pid.split(':', 1)[1]}.html"
     if pid.startswith("hal:"):
-        return payload.get("url") if payload else f"https://hal.science/hal-{pid.split(':', 1)[1]}"
+        return None if has_payload else f"https://hal.science/hal-{pid.split(':', 1)[1]}"
     if pid.startswith("gh:"):
-        return payload.get("url") if payload else None
+        return None
     return f"https://arxiv.org/abs/{pid}"
+
+
+def source_url(paper_id, payload=None):
+    """Canonical public URL for a document, by source."""
+    pid = str(paper_id or "")
+    # a whitepaper carries its own origin: it was fetched from a project site
+    if payload and payload.get("url"):
+        return payload["url"]
+    return _source_url_for_id(pid, payload is not None)
 
 
 # ---------------------------------------------------------------------------
@@ -920,30 +972,39 @@ def _lexical_fallback_results(query, paper_ids, limit):
     if not match:
         return []
     marks = ",".join("?" * len(ids))
-    fts = None
+    deadline = time.monotonic() + LEXICAL_QUERY_TIMEOUT
+    fts_sql = (f"SELECT text, arxiv_id, section_type, element_type, layers, year "
+              f"FROM chunks WHERE chunks MATCH ? AND arxiv_id IN ({marks}) "
+              f"ORDER BY bm25(chunks) LIMIT ?")
+    fts_params = [match, *ids, limit * 3]
     try:
-        fts = sqlite3.connect(f"file:{FTS_DB_PATH}?mode=ro", uri=True, timeout=2)
-        deadline = time.monotonic() + LEXICAL_QUERY_TIMEOUT
+        fts = _ro_conn(FTS_DB_PATH)
         fts.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
-        rows = fts.execute(
-            f"SELECT text, arxiv_id, section_type, element_type, layers, year "
-            f"FROM chunks WHERE chunks MATCH ? AND arxiv_id IN ({marks}) "
-            f"ORDER BY bm25(chunks) LIMIT ?", [match, *ids, limit * 3]
-        ).fetchall()
+        rows = fts.execute(fts_sql, fts_params).fetchall()
+    except sqlite3.OperationalError:
+        _ro_conn_drop(FTS_DB_PATH)
+        try:
+            fts = _ro_conn(FTS_DB_PATH)
+            fts.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
+            rows = fts.execute(fts_sql, fts_params).fetchall()
+        except sqlite3.Error:
+            return []
     except sqlite3.Error:
         return []
-    finally:
-        if fts is not None:
-            fts.close()
     best = {}
     for row in rows:
         best.setdefault(row[1], row)
+    meta_sql = (f"SELECT arxiv_id,title,citation_count,venue,niche_score,matched_terms,source_url "
+               f"FROM papers WHERE arxiv_id IN ({marks})")
     try:
-        state = sqlite3.connect(f"file:{STATE_DB_PATH}?mode=ro", uri=True, timeout=2)
-        meta = {row[0]: row[1:] for row in state.execute(
-            f"SELECT arxiv_id,title,citation_count,venue,niche_score,matched_terms,source_url "
-            f"FROM papers WHERE arxiv_id IN ({marks})", ids).fetchall()}
-        state.close()
+        state = _ro_conn(STATE_DB_PATH)
+        meta = {row[0]: row[1:] for row in state.execute(meta_sql, ids).fetchall()}
+    except sqlite3.OperationalError:
+        _ro_conn_drop(STATE_DB_PATH)
+        try:
+            meta = {row[0]: row[1:] for row in _ro_conn(STATE_DB_PATH).execute(meta_sql, ids).fetchall()}
+        except sqlite3.Error:
+            meta = {}
     except sqlite3.Error:
         meta = {}
     results = []
@@ -1130,10 +1191,18 @@ def _run_search(body: SearchBody, x_api_key=None,
                 vector, qfilter, dense_limit, limit, dense_timeout, layers=layers)
     except HTTPException as error:
         dense_error = error
+    lexical_skipped = False
     try:
-        lexical = lexical_future.result() if lexical_future else []
+        lexical = lexical_future.result(timeout=LEXICAL_QUERY_TIMEOUT) if lexical_future else []
+    except FuturesTimeoutError:
+        # BM25 missed its own deadline (slow disk under fts.db); the dense
+        # results already stand on their own, so answer with those rather
+        # than blocking the request on a thread that is already overrunning.
+        lexical, lexical_skipped = [], True
     finally:
         if lexical_executor:
+            # the FTS thread finishes on its own time; cancel_futures only
+            # drops futures that hadn't started yet.
             lexical_executor.shutdown(wait=False, cancel_futures=True)
     if dense_error and not lexical:
         raise dense_error
@@ -1256,6 +1325,10 @@ def _run_search(body: SearchBody, x_api_key=None,
     payload = {"results": results, "count": len(results), "usage": USAGE_NOTICE}
     if hier_global_skipped:
         payload["global_channel"] = "skipped"
+    if lexical_skipped:
+        # dense results are complete on their own -- this is not "partial",
+        # only missing the exact-term channel hybrid search adds on top
+        payload["lexical_channel"] = "skipped"
     if dense_error:
         payload["partial"] = True
         payload["retrieval_warning"] = (
@@ -1956,16 +2029,18 @@ def _paper_facts(paper_ids):
     ids = [pid for pid in dict.fromkeys(paper_ids) if pid]
     if not ids:
         return {}
+    sql = (f"SELECT arxiv_id, niche_score FROM papers "
+          f"WHERE arxiv_id IN ({','.join('?' * len(ids))})")
     try:
-        conn = sqlite3.connect(f"file:{STATE_DB_PATH}?mode=ro", uri=True, timeout=15)
+        rows = _ro_conn(STATE_DB_PATH).execute(sql, ids).fetchall()
+    except sqlite3.OperationalError:
+        _ro_conn_drop(STATE_DB_PATH)
+        try:
+            rows = _ro_conn(STATE_DB_PATH).execute(sql, ids).fetchall()
+        except sqlite3.Error:
+            return {}
     except sqlite3.Error:
         return {}
-    try:
-        rows = conn.execute(
-            f"SELECT arxiv_id, niche_score FROM papers "
-            f"WHERE arxiv_id IN ({','.join('?' * len(ids))})", ids).fetchall()
-    finally:
-        conn.close()
     return {r[0]: r[1] for r in rows}
 
 
