@@ -138,6 +138,10 @@ COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "papers_fulltext")
 EMBED_BATCH_URL = os.getenv("EMBED_BATCH_URL", "http://127.0.0.1:8005/embed_batch")
 EMBED_TIMEOUT = 90
 UPSERT_BATCH_SIZE = 64
+# Off by default: papers_coarse (see coarse_index.py) is a separate, additive
+# article-level index for two-tier search and must never be able to hold up
+# or break the chunk pipeline above. Flip on once it has been backfilled.
+COARSE_INDEX_ENABLED = os.getenv("COARSE_INDEX_ENABLED", "0") == "1"
 
 # --- speed tuning (fulltext/chunk/embed only; harvest/quality untouched) ---
 FULLTEXT_CYCLE_LIMIT = 150       # quality_checked papers considered per cycle
@@ -1188,6 +1192,11 @@ def upsert_discovered(conn, arxiv_id, title, year, layer, abstract=None,
     match_text = f"{title} {abstract}" if abstract else title
     scores = niche_filter.niche_score(match_text)
     matched_layers = sorted(l for l, d in scores.items() if d["score"] > 0)
+    # A protocol spec is Web3 by construction, but it is written in opcodes and
+    # gas rather than "blockchain": the lexical gate had thrown out 237 of 686
+    # EIPs, EIP-1559 and EIP-155 among them.
+    if str(arxiv_id).startswith((EIP_ID_PREFIX, SIMD_ID_PREFIX)) and "web3" not in matched_layers:
+        matched_layers = sorted(matched_layers + ["web3"])
     _, primary_score = niche_filter.primary_layer(scores)
     matched_terms_json = json.dumps(niche_filter.all_matched_terms(scores))
 
@@ -2499,6 +2508,19 @@ def fts_write(points):
         fts.close()
 
 
+def _sync_coarse_index(conn, arxiv_ids):
+    """Best-effort mirror into papers_coarse right after papers hit status='done'.
+    Imported lazily (coarse_index imports this module) and never allowed to
+    cost a paper: any failure here is a warning, not a pipeline error."""
+    if not COARSE_INDEX_ENABLED or not arxiv_ids:
+        return
+    try:
+        import coarse_index
+        coarse_index.upsert_papers(conn, arxiv_ids)
+    except Exception as e:
+        log.warning(f"coarse-index: sync failed for {arxiv_ids}: {e}")
+
+
 def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT):
     rows = conn.execute(
         "SELECT arxiv_id, title, year, layers, citation_count, venue, niche_score, matched_terms, "
@@ -2526,6 +2548,7 @@ def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT):
             conn.execute("UPDATE papers SET status='done', updated_at=? WHERE arxiv_id=?", (now_iso(), arxiv_id))
             conn.commit()
             processed += 1
+            _sync_coarse_index(conn, [arxiv_id])
             continue
         paper_meta[arxiv_id] = row
         for c in embeddable:
@@ -2625,6 +2648,7 @@ def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT):
         conn.execute("UPDATE papers SET status='done', updated_at=? WHERE arxiv_id=?", (now_iso(), arxiv_id))
         conn.commit()
         processed += 1
+        _sync_coarse_index(conn, [arxiv_id])
 
     # Batches run concurrently against embed-small; qdrant upsert + status commit
     # happen per-paper, sequentially, in this (main) thread as soon as a paper's

@@ -40,7 +40,10 @@ The failure this service works hardest to avoid is a confident answer where it s
 ```
 pipeline/    harvest, quality gate, LaTeX extraction, chunking, embedding,
              citation graph, deferred re-checks. One systemd service, eight
-             stages in threads, SQLite WAL for durability.
+             stages in threads, SQLite WAL for durability. coarse_index.py
+             maintains papers_coarse, a small in-RAM title+abstract index
+             used to shortlist candidate articles before the on-disk
+             per-chunk search.
 api/         FastAPI: search, spec, compare, trends, validate, adjudicate,
              claim linking. api/tests holds the regression harness.
 mcp/         MCP server (streamable-http) wrapping the API as seven tools.
