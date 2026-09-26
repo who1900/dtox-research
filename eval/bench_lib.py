@@ -114,7 +114,32 @@ def is_usable_context(raw_text):
         return None
     if is_listy_or_filler(cleaned):
         return None
+    # S2 truncates long contexts with an ellipsis, and a second citation often
+    # survives as "(Huang et al., 2025a; ...)" or a lone "al., 2021)" fragment:
+    # either way the sentence is about more than the target.
+    if cleaned.startswith(("…", "...")) or _RESIDUAL_CITE_RE.search(cleaned):
+        return None
     return cleaned, kind
+
+
+_RESIDUAL_CITE_RE = re.compile(
+    r"et al|\bal\.,|\b(?:19|20)\d\d[a-z]?\s*[;)]|\[\s*\d")
+
+
+def content_tokens(text):
+    # a five-letter prefix is a crude stem, enough to let "adapters" meet
+    # "adaptation" without pulling in a stemming library
+    return {t.lower()[:5] for t in _TOKEN_RE.findall(text or "")
+            if len(t) >= 4 and t.lower() not in _STOPWORDS and not t.isdigit()}
+
+
+def is_grounded(query, title, abstract, min_shared=2):
+    """The context must share a few content words with the target itself.
+
+    Contexts like "these benchmarks still fall short" cite the right paper but
+    could describe a hundred others; no retriever can be graded on them.
+    """
+    return len(content_tokens(query) & content_tokens(f"{title} {abstract}")) >= min_shared
 
 
 # ---------------- named vs. descriptive ----------------

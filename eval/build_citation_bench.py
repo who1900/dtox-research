@@ -52,7 +52,7 @@ def load_targets(db_path, per_layer, builder_tech_cap, seed):
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
-        "SELECT arxiv_id, title, layers, year FROM papers WHERE status='done'"
+        "SELECT arxiv_id, title, layers, year, abstract FROM papers WHERE status='done'"
     ).fetchall()
     conn_close = conn
     in_degree = {}
@@ -75,7 +75,7 @@ def load_targets(db_path, per_layer, builder_tech_cap, seed):
             continue  # nothing to build a bench query from
         bucket = bl.popularity_bucket(degree)
         candidates.append({
-            "arxiv_id": aid, "title": row["title"], "layer": primary_layer,
+            "arxiv_id": aid, "title": row["title"], "abstract": row["abstract"], "layer": primary_layer,
             "bucket": bucket, "year": row["year"], "in_degree": degree,
         })
 
@@ -182,6 +182,8 @@ def select_contexts_for_target(citation_payload, target, max_contexts=MAX_CONTEX
             if not usable:
                 continue
             query, marker_kind = usable
+            if not bl.is_grounded(query, target["title"], target.get("abstract")):
+                continue
             named = bl.is_named_query(query, target["title"])
             score = (1 if any(i in PREFERRED_INTENTS for i in intents) else 0) + (1 if influential else 0)
             candidates.append({
