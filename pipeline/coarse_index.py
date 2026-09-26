@@ -28,7 +28,8 @@ import time
 import requests
 
 import service
-from concurrent.futures import ThreadPoolExecutor
+import queue
+import threading
 
 log = logging.getLogger("dtox-research.coarse_index")
 if not log.handlers:
@@ -372,38 +373,53 @@ def backfill(conn, limit=None, dry_run=False):
         return rows, resp.json()["vectors"]
 
     batches = [todo[i : i + COARSE_BATCH_SIZE] for i in range(0, total, COARSE_BATCH_SIZE)]
-    done = 0
+    # One worker per embed service pulling from a shared queue: waiting for a
+    # whole wave let the idle query service sit behind the busy ingest one.
+    work = queue.Queue()
+    for b in batches:
+        work.put(b)
+    lock = threading.Lock()
+    counter = {"done": 0}
     start = time.monotonic()
-    pool = ThreadPoolExecutor(max_workers=len(urls))
-    for w in range(0, len(batches), len(urls)):
-        jobs = [(k, b) for k, b in enumerate(batches[w : w + len(urls)])]
-        results = []
-        for job, fut in [(j, pool.submit(embed, j)) for j in jobs]:
+
+    def worker(slot):
+        while True:
             try:
-                results.append(fut.result())
+                batch_rows = work.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                rows, vectors = embed((slot, batch_rows))
             except requests.RequestException as e:
-                log.warning(f"coarse: embed batch failed, skipping {len(job[1])} papers: {e}")
-        for batch_rows, vectors in results:
+                log.warning(f"coarse: embed batch failed, skipping {len(batch_rows)} papers: {e}")
+                continue
             points = [
                 {
                     "id": coarse_point_id(row["arxiv_id"]),
                     "vector": vec,
                     "payload": build_payload(row, in_citations.get(row["arxiv_id"], 0)),
                 }
-                for row, vec in zip(batch_rows, vectors)
+                for row, vec in zip(rows, vectors)
             ]
             try:
-                upsert_batch(session, points)
+                upsert_batch(sessions[slot], points)
             except requests.RequestException as e:
                 log.warning(f"coarse: upsert failed for batch of {len(points)} papers: {e}")
                 continue
-            done += len(points)
-            if done % 1000 < COARSE_BATCH_SIZE:
+            with lock:
+                counter["done"] += len(points)
+                done_now = counter["done"]
+            if done_now % 1000 < COARSE_BATCH_SIZE:
                 elapsed = time.monotonic() - start
-                rate = done / elapsed if elapsed > 0 else 0.0
-                log.info(f"coarse: {done}/{total} done ({rate:.1f}/s)")
-        time.sleep(COARSE_SLEEP)
-    pool.shutdown()
+                log.info(f"coarse: {done_now}/{total} done ({done_now / elapsed:.1f}/s)")
+            time.sleep(COARSE_SLEEP)
+
+    threads = [threading.Thread(target=worker, args=(k,)) for k in range(len(urls))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    done = counter["done"]
     log.info(f"coarse: backfill complete, {done} papers indexed")
     return done
 
