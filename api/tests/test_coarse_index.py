@@ -234,6 +234,124 @@ class BackfillSkipsAlreadyIndexedTests(unittest.TestCase):
         upsert_mock.assert_not_called()
 
 
+class CoarseEmbedBatchUrlTests(unittest.TestCase):
+    """COARSE_EMBED_BATCH_URL: papers_coarse's migration to a separate bge-base
+    service. Empty by default, which must leave every other test in this file
+    (all using service.embed_texts_batch) byte-for-byte unaffected.
+    """
+
+    def test_upsert_papers_uses_coarse_embed_batch_url_when_set(self):
+        conn = make_conn()
+        insert_paper(conn, "2401.00020", title="T",
+                     abstract="This abstract is long enough to clear the eighty character minimum comfortably and then some.")
+        session = MagicMock()
+        session.post.return_value.raise_for_status = lambda: None
+        session.post.return_value.json.return_value = {"vectors": [[0.1] * 768]}
+
+        with patch.object(coarse_index, "ensure_coarse_collection"), \
+             patch.object(coarse_index, "COARSE_EMBED_BATCH_URL", "http://coarse-base.local/embed_batch"), \
+             patch.object(service, "embed_texts_batch") as small_embed_mock, \
+             patch.object(coarse_index, "upsert_batch") as upsert_mock:
+            n = coarse_index.upsert_papers(conn, ["2401.00020"], session=session)
+
+        self.assertEqual(n, 1)
+        small_embed_mock.assert_not_called()
+        session.post.assert_called_once()
+        called_url = session.post.call_args[0][0]
+        self.assertEqual(called_url, "http://coarse-base.local/embed_batch")
+        points = upsert_mock.call_args[0][1]
+        self.assertEqual(points[0]["vector"], [0.1] * 768)
+
+    def test_backfill_uses_coarse_embed_batch_url_when_set(self):
+        conn = make_conn()
+        insert_paper(conn, "2401.00021", title="T",
+                     abstract="This abstract is long enough to clear the eighty character minimum comfortably and then some.")
+        fake_session = MagicMock()
+        fake_session.post.return_value.raise_for_status = lambda: None
+        fake_session.post.return_value.json.return_value = {"vectors": [[0.2] * 768]}
+
+        with patch.object(coarse_index, "ensure_coarse_collection"), \
+             patch.object(coarse_index, "get_indexed_arxiv_ids", return_value=set()), \
+             patch.object(coarse_index, "COARSE_EMBED_BATCH_URL", "http://coarse-base.local/embed_batch"), \
+             patch.object(coarse_index, "COARSE_SLEEP", 0.0), \
+             patch.object(coarse_index.requests, "Session", return_value=fake_session), \
+             patch.object(service, "embed_texts_batch") as small_embed_mock, \
+             patch.object(coarse_index, "upsert_batch") as upsert_mock:
+            done = coarse_index.backfill(conn, limit=None, dry_run=False)
+
+        self.assertEqual(done, 1)
+        small_embed_mock.assert_not_called()
+        fake_session.post.assert_any_call(
+            "http://coarse-base.local/embed_batch",
+            json=unittest.mock.ANY, timeout=service.EMBED_TIMEOUT)
+        upsert_mock.assert_called_once()
+        points = upsert_mock.call_args[0][1]
+        self.assertEqual(points[0]["vector"], [0.2] * 768)
+
+    def test_default_unset_keeps_using_shared_small_embed_service(self):
+        conn = make_conn()
+        insert_paper(conn, "2401.00022", title="T",
+                     abstract="This abstract is long enough to clear the eighty character minimum comfortably and then some.")
+        with patch.object(coarse_index, "ensure_coarse_collection"), \
+             patch.object(service, "embed_texts_batch", return_value=[[0.0] * 384]) as small_embed_mock, \
+             patch.object(coarse_index, "upsert_batch") as upsert_mock:
+            n = coarse_index.upsert_papers(conn, ["2401.00022"])
+        self.assertEqual(n, 1)
+        small_embed_mock.assert_called_once()
+        points = upsert_mock.call_args[0][1]
+        self.assertEqual(points[0]["vector"], [0.0] * 384)
+
+
+class EnsureCoarseCollectionDimTests(unittest.TestCase):
+    """ensure_coarse_collection must size a new collection from the actual
+    embedder in use (or COARSE_DIM), not a hardcoded 384 -- a mismatch against
+    a 768-dim bge-base vector is a Qdrant 400 on every later upsert."""
+
+    @staticmethod
+    def _creation_put_body(session):
+        """The one PUT call that creates the collection itself (carries a
+        "vectors" key), as opposed to the several later PUTs that just add
+        payload indexes."""
+        for call in session.put.call_args_list:
+            body = call.kwargs.get("json") or {}
+            if "vectors" in body:
+                return body
+        raise AssertionError("no collection-creation PUT call found")
+
+    def test_creates_collection_with_dim_from_actual_probe_vector(self):
+        session = MagicMock()
+        session.get.return_value.status_code = 404
+        session.put.return_value.raise_for_status = lambda: None
+        with patch.object(coarse_index, "embed_coarse_batch", return_value=[[0.0] * 768]) as embed_mock, \
+             patch.object(coarse_index, "COARSE_DIM_ENV", None):
+            coarse_index.ensure_coarse_collection(session)
+        embed_mock.assert_called_once()
+        body = self._creation_put_body(session)
+        self.assertEqual(body["vectors"]["size"], 768)
+
+    def test_coarse_dim_env_skips_the_probe_call(self):
+        session = MagicMock()
+        session.get.return_value.status_code = 404
+        session.put.return_value.raise_for_status = lambda: None
+        with patch.object(coarse_index, "COARSE_DIM_ENV", "512"), \
+             patch.object(coarse_index, "embed_coarse_batch") as embed_mock:
+            coarse_index.ensure_coarse_collection(session)
+        embed_mock.assert_not_called()
+        body = self._creation_put_body(session)
+        self.assertEqual(body["vectors"]["size"], 512)
+
+    def test_existing_collection_is_left_alone_no_probe_or_creation(self):
+        session = MagicMock()
+        session.get.return_value.status_code = 200
+        with patch.object(coarse_index, "embed_coarse_batch") as embed_mock, \
+             patch.object(coarse_index, "COARSE_DIM_ENV", None):
+            coarse_index.ensure_coarse_collection(session)
+        embed_mock.assert_not_called()
+        for call in session.put.call_args_list:
+            body = call.kwargs.get("json") or {}
+            self.assertNotIn("vectors", body, "existing collection must not be re-created")
+
+
 class ServiceHookTests(unittest.TestCase):
     """service._sync_coarse_index: the embed pipeline must never break because
     of the coarse index, and must stay a no-op unless explicitly enabled."""

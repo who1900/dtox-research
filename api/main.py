@@ -63,6 +63,15 @@ HIER_FUSION = os.getenv("HIER_FUSION", "mix")
 HIER_W_DENSE = float(os.getenv("HIER_W_DENSE", "1.0"))
 HIER_W_LEX = float(os.getenv("HIER_W_LEX", "0.8"))
 HIER_W_GLOBAL = float(os.getenv("HIER_W_GLOBAL", "0.5"))
+# papers_coarse is migrating from bge-small (384-dim, shared EMBED_URL below) to
+# bge-base (768-dim, embed/embed_service.py). Empty by default: stage A embeds
+# with the same query vector as chunk search, byte-for-byte the old behavior.
+# Once set, only _coarse_paper_search's Qdrant call switches embedder -- stage
+# B/C chunk search (papers_fulltext) always stays on bge-small/EMBED_URL. A
+# bge-small vector must never reach COARSE_COLLECTION once this is set: Qdrant
+# would 400 on the dimension mismatch (384 vs 768) rather than silently degrade.
+COARSE_EMBED_URL = os.getenv("COARSE_EMBED_URL", "")
+COARSE_EMBED_TIMEOUT = float(os.getenv("COARSE_EMBED_TIMEOUT", "2"))
 EMBED_URL = os.getenv("EMBED_URL", "http://127.0.0.1:8006/embed")
 EMBED_BATCH_URL = os.getenv("EMBED_BATCH_URL", "http://127.0.0.1:8006/embed_batch")
 QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
@@ -196,6 +205,9 @@ class TTLCache:
 search_cache = TTLCache(ttl_seconds=600, max_size=500)
 embedding_cache = TTLCache(ttl_seconds=1800, max_size=2000)
 qdrant_result_cache = TTLCache(ttl_seconds=600, max_size=1000)
+# separate from embedding_cache: a coarse-model vector must never be handed
+# back to a caller expecting a bge-small one, or vice versa.
+coarse_embedding_cache = TTLCache(ttl_seconds=1800, max_size=2000)
 
 
 # ---------------- lexical half of the search ----------------
@@ -460,6 +472,28 @@ def embed_query(text: str, wait_timeout=EMBED_WAIT_TIMEOUT,
         API_EMBED_SLOTS.release()
 
 
+def embed_query_coarse(text: str, timeout=None) -> List[float]:
+    """Embed a query with the coarse-index model (COARSE_EMBED_URL), for stage
+    A of hierarchical search only. Own LRU cache: this vector's dimension
+    (bge-base, 768) differs from embed_query's (bge-small, 384) and the two
+    must never be mixed up or handed to the wrong collection. Raises
+    requests.RequestException on failure/timeout -- callers are expected to
+    fall back to the old (shared-vector) path, exactly as when papers_coarse
+    itself is unavailable.
+    """
+    timeout = COARSE_EMBED_TIMEOUT if timeout is None else timeout
+    text = (text or "").strip()
+    cached = coarse_embedding_cache.get(text)
+    if cached is not None:
+        return cached
+    resp = requests.post(COARSE_EMBED_URL, json={"text": text, "query": True},
+                         timeout=timeout)
+    resp.raise_for_status()
+    vector = resp.json()["vector"]
+    coarse_embedding_cache.set(text, vector)
+    return vector
+
+
 def prime_query_embeddings(texts):
     """Embed the known audit phrasings in small batches before retrieval.
 
@@ -666,7 +700,7 @@ def two_phase_dense_search(vector, qfilter, dense_limit, final_limit, timeout, l
 
 # ---------------- hierarchical (two-tier) search: stages A/B/C ----------------
 
-def _coarse_paper_search(vector, layer, year_from, year_to, limit, timeout):
+def _coarse_paper_search(vector, layer, year_from, year_to, limit, timeout, query=None):
     """Stage A: shortlist articles from the small in-RAM papers_coarse index.
 
     Only layer/year are applied here -- section_type/element_type/terms are
@@ -676,7 +710,17 @@ def _coarse_paper_search(vector, layer, year_from, year_to, limit, timeout):
     so a paper the corpus itself treats as canonical (e.g. LoRA, cited by
     thousands of its own descendants) outranks a near-tied chunk-level match
     from one of those descendants.
+
+    When COARSE_EMBED_URL is set, the query is re-embedded with the coarse
+    model (papers_coarse_base, bge-base) instead of reusing `vector` (the
+    bge-small vector chunk search already computed) -- the two collections are
+    on different embedders and their vectors are not interchangeable. On
+    failure this raises, letting the caller (_hier_run) fall back exactly as
+    it does when papers_coarse itself is unavailable.
     """
+    search_vector = vector
+    if COARSE_EMBED_URL:
+        search_vector = embed_query_coarse(query)
     must = []
     if layer:
         must.append({"key": "layers", "match": {"any": [layer]}})
@@ -688,7 +732,7 @@ def _coarse_paper_search(vector, layer, year_from, year_to, limit, timeout):
             rng["lte"] = year_to
         must.append({"key": "year", "range": rng})
     qfilter = {"must": must} if must else None
-    hits = qdrant_search(vector, qfilter, limit, timeout=timeout, with_payload=True,
+    hits = qdrant_search(search_vector, qfilter, limit, timeout=timeout, with_payload=True,
                          collection=COARSE_COLLECTION)
     cap = math.log1p(1000)
     papers = []
@@ -786,7 +830,7 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
         layers=layers)
     try:
         papers = _coarse_paper_search(vector, body.layer, body.year_from, body.year_to,
-                                      HIER_PAPERS, dense_timeout)
+                                      HIER_PAPERS, dense_timeout, query=query)
         lexical_ids = []
         if PAPER_LEXICAL:
             papers, lexical_ids = _lexical_paper_shortlist(papers, query, body.layer,

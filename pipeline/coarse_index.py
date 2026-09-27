@@ -53,6 +53,15 @@ ABSTRACT_CHAR_LIMIT = int(os.getenv("COARSE_MAX_CHARS", "800"))
 # Backfill spreads batches over every listed embed service (same model); the
 # live query service can lend its idle CPU for a one-off rebuild.
 COARSE_EMBED_URLS = [u.strip() for u in os.getenv("COARSE_EMBED_URLS", "").split(",") if u.strip()]
+# Migration target: papers_coarse -> papers_coarse_base (bge-base, 768-dim),
+# served by embed/embed_service.py. Empty by default: upsert_papers/backfill
+# keep using the shared bge-small service exactly as before. When set, it
+# takes priority over COARSE_EMBED_URLS (which only spreads bge-small load
+# across mirrors of the *same* model) since there is one bge-base service.
+COARSE_EMBED_BATCH_URL = os.getenv("COARSE_EMBED_BATCH_URL", "")
+# Collection vector size normally comes from the first real embedding
+# (see ensure_coarse_collection); set this only to skip that probe call.
+COARSE_DIM_ENV = os.getenv("COARSE_DIM")
 MIN_ABSTRACT_LEN = 80
 # Mirrors extractor.SKIP_SECTION_TYPES: skip the same low-value sections when
 # picking a fallback sentence for abstract-less papers.
@@ -230,14 +239,35 @@ def _ensure_coarse_indexes(session):
         )
 
 
+def embed_coarse_batch(session, texts):
+    """Embed a batch of texts with whichever embedder papers_coarse currently
+    uses: COARSE_EMBED_BATCH_URL (the bge-base migration target) when set,
+    else the existing shared bge-small service (service.embed_texts_batch) --
+    unchanged default behavior."""
+    if COARSE_EMBED_BATCH_URL:
+        resp = session.post(COARSE_EMBED_BATCH_URL, json={"texts": texts}, timeout=service.EMBED_TIMEOUT)
+        resp.raise_for_status()
+        return resp.json()["vectors"]
+    return service.embed_texts_batch(session, texts)
+
+
 def ensure_coarse_collection(session):
     resp = session.get(f"{service.QDRANT_URL}/collections/{COARSE_COLLECTION}", timeout=15)
     if resp.status_code == 200:
         _ensure_coarse_indexes(session)
         return
     log.info(f"creating Qdrant collection {COARSE_COLLECTION}")
+    # Dimension comes from the actual embedder in use (COARSE_DIM overrides,
+    # for skipping the probe call) rather than a hardcoded 384 -- papers_coarse
+    # is migrating to bge-base (768-dim) via COARSE_EMBED_BATCH_URL, and a
+    # collection created with the wrong size would make every later upsert
+    # a Qdrant 400.
+    if COARSE_DIM_ENV:
+        dim = int(COARSE_DIM_ENV)
+    else:
+        dim = len(embed_coarse_batch(session, ["dimension probe"])[0])
     body = {
-        "vectors": {"size": 384, "distance": "Cosine", "on_disk": False},
+        "vectors": {"size": dim, "distance": "Cosine", "on_disk": False},
         "hnsw_config": {"m": 16, "ef_construct": 128},
         "on_disk_payload": False,
     }
@@ -326,7 +356,7 @@ def upsert_papers(conn, arxiv_ids, session=None):
             return 0
         in_citations = fetch_in_citations_for(conn, [r["arxiv_id"] for r in rows])
         texts = [build_embed_text(r["title"], r["abstract"], r["arxiv_id"], session=session) for r in rows]
-        vectors = service.embed_texts_batch(session, texts)
+        vectors = embed_coarse_batch(session, texts)
         points = [
             {
                 "id": coarse_point_id(row["arxiv_id"]),
@@ -366,6 +396,10 @@ def backfill(conn, limit=None, dry_run=False):
         slot, rows = job
         texts = [build_embed_text(r["title"], r["abstract"], r["arxiv_id"], session=sessions[slot])
                  for r in rows]
+        if COARSE_EMBED_BATCH_URL:
+            # single new bge-base service -- takes priority over COARSE_EMBED_URLS,
+            # which only spreads bge-small load across mirrors of that model.
+            return rows, embed_coarse_batch(sessions[slot], texts)
         if not COARSE_EMBED_URLS:
             return rows, service.embed_texts_batch(sessions[slot], texts)
         resp = sessions[slot].post(urls[slot], json={"texts": texts}, timeout=service.EMBED_TIMEOUT)
