@@ -63,6 +63,16 @@ HIER_FUSION = os.getenv("HIER_FUSION", "mix")
 HIER_W_DENSE = float(os.getenv("HIER_W_DENSE", "1.0"))
 HIER_W_LEX = float(os.getenv("HIER_W_LEX", "0.8"))
 HIER_W_GLOBAL = float(os.getenv("HIER_W_GLOBAL", "0.5"))
+# When a hierarchical search actually runs (not the stage A/B fallback), its
+# own paper-level BM25 channel (PAPER_LEXICAL, folded in via _hier_run/the
+# paper+chunk fusion below) already covers exact-term matches, so the old
+# chunk-level lexical channel -- a 9.2M-row fts.db query on a slow disk, plus
+# the _score_specific_papers/_lexical_fallback_results extra-scoring it feeds
+# in _run_search's hybrid block -- is redundant work. Default "1" keeps the
+# old behavior (chunk lexical always runs) byte-for-byte; "0" skips it, but
+# only while hier search is on and actually succeeds -- a stage A/B fallback
+# still gets the chunk-level channel, exactly as before.
+HIER_CHUNK_LEXICAL = os.getenv("HIER_CHUNK_LEXICAL", "1") == "1"
 # papers_coarse is migrating from bge-small (384-dim, shared EMBED_URL below) to
 # bge-base (768-dim, embed/embed_service.py). Empty by default: stage A embeds
 # with the same query vector as chunk search, byte-for-byte the old behavior.
@@ -537,11 +547,15 @@ def _qdrant_cache_key(vector, qfilter, with_payload=True, collection=None):
         json.dumps(vector, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     filter_key = json.dumps(qfilter, sort_keys=True, separators=(",", ":")) if qfilter else ""
-    # with_payload is part of the identity: a cached no-payload result must
-    # never be handed to a caller that expects hit["payload"] to be usable.
-    # collection likewise, so a papers_coarse search can never answer a
-    # papers_fulltext one from cache.
-    return vector_key, filter_key, with_payload, collection or COLLECTION
+    # with_payload is part of the identity: a cached no-payload (or partial-
+    # payload) result must never be handed to a caller that expects a
+    # different set of payload fields to be usable. collection likewise, so a
+    # papers_coarse search can never answer a papers_fulltext one from cache.
+    # Qdrant also accepts a field-name list for with_payload (partial
+    # payload); normalize that to a hashable, order-independent tuple.
+    payload_key = (tuple(sorted(with_payload)) if isinstance(with_payload, list)
+                  else with_payload)
+    return vector_key, filter_key, payload_key, collection or COLLECTION
 
 
 def prime_qdrant_searches(texts, layer, limit=80):
@@ -1376,12 +1390,22 @@ def _run_search(body: SearchBody, x_api_key=None,
         must.append({"key": "year", "range": rng})
     qfilter = {"must": must} if must else None
 
+    # HIER_CHUNK_LEXICAL=0: skip firing the chunk-level BM25 query up front,
+    # betting that hierarchical search (already running the paper-level BM25
+    # channel) will succeed. Whether that bet paid off is only knowable once
+    # _hier_run returns below; if it fell back instead, the chunk channel is
+    # fetched then, same as the always-on path just a bit later.
+    # Only skip the chunk channel when the paper-level BM25 channel is also
+    # on -- that's the channel this optimization assumes is covering for it.
+    # Without PAPER_LEXICAL, hier search carries no lexical signal of its own
+    # and dropping chunk lexical too would leave exact-term matches uncovered.
+    skip_chunk_lexical = HIER_SEARCH and not HIER_CHUNK_LEXICAL and PAPER_LEXICAL
     lexical_executor = (ThreadPoolExecutor(max_workers=2 if PAPER_LEXICAL else 1)
                        if body.hybrid else None)
     lexical_future = (lexical_executor.submit(
         _bm25_candidates, query, body.layer, body.section_type,
         body.element_type, body.year_from, body.year_to)
-        if lexical_executor else None)
+        if lexical_executor and not skip_chunk_lexical else None)
     paper_lexical_future = (lexical_executor.submit(
         _paper_bm25, query, body.layer, body.year_from, body.year_to)
         if lexical_executor and PAPER_LEXICAL else None)
@@ -1401,10 +1425,20 @@ def _run_search(body: SearchBody, x_api_key=None,
                 vector, qfilter, dense_limit, limit, dense_timeout, layers=layers)
     except HTTPException as error:
         dense_error = error
+    # True only when hier search was on AND actually produced its result (not
+    # the stage A/B fallback to the old single-tier path).
+    hier_used = bool(HIER_SEARCH and hier_extra is not None)
     lexical_skipped = False
     lexical = []
     try:
-        lexical = lexical_future.result(timeout=LEXICAL_QUERY_TIMEOUT) if lexical_future else []
+        if lexical_future is not None:
+            lexical = lexical_future.result(timeout=LEXICAL_QUERY_TIMEOUT)
+        elif skip_chunk_lexical and not hier_used and body.hybrid:
+            # the bet above didn't pay off -- hier fell back to the old path,
+            # which needs the chunk-level channel just like before. It was
+            # never fired, so fetch it now (rare: only on stage A/B failure).
+            lexical = _bm25_candidates(query, body.layer, body.section_type,
+                                       body.element_type, body.year_from, body.year_to)
     except FuturesTimeoutError:
         # BM25 missed its own deadline (slow disk under fts.db); the dense
         # results already stand on their own, so answer with those rather
@@ -1425,17 +1459,23 @@ def _run_search(body: SearchBody, x_api_key=None,
             # drops futures that hadn't started yet.
             lexical_executor.shutdown(wait=False, cancel_futures=True)
 
+    # HIER_CHUNK_LEXICAL=0, hier search actually used: the chunk channel was
+    # deliberately never fired above (not merely timed out), so it must not
+    # be reported as available even though lexical_skipped is False here.
+    chunk_lexical_skipped_intentionally = skip_chunk_lexical and hier_used
+
     # PAPER_LEXICAL off (default): `lexical` is untouched, exactly the old
     # chunk-only BM25 list -- no behavior change below this point.
     lexical_channel = None
     if PAPER_LEXICAL and paper_lexical_future is not None:
-        chunk_available = not lexical_skipped
+        chunk_available = not lexical_skipped and not chunk_lexical_skipped_intentionally
         if not paper_lexical_skipped:
             fused_lexical = reciprocal_rank_fusion(
                 paper_lexical, lexical if chunk_available else [], weights=[1.0, 0.6])
             lexical = sorted(fused_lexical, key=lambda pid: -fused_lexical[pid])
             lexical_skipped = False
-            lexical_channel = "paper+chunk" if chunk_available else "paper"
+            lexical_channel = "paper" if chunk_lexical_skipped_intentionally else (
+                "paper+chunk" if chunk_available else "paper")
         else:
             # the article-level index is the safety net this feature exists
             # for; if it also missed its deadline there is nothing exact-term
@@ -1532,7 +1572,14 @@ def _run_search(body: SearchBody, x_api_key=None,
         for r in results:
             base = "paper" if r.get("found_via") == "paper" else "dense"
             r["channels"] = [base, "lexical"] if r["arxiv_id"] in lex_all else [base]
-        extra_ids = [pid for pid in lexical if pid not in known][:BM25_CANDIDATES]
+        # HIER_CHUNK_LEXICAL=0, hier used: `lexical` here is the paper-level
+        # BM25 list only, already folded into hier's own ranking -- scoring
+        # its "extras" again through _score_specific_papers (the expensive
+        # per-request Qdrant payload fetch this whole feature exists to
+        # avoid) or falling back to _lexical_fallback_results would just
+        # redo work the hier path already accounted for.
+        extra_ids = ([] if chunk_lexical_skipped_intentionally else
+                    [pid for pid in lexical if pid not in known][:BM25_CANDIDATES])
         scored = []
         if extra_ids and vector is not None and dense_error is None:
             scored = _score_specific_papers(query, extra_ids, body.layer,
@@ -1543,8 +1590,9 @@ def _run_search(body: SearchBody, x_api_key=None,
                 h["found_via"] = "lexical match"
                 h["channels"] = ["lexical"]
         scored_ids = {item["arxiv_id"] for item in scored}
-        raw = ([] if terms else _lexical_fallback_results(
-            query, [pid for pid in extra_ids if pid not in scored_ids], limit))
+        raw = ([] if (terms or chunk_lexical_skipped_intentionally) else
+              _lexical_fallback_results(
+                  query, [pid for pid in extra_ids if pid not in scored_ids], limit))
         dense_order = [r["arxiv_id"] for r in results]
         fused = _rrf(dense_order, lexical, weights=[1.0, 0.6])
         lex_set = set(lexical)
@@ -2556,7 +2604,16 @@ def _citation_neighbours(paper_ids):
 def _score_specific_papers(query, paper_ids, layer=None, vector=None, timeout=45,
                            constraints=None):
     """Best chunk of each named paper against the query, scored the usual way,
-    so a paper reached through the graph is comparable to one found by search."""
+    so a paper reached through the graph is comparable to one found by search.
+
+    Two-phase, like the rest of dense retrieval: phase 1 asks Qdrant for only
+    id/score/arxiv_id/section_type across up to len(paper_ids)*8 candidates
+    (enough to cover every chunk of every named paper); phase 2 fetches the
+    full payload for just the one winning point per paper. Fetching full
+    payload (including chunk text) for all ~320 candidates on every call --
+    over an SSH tunnel to Qdrant -- was the single largest cost in a
+    hierarchical-search request; this cuts it to a handful of points.
+    """
     if not paper_ids:
         return []
     must = [{"key": "arxiv_id", "match": {"any": list(paper_ids)}}]
@@ -2566,7 +2623,8 @@ def _score_specific_papers(query, paper_ids, layer=None, vector=None, timeout=45
     try:
         query_vector = vector or embed_query(query)
         hits = qdrant_search(query_vector, {"must": must}, len(paper_ids) * 8,
-                             timeout=timeout)
+                             timeout=timeout,
+                             with_payload=["arxiv_id", "section_type"])
     except HTTPException:
         return []
     best = {}
@@ -2578,25 +2636,33 @@ def _score_specific_papers(query, paper_ids, layer=None, vector=None, timeout=45
         surveys = pay.get("section_type") in (SURVEY_SECTIONS | CONTEXT_SECTIONS)
         rank = (0 if surveys else 1, h.get("score") or 0)
         if pid not in best or rank > best[pid][0]:
-            best[pid] = (rank, {
-                "arxiv_id": pid,
-                "source": SOURCE_LABELS[source_of(pid)],
-                "url": source_url(pid, pay),
-                "title": pay.get("title"),
-                "section_type": pay.get("section_type"),
-                "section_title": pay.get("section_title"),
-                "element_type": pay.get("element_type"),
-                "year": pay.get("year"),
-                "repos": pay.get("repos") or [],
-                "terms": pay.get("terms") or [],
-                "text": (pay.get("text") or "")[:500],
-                "score": h.get("score"),
-                "layers": pay.get("layers"),
-                "venue": pay.get("venue"),
-                "citation_count": pay.get("citation_count"),
-                "fulltext": source_of(pid) in FULLTEXT_SOURCES,
-            })
-    return [v[1] for v in best.values()]
+            best[pid] = (rank, h)
+    if not best:
+        return []
+    winner_ids = [h["id"] for _, h in best.values()]
+    full_payloads = qdrant_fetch_payloads(winner_ids, timeout=timeout)
+    results = []
+    for pid, (_, h) in best.items():
+        pay = full_payloads.get(h.get("id")) or {}
+        results.append({
+            "arxiv_id": pid,
+            "source": SOURCE_LABELS[source_of(pid)],
+            "url": source_url(pid, pay),
+            "title": pay.get("title"),
+            "section_type": pay.get("section_type"),
+            "section_title": pay.get("section_title"),
+            "element_type": pay.get("element_type"),
+            "year": pay.get("year"),
+            "repos": pay.get("repos") or [],
+            "terms": pay.get("terms") or [],
+            "text": (pay.get("text") or "")[:500],
+            "score": h.get("score"),
+            "layers": pay.get("layers"),
+            "venue": pay.get("venue"),
+            "citation_count": pay.get("citation_count"),
+            "fulltext": source_of(pid) in FULLTEXT_SOURCES,
+        })
+    return results
 
 
 def _corpus_stats():
