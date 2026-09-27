@@ -1,0 +1,5 @@
+0 4 * * 0 QDRANT_URL=http://127.0.0.1:16335 /usr/bin/python3 /opt/dtox-research/backup.py --weekly >> /var/log/dtox-backup.log 2>&1
+0 9 * * * QDRANT_URL=http://127.0.0.1:16335 /usr/bin/python3 /opt/dtox-research/monitor.py --digest >> /var/log/dtox-monitor.log 2>&1
+*/15 * * * * QDRANT_URL=http://127.0.0.1:16335 /usr/bin/python3 /opt/dtox-research/monitor.py >> /var/log/dtox-monitor.log 2>&1
+30 3 * * * QDRANT_URL=http://127.0.0.1:16335 /usr/bin/python3 /opt/dtox-research/backup.py >> /var/log/dtox-backup.log 2>&1
+*/30 * * * * QDRANT_URL=http://127.0.0.1:16335 /usr/bin/python3 /opt/dtox-research/public_stats.py >> /var/log/dtox-public-stats.log 2>&1

@@ -1,0 +1,19 @@
+[Unit]
+Description=dtox cross-encoder rerank (127.0.0.1:8090)
+After=network-online.target
+
+[Service]
+WorkingDirectory=/opt/dtox-rerank
+Environment=HF_HOME=/opt/rerank-hf
+Environment=HF_HUB_OFFLINE=1
+Environment=RERANK_THREADS=2
+ExecStart=/opt/rerank-venv/bin/uvicorn rerank_service:app --host 127.0.0.1 --port 8090
+User=nobody
+Group=nogroup
+NoNewPrivileges=true
+Restart=always
+RestartSec=5
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target

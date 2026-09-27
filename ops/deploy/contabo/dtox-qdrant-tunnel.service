@@ -1,0 +1,12 @@
+[Unit]
+Description=SSH tunnel to the Qdrant on Oracle (127.0.0.1:16335 -> oracle 127.0.0.1:6333)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/ssh -N -T -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o UserKnownHostsFile=/root/.ssh/known_hosts_oracle -o StrictHostKeyChecking=yes -o BatchMode=yes -i /root/.ssh/id_ed25519_oracle_tunnel -L 127.0.0.1:16335:127.0.0.1:6333 -L 127.0.0.1:16337:127.0.0.1:8090 ubuntu@92.5.127.67
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
