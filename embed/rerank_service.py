@@ -18,7 +18,7 @@ from huggingface_hub import hf_hub_download
 from pydantic import BaseModel, Field
 from tokenizers import Tokenizer
 
-REPO = "cross-encoder/ms-marco-MiniLM-L6-v2"
+REPO = os.getenv("RERANK_REPO", "cross-encoder/ms-marco-MiniLM-L6-v2")
 REVISION = os.getenv("RERANK_REVISION", "233902d25c440f23af6f7d6e94d2946bac0bee0a")
 MODEL_FILE = os.getenv("RERANK_MODEL_FILE", "onnx/model_qint8_arm64.onnx")
 THREADS = int(os.getenv("RERANK_THREADS", "2"))
