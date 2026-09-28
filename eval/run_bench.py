@@ -81,7 +81,10 @@ def run_one_query(api_base, api_key, row, limit, params, timeout):
         }
     data = resp.json()
     results = data.get("results", [])
-    result_ids = [r.get("arxiv_id") for r in results]
+    # the API returns one copy per paper and names the others under "twins":
+    # the ACL copy of an arXiv target is the target
+    result_ids = [row["target"] if row["target"] in (r.get("twins") or []) else r.get("arxiv_id")
+                  for r in results]
     rank = bl.rank_of_target(result_ids, row["target"], source_id=row.get("source_id"))
     return {
         "qid": row["qid"], "target": row["target"], "layer": row["layer"],

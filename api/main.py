@@ -1152,6 +1152,61 @@ def license_of(paper_id):
     return LICENSE_INFO.get(source_of(paper_id), LICENSE_INFO["arxiv"])
 
 
+# Copies of one paper from different sources (ACL and arXiv, PMLR and arXiv,
+# ...), grouped offline by ops/build_twins.py. Without this a search spent
+# several of its slots on one paper. Re-read when the file changes, checked at
+# most once a minute; a missing or broken file means no grouping, not an error.
+TWINS_PATH = os.getenv("TWINS_PATH", "/opt/dtox-research/twins.json")
+_twins_state = {"checked": 0.0, "mtime": None, "canonical": {}, "members": {}}
+_twins_lock = threading.Lock()
+
+
+def _twins():
+    now = time.monotonic()
+    with _twins_lock:
+        if now - _twins_state["checked"] < 60:
+            return _twins_state
+        _twins_state["checked"] = now
+        try:
+            mtime = os.stat(TWINS_PATH).st_mtime
+        except OSError:
+            return _twins_state
+        if mtime == _twins_state["mtime"]:
+            return _twins_state
+        try:
+            with open(TWINS_PATH) as f:
+                canonical = json.load(f).get("canonical") or {}
+        except (OSError, ValueError) as e:
+            log.warning(f"twins: could not load {TWINS_PATH}: {e}")
+            return _twins_state
+        members = {}
+        for paper_id, head in canonical.items():
+            members.setdefault(head, []).append(paper_id)
+        _twins_state.update(mtime=mtime, canonical=canonical, members=members)
+        return _twins_state
+
+
+def canonical_id(paper_id):
+    return _twins()["canonical"].get(paper_id, paper_id)
+
+
+def _collapse_twins(results):
+    """One result per paper, first (best ranked) copy wins; the other copies
+    are named under "twins" so a caller can still reach them."""
+    state = _twins()
+    out, seen = [], set()
+    for r in results:
+        head = state["canonical"].get(r["arxiv_id"], r["arxiv_id"])
+        if head in seen:
+            continue
+        seen.add(head)
+        others = [m for m in state["members"].get(head, []) if m != r["arxiv_id"]]
+        if others:
+            r["twins"] = others
+        out.append(r)
+    return out
+
+
 def _result_from_hit(hit):
     payload = hit.get("payload") or {}
     paper_id = payload.get("arxiv_id")
@@ -1511,9 +1566,10 @@ def _run_search(body: SearchBody, x_api_key=None,
             if (h.get("score") or 0) < floor and aid not in lex_exempt_ids:
                 continue
             if body.dedupe:
-                if aid in seen:
+                key = canonical_id(aid)
+                if key in seen:
                     continue
-                seen.add(aid)
+                seen.add(key)
             if len(picked) >= limit:
                 break
             picked.append(_result_from_hit(h))
@@ -1547,7 +1603,7 @@ def _run_search(body: SearchBody, x_api_key=None,
                 r["fusion_ranks"] = fusion_ranks_map.get(r["arxiv_id"])
         hier_global_skipped = hier_extra["global_channel"] == "skipped"
         if hier_extra["global_extra"]:
-            known_arxiv = {r["arxiv_id"] for r in results}
+            known_arxiv = {canonical_id(r["arxiv_id"]) for r in results}
             added = 0
             for h in hier_extra["global_extra"]:
                 if added >= HIER_GLOBAL_EXTRA:
@@ -1555,7 +1611,7 @@ def _run_search(body: SearchBody, x_api_key=None,
                 if (h.get("score") or 0) < floor:
                     continue
                 extra_result = _result_from_hit(h)
-                aid = extra_result["arxiv_id"]
+                aid = canonical_id(extra_result["arxiv_id"])
                 if aid in known_arxiv:
                     continue
                 results.append(extra_result)
@@ -1612,6 +1668,8 @@ def _run_search(body: SearchBody, x_api_key=None,
             result["channels"] = (["paper"] if result.get("found_via") == "paper"
                                   else ["dense"])
 
+    if body.dedupe:
+        results = _collapse_twins(results)
     facts = _paper_facts([r["arxiv_id"] for r in results])
     for r in results:
         r["niche_score"] = facts.get(r["arxiv_id"])
