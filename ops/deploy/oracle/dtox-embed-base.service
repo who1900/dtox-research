@@ -1,0 +1,21 @@
+[Unit]
+Description=dtox bge-base embedder for the paper index (127.0.0.1:8090, reached from Contabo via tunnel 16337)
+After=network-online.target
+Conflicts=dtox-rerank.service
+
+[Service]
+WorkingDirectory=/opt/dtox-embed
+Environment=HF_HOME=/opt/rerank-hf
+Environment=HF_HUB_OFFLINE=1
+Environment=EMBED_THREADS=2
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/rerank-venv/bin/uvicorn embed_service:app --host 127.0.0.1 --port 8090
+User=nobody
+Group=nogroup
+NoNewPrivileges=true
+Restart=always
+RestartSec=5
+MemoryMax=1500M
+
+[Install]
+WantedBy=multi-user.target
