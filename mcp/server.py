@@ -158,16 +158,18 @@ def search_research_paper(
 
     Returns:
         dict with "results": a list of matched chunks, each containing title,
-        arxiv_url, section_type, section_title, text (excerpt), score, venue,
+        url, section_type, section_title, text (excerpt), score, venue,
         citation_count, "fulltext" (false for IACR records, which are indexed
         by abstract only, so section and element filters cannot reach inside
         them) and "niche_score" (how strongly the paper belongs to its layer;
         1 means a single passing mention, which is how a graph-database paper
-        once became top evidence for a blockchain claim). Also "count",
+        once became top evidence for a blockchain claim). "licenses" maps
+        each source label seen in the results to its license and reuse
+        terms. Also "count",
         "filters_applied", and on an empty result "why_empty" naming the
         filter to relax.
     """
-    body = {"query": query, "limit": limit}
+    body = {"query": query, "limit": limit, "compact": True}
     if layer:
         body["layer"] = layer
     if section_type:
@@ -250,8 +252,8 @@ def find_papers(
 @mcp.tool()
 def get_paper(paper_id: str) -> dict:
     """Open one paper: title, venue, citation count, full abstract, the
-    outline of its indexed sections (with how much prose, math and tables
-    each holds), and its citation neighbours inside the corpus: what it cites
+    outline of its indexed sections (with how many chunks of prose, math and
+    tables each holds), and its citation neighbours inside the corpus: what it cites
     and what cites it, most cited first.
 
     Use it to judge a paper before reading it, to find the section worth
@@ -262,7 +264,7 @@ def get_paper(paper_id: str) -> dict:
 
     Returns:
         dict with id, title, year, venue, citation_count, abstract, url,
-        outline (each {section_title, section_type, chunks, chars, elements}),
+        outline (each {section_title, section_type, chunks, elements}),
         cites / cited_by (up to 25 each, with cites_in_corpus and
         cited_by_in_corpus totals) and twins.
     """

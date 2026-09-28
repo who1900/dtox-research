@@ -98,6 +98,38 @@ class OutlineAndSectionTest(unittest.TestCase):
         self.assertEqual(outline[1]["chunks"], 2)
         self.assertEqual(outline[1]["elements"], {"prose": 1, "equation": 1})
 
+    def test_outline_needs_no_text_and_reports_no_chars(self):
+        bare = [{k: v for k, v in p.items() if k != "text"} for p in self.PAYLOADS]
+        outline = main._outline(bare)
+        self.assertEqual(outline, main._outline(self.PAYLOADS))
+        self.assertTrue(all("chars" not in s for s in outline))
+
+    def test_card_scrolls_metadata_only(self):
+        points = [{"payload": {k: v for k, v in p.items() if k != "text"}} for p in self.PAYLOADS]
+        with patch.object(main, "auth_and_limit"), \
+             patch.object(main, "_paper_rows", side_effect=lambda ids: {i: dict(ROWS[i]) for i in ids if i in ROWS}), \
+             patch.object(main, "_neighbours", return_value=([], 0)), \
+             patch.object(main, "qdrant_scroll_by_arxiv", return_value=points) as scroll:
+            card = main.paper_card("2403.02691")
+        self.assertEqual(scroll.call_args.kwargs["payload_fields"], main.OUTLINE_FIELDS)
+        self.assertEqual(scroll.call_args.kwargs["page"], main.OUTLINE_PAGE)
+        self.assertEqual(card["indexed_chunks"], 3)
+        self.assertEqual([s["section_title"] for s in card["outline"]], ["Introduction", "Method"])
+
+    def test_scroll_asks_qdrant_for_include_list_only_when_narrowed(self):
+        sent = []
+
+        class Resp:
+            def raise_for_status(self): pass
+            def json(self): return {"result": {"points": [], "next_page_offset": None}}
+        with patch.object(main.requests, "post", side_effect=lambda url, json, timeout: sent.append(json) or Resp()):
+            main.qdrant_scroll_by_arxiv("x", payload_fields=["a"], page=500)
+            main.qdrant_scroll_by_arxiv("x")
+        self.assertEqual(sent[0]["with_payload"], {"include": ["a"]})
+        self.assertEqual(sent[0]["limit"], 500)
+        self.assertIs(sent[1]["with_payload"], True)
+        self.assertEqual(sent[1]["limit"], 200)
+
     def test_section_is_paged(self):
         points = [{"payload": p} for p in self.PAYLOADS]
         with patch.object(main, "auth_and_limit"), \
@@ -107,6 +139,48 @@ class OutlineAndSectionTest(unittest.TestCase):
             self.assertIsNone(first["next_offset"])
             with self.assertRaises(HTTPException):
                 main.paper_section("2401.1", title="Nope")
+
+
+class CompactSearchTest(unittest.TestCase):
+    LIC_A, LIC_B = {"spdx": "CC-BY-4.0"}, {"spdx": "none"}
+
+    def _full(self):
+        return {"results": [
+            {"arxiv_id": "1", "source": "arXiv", "url": "u1", "arxiv_url": "u1", "license": self.LIC_A, "text": "t1"},
+            {"arxiv_id": "2", "source": "arXiv", "url": "u2", "arxiv_url": "u2", "license": self.LIC_A, "text": "t2"},
+            {"arxiv_id": "3", "source": "IACR", "url": "u3", "arxiv_url": "u3", "license": self.LIC_B, "text": "t3"},
+        ], "count": 3, "usage": "n"}
+
+    def _search(self, compact):
+        full = self._full()
+        with patch.object(main.search_cache, "get", return_value=full):
+            out = main._run_search(main.SearchBody(query="q", compact=compact))
+        return full, out
+
+    def test_default_shape_is_untouched(self):
+        full, out = self._search(False)
+        self.assertIs(out, full)
+        self.assertNotIn("licenses", out)
+        self.assertIn("license", out["results"][0])
+        self.assertIn("arxiv_url", out["results"][0])
+
+    def test_compact_drops_per_hit_fields_and_lists_licenses_once(self):
+        _, out = self._search(True)
+        for r in out["results"]:
+            self.assertNotIn("license", r)
+            self.assertNotIn("arxiv_url", r)
+        self.assertEqual(out["licenses"], {"arXiv": self.LIC_A, "IACR": self.LIC_B})
+        self.assertEqual([r["text"] for r in out["results"]], ["t1", "t2", "t3"])
+        self.assertEqual(out["count"], 3)
+
+    def test_compact_does_not_corrupt_the_cached_payload(self):
+        full, _ = self._search(True)
+        self.assertEqual(full, self._full())
+
+    def test_only_seen_sources_get_a_license(self):
+        full = self._full()
+        full["results"] = full["results"][:2]
+        self.assertEqual(main._compact_search(full)["licenses"], {"arXiv": self.LIC_A})
 
 
 class FacetsTest(unittest.TestCase):

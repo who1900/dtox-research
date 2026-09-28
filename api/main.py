@@ -984,12 +984,15 @@ def qdrant_search_layers(vector, base_filter, limit, timeout=SEARCH_QDRANT_TIMEO
     return merge_layer_hits(result_sets, limit), sorted(failed)
 
 
-def qdrant_scroll_by_arxiv(arxiv_id: str, limit=1000):
+def qdrant_scroll_by_arxiv(arxiv_id: str, limit=1000, page=200, payload_fields=None):
+    """All chunks of one paper. `payload_fields` narrows the payload to those
+    keys (the outline needs no text); default is the whole payload."""
     qfilter = {"must": [{"key": "arxiv_id", "match": {"value": arxiv_id}}]}
     points = []
     offset = None
     while True:
-        body = {"filter": qfilter, "limit": min(limit, 200), "with_payload": True, "with_vector": False}
+        body = {"filter": qfilter, "limit": min(limit, page), "with_vector": False,
+                "with_payload": {"include": payload_fields} if payload_fields else True}
         if offset:
             body["offset"] = offset
         try:
@@ -1370,6 +1373,11 @@ class SearchBody(BaseModel):
     # return zero. On an empty result the query is re-run with one filter
     # dropped at a time, and the answer names the culprit. Set False to skip it.
     diagnose: bool = True
+    # agent-facing shape: the license block is identical for every hit of one
+    # source and arxiv_url repeats url, so a result list carries them once
+    # (licenses, by source label) instead of per hit. Off by default: the
+    # harness and other callers rely on the full shape.
+    compact: bool = False
 
 
 # ---------------- auth + rate-limit dependency ----------------
@@ -1400,6 +1408,24 @@ def search(body: SearchBody, x_api_key: Optional[str] = Header(default=None)):
     return _run_search(body, x_api_key)
 
 
+def _compact_search(full):
+    """Copy of a search payload without the per-hit license and arxiv_url;
+    the licenses go once at the root, keyed by source label. Never mutates
+    `full`, which may be the cached object."""
+    licenses, results = {}, []
+    for r in full.get("results", []):
+        r = dict(r)
+        lic = r.pop("license", None)
+        if lic is not None:
+            licenses[r.get("source")] = lic
+        r.pop("arxiv_url", None)
+        results.append(r)
+    out = dict(full)
+    out["results"] = results
+    out["licenses"] = licenses
+    return out
+
+
 def _run_search(body: SearchBody, x_api_key=None,
                 dense_timeout=SEARCH_QDRANT_TIMEOUT,
                 embed_wait_timeout=SEARCH_EMBED_WAIT_TIMEOUT,
@@ -1411,6 +1437,13 @@ def _run_search(body: SearchBody, x_api_key=None,
     be charged to the caller's 60-per-minute budget. One audit could spend five
     requests, and the regression harness tripped the limit on its own traffic.
     """
+
+    if body.compact:
+        # the cache holds the full shape; compacting a copy afterwards keeps
+        # both shapes correct without a second cache entry per query
+        full = _run_search(body.model_copy(update={"compact": False}), x_api_key,
+                           dense_timeout, embed_wait_timeout, embed_http_timeout)
+        return _compact_search(full)
 
     query = (body.query or "").strip()
     if not query:
@@ -4521,18 +4554,22 @@ def _foundational(pool, body):
     return sorted(merged.values(), key=lambda r: (-r["cited_by_pool"], -(r.get("citation_count") or 0)))
 
 
+OUTLINE_FIELDS = ["section_title", "section_type", "element_type", "chunk_index"]
+OUTLINE_PAGE = 500
+
+
 def _outline(payloads):
-    """Sections in paper order with how much of each is prose, math or tables."""
+    """Sections in paper order with how many chunks of prose, math or tables each
+    holds. Built from metadata only (OUTLINE_FIELDS), no chunk text."""
     order, sections = [], {}
     for p in sorted(payloads, key=lambda p: p.get("chunk_index", 0)):
         title = p.get("section_title") or "(untitled)"
         if title not in sections:
             sections[title] = {"section_title": title, "section_type": p.get("section_type"),
-                               "chunks": 0, "chars": 0, "elements": {}}
+                               "chunks": 0, "elements": {}}
             order.append(title)
         s = sections[title]
         s["chunks"] += 1
-        s["chars"] += len(p.get("text") or "")
         et = p.get("element_type") or "prose"
         s["elements"][et] = s["elements"].get(et, 0) + 1
     return [sections[t] for t in order]
@@ -4772,16 +4809,22 @@ def paper_card(paper_id: str, x_api_key: Optional[str] = Header(default=None)):
         paper_id = head
     card = _paper_card(rows[paper_id], abstract_chars=None)
     card["influential_citations"] = rows[paper_id].get("influential_citations")
-    try:
-        points = qdrant_scroll_by_arxiv(paper_id, limit=3000)
-    except HTTPException:
-        points = []
+    def outline_points():
+        try:
+            return qdrant_scroll_by_arxiv(paper_id, limit=3000, page=OUTLINE_PAGE,
+                                          payload_fields=OUTLINE_FIELDS)
+        except HTTPException:
+            return []
+    # the scroll and both citation lookups are independent; run them together
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        f_points = pool.submit(outline_points)
+        f_cites = pool.submit(_neighbours, "SELECT dst FROM citations WHERE src=?", paper_id)
+        f_cited = pool.submit(_neighbours, "SELECT src FROM citations WHERE dst=?", paper_id)
+        points = f_points.result()
+        card["cites"], card["cites_in_corpus"] = f_cites.result()
+        card["cited_by"], card["cited_by_in_corpus"] = f_cited.result()
     card["outline"] = _outline([pt["payload"] for pt in points])
     card["indexed_chunks"] = len(points)
-    card["cites"], card["cites_in_corpus"] = _neighbours(
-        "SELECT dst FROM citations WHERE src=?", paper_id)
-    card["cited_by"], card["cited_by_in_corpus"] = _neighbours(
-        "SELECT src FROM citations WHERE dst=?", paper_id)
     card["usage"] = USAGE_NOTICE
     return card
 
