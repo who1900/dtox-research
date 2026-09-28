@@ -1195,7 +1195,7 @@ def upsert_discovered(conn, arxiv_id, title, year, layer, abstract=None,
     off_niche iff no layer scores > 0, same as the old niche_match() gate."""
     match_text = f"{title} {abstract}" if abstract else title
     scores = niche_filter.niche_score(match_text)
-    matched_layers = sorted(l for l, d in scores.items() if d["score"] > 0)
+    matched_layers = niche_filter.admitted_layers(scores)
     # A protocol spec is Web3 by construction, but it is written in opcodes and
     # gas rather than "blockchain": the lexical gate had thrown out 237 of 686
     # EIPs, EIP-1559 and EIP-155 among them, and the Aave whitepaper.

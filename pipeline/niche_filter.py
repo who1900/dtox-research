@@ -255,6 +255,36 @@ def _passes_negative_guard(layer, text, matched_terms):
     return True
 
 
+# Naming a language or a web stack says what a paper was built with, not what
+# it is about: "implemented in Python", "a Swift telescope", "an HTML report".
+# A re-check of the off_niche shelf admitted 10,679 papers on such a term
+# alone (X-ray astronomy, fMRI, histology datasets) and every sampled one was
+# noise. builder-tech therefore needs at least one term about the craft itself
+# (program analysis, testing, compilers, supply chain, ...) beside them.
+LANGUAGE_ONLY_TERMS = frozenset({
+    "rust", "c++", "c#", "golang", "go language", "typescript", "javascript",
+    "python", "java", "kotlin", "swift", "dart", "objective-c", "scala", "ruby",
+    "php", "lua", "elixir", "erlang", "haskell", "ocaml", "f#", "zig", "nim",
+    "flutter", "react native", "html", "css", "web frontend", "web application",
+    "node.js", "nodejs", "next.js", "vue.js", "angular framework", "svelte",
+    "webassembly", "wasm", "android application", "ios application",
+    "mobile application", "mobile app",
+})
+
+
+def admitted_layers(scores):
+    """Layers a paper is admitted under at harvest time: any layer with a term,
+    except builder-tech on language or stack names alone."""
+    out = []
+    for layer, d in scores.items():
+        if d["score"] <= 0:
+            continue
+        if layer == "builder-tech" and set(d["matched_terms"]) <= LANGUAGE_ONLY_TERMS:
+            continue
+        out.append(layer)
+    return sorted(out)
+
+
 def niche_match(text, min_score=None):
     """Return sorted list of layer names whose terms appear in `text`
     (case-insensitive, word-boundary match). Empty list = off-niche.

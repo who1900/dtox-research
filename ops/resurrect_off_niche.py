@@ -10,7 +10,7 @@ path as a fresh harvest, so a paper that now matches goes back to
 Run from the pipeline directory (it imports service and niche_filter):
 
   resurrect_off_niche.py                 # dry run: counts per layer
-  resurrect_off_niche.py --apply         # write, committing every 500
+  resurrect_off_niche.py --apply         # write, one commit per paper
   resurrect_off_niche.py --since 2020    # only papers from that year on
 """
 import argparse
@@ -32,16 +32,18 @@ def main():
     by_layer, by_year, n = collections.Counter(), collections.Counter(), 0
     for i, r in enumerate(rows):
         text = f"{r['title']} {r['abstract']}" if r["abstract"] else r["title"]
-        layers = sorted(l for l, d in nf.niche_score(text).items() if d["score"] > 0)
+        layers = nf.admitted_layers(nf.niche_score(text))
         if layers:
             n += 1
             by_layer[",".join(layers)] += 1
             by_year[r["year"]] += 1
             if args.apply:
+                # commit per row: a transaction left open across the scan holds
+                # the write lock, and the live pipeline stalled for three hours
+                # on "database is locked" the first time this ran
                 service.upsert_discovered(conn, r["arxiv_id"], r["title"], r["year"], layers[0],
                                           abstract=r["abstract"], commit=False)
-                if n % 500 == 0:
-                    conn.commit()
+                conn.commit()
         if (i + 1) % 50000 == 0:
             print(f"{i + 1}/{len(rows)} scanned, {n} pass", flush=True)
     if args.apply:
