@@ -1,0 +1,11 @@
+[Unit]
+Description=dtox reprocess lost-body LaTeX papers (feeds the pipeline queue)
+After=dtox-research.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/dtox-research
+Environment=QDRANT_URL=http://127.0.0.1:16335
+# --apply is deliberate: install only once the dry run and reprocess_list.json have been checked
+ExecStart=/usr/bin/nice -n 19 /usr/bin/ionice -c3 /opt/dtox-research/venv/bin/python /opt/dtox-research/reprocess_lost_body.py --feed --apply --skip-fts
+TimeoutStartSec=1800
