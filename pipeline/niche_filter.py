@@ -47,6 +47,10 @@ BROAD_TERMS = {
         "moe", "prompt compression", "prompt tuning", "context window", "long context",
         "gpt", "chatgpt", "llama", "mistral", "qwen", "perplexity language",
         "text generation model", "decoder-only", "encoder-decoder language",
+        # sampled off the off_niche shelf, 2026-09-28: on topic in nearly
+        # every example, but a passing mention is common, so weight 1
+        "jailbreak", "rlhf", "reinforcement learning from human feedback",
+        "dense retrieval",
     ],
     "ai-agents": [
         "llm agent", "language model agent", "llm-based agent", "tool use", "tool-use",
@@ -58,6 +62,7 @@ BROAD_TERMS = {
         # LLM/language-model signal in the phrase itself.
         "multi-agent llm", "multi-agent language model", "multi-agent large language model",
         "llm-based multi-agent", "llm multi-agent", "multi-llm-agent", "multi agent llm",
+        "code agent",
     ],
     "web3": [
         "blockchain", "defi", "decentralized finance", "smart contract", "solana",
@@ -71,6 +76,11 @@ BROAD_TERMS = {
         "rust programming language", "software engineering", "software testing",
         "program analysis", "distributed system", "developer tooling", "programming language",
         "language runtime", "smart contract language", "mobile development",
+        # code generation and its neighbours are the developer's side of LLM
+        # work, but the words also cover compiler back ends and genetic
+        # programming: weight 1, and the citation gate decides
+        "code generation", "program synthesis", "program repair", "code completion",
+        "code search", "test generation",
     ],
 }
 
@@ -96,6 +106,7 @@ SPECIFIC_TERMS = {
         "episodic memory", "planner-executor", "multi-agent debate",
         "agent orchestration", "guardrails", "prompt injection", "tool-augmented",
         "autonomous agent",
+        "coding agent", "software engineering agent", "swe agent", "swe-agent",
     ],
     "web3": [
         # applied cryptography that IACR ePrint publishes and blockchains
@@ -120,6 +131,7 @@ SPECIFIC_TERMS = {
         "concentrated liquidity", "jit liquidity", "sandwich attack", "funding rate",
         "restaking", "eigenlayer", "slashing", "distributed validator", "zk-rollup",
         "optimistic rollup", "stablecoin", "liquid staking",
+        "verifiable computation", "zkp",
     ],
     "builder-tech": [
         "rust", "c++", "c#", "golang", "go language", "typescript", "javascript",
@@ -138,6 +150,14 @@ SPECIFIC_TERMS = {
         "formal verification", "model checking", "compiler optimization",
         "language server protocol", "software supply chain", "dependency resolution",
         "reproducible build", "distributed systems", "database systems",
+        # security of the code a developer ships: sampled clean on the
+        # off_niche shelf ("reentrancy" was not: all seven hits were NLP
+        # parsing, and "sanitizer" pulled in fonts and voice privacy)
+        "vulnerability detection", "vulnerability repair", "software vulnerability",
+        "software vulnerabilities", "security patch", "malicious package",
+        "memory safety", "flaky test", "binary analysis", "decompiler",
+        "decompilation", "api misuse", "bug localization", "compiler testing",
+        "automated program repair",
     ],
 }
 
@@ -272,14 +292,39 @@ LANGUAGE_ONLY_TERMS = frozenset({
 })
 
 
+# Craft terms broad enough to name a whole field: alone they admitted a
+# Bayesian cross-validation paper ("model checking"), curriculum studies
+# ("software engineering"), hardware Trojan test patterns ("test generation")
+# and plasma physics ("passkey") in a 2026-09-28 dry run. Each one still
+# counts; it just needs a second craft term beside it.
+BUILDER_GENERIC_TERMS = frozenset({
+    "software engineering", "software testing", "program analysis", "distributed system",
+    "distributed systems", "developer tooling", "programming language", "language runtime",
+    "mobile development", "database systems", "model checking", "formal verification",
+    "symbolic execution", "compiler optimization", "dependency resolution",
+    "hardware wallet", "secure element", "secure enclave", "passkey", "webauthn",
+    "code generation", "program synthesis", "program repair", "code completion",
+    "code search", "test generation",
+})
+
+
+def _builder_tech_admits(matched_terms):
+    craft = set(matched_terms) - LANGUAGE_ONLY_TERMS
+    if craft - BUILDER_GENERIC_TERMS:
+        return True
+    # "distributed system" and "distributed systems" are one term, not two
+    return len({t.rstrip("s") for t in craft}) >= 2
+
+
 def admitted_layers(scores):
     """Layers a paper is admitted under at harvest time: any layer with a term,
-    except builder-tech on language or stack names alone."""
+    except builder-tech, which needs a specific craft term or two generic ones;
+    language and stack names never count."""
     out = []
     for layer, d in scores.items():
         if d["score"] <= 0:
             continue
-        if layer == "builder-tech" and set(d["matched_terms"]) <= LANGUAGE_ONLY_TERMS:
+        if layer == "builder-tech" and not _builder_tech_admits(d["matched_terms"]):
             continue
         out.append(layer)
     return sorted(out)
