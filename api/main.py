@@ -4321,6 +4321,284 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
     }
 
 
+# ---------------------------------------------------------------------------
+# Exploration: papers as the unit
+# ---------------------------------------------------------------------------
+# /v1/search answers with passages, which is right for "how does X work" and
+# wrong for "which papers matter on X": a survey and its three follow-ups fill
+# the page while the paper everyone cites sits at rank 30. These endpoints let
+# an agent walk the corpus the way a reader does: list papers on a subject
+# ordered by relevance, influence or recency; open one to see its abstract,
+# outline and citation neighbours; read one section.
+
+EXPLORE_LAYERS = {"llm-slm", "ai-agents", "web3", "builder-tech"}
+EXPLORE_SORTS = ("relevance", "citations", "recent", "foundational")
+EXPLORE_POOL = 60             # candidates ranked by relevance
+# re-sorts only reorder the head of that list: at rank 57 of "maximal
+# extractable value" sat a lattice QCD paper that says "maximally twisted",
+# and sorting 60 by citations put it second
+EXPLORE_RESORT_POOL = 30
+# "foundational": papers the relevant ones cite, counted inside that set.
+# Flash Boys 2.0 predates the word MEV and never ranks on wording, yet most
+# MEV papers cite it; the graph does not care how either side is phrased.
+FOUNDATIONAL_MIN_CITERS = 3
+EXPLORE_ABSTRACT_CHARS = 420
+SECTION_MAX_CHARS = 8000
+NEIGHBOUR_LIMIT = 25
+PAPER_COLUMNS = "arxiv_id, title, year, venue, citation_count, influential, layers, abstract"
+
+
+def _paper_rows(paper_ids):
+    """state.db record for each id that is fully indexed, keyed by id."""
+    ids = [pid for pid in dict.fromkeys(paper_ids) if pid]
+    if not ids:
+        return {}
+    out = {}
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        sql = (f"SELECT {PAPER_COLUMNS} FROM papers WHERE status='done' "
+               f"AND arxiv_id IN ({','.join('?' * len(part))})")
+        try:
+            rows = _ro_conn(STATE_DB_PATH).execute(sql, part).fetchall()
+        except sqlite3.OperationalError:
+            _ro_conn_drop(STATE_DB_PATH)
+            try:
+                rows = _ro_conn(STATE_DB_PATH).execute(sql, part).fetchall()
+            except sqlite3.Error:
+                rows = []
+        except sqlite3.Error:
+            rows = []
+        for r in rows:
+            out[r[0]] = {"arxiv_id": r[0], "title": r[1], "year": r[2], "venue": r[3],
+                         "citation_count": r[4], "influential_citations": r[5],
+                         "layers": [l for l in (r[6] or "").split(",") if l],
+                         "abstract": r[7]}
+    return out
+
+
+def _paper_card(row, abstract_chars=EXPLORE_ABSTRACT_CHARS):
+    abstract = (row.get("abstract") or "").strip()
+    if abstract_chars is not None and len(abstract) > abstract_chars:
+        cut = abstract.rfind(". ", 0, abstract_chars)
+        abstract = abstract[:cut + 1] if cut > abstract_chars // 3 else abstract[:abstract_chars] + "..."
+    pid = row["arxiv_id"]
+    card = {"id": pid, "title": row.get("title"), "year": row.get("year"),
+            "venue": row.get("venue"), "citation_count": row.get("citation_count"),
+            "layers": row.get("layers"), "source": SOURCE_LABELS[source_of(pid)],
+            "url": source_url(pid), "fulltext": source_of(pid) in FULLTEXT_SOURCES,
+            "abstract": abstract}
+    others = [m for m in _twins()["members"].get(canonical_id(pid), []) if m != pid]
+    if others:
+        card["twins"] = others
+    return card
+
+
+def _check_layer(layer):
+    if layer and layer not in EXPLORE_LAYERS:
+        raise HTTPException(status_code=400, detail=f"layer must be one of {sorted(EXPLORE_LAYERS)}")
+
+
+class PapersBody(BaseModel):
+    query: str = Field(..., min_length=2, max_length=500)
+    layer: Optional[str] = None
+    year_from: Optional[int] = None
+    year_to: Optional[int] = None
+    sort: str = "relevance"
+    limit: int = Field(default=10, ge=1, le=30)
+
+
+@app.post("/v1/papers")
+def find_papers(body: PapersBody, x_api_key: Optional[str] = Header(default=None)):
+    """Papers on a subject, one row each, from the paper-level index (title +
+    abstract embeddings fused with title/abstract BM25). sort=citations and
+    sort=recent re-order the EXPLORE_POOL most relevant papers, so "the most
+    cited papers about MEV" never means "the most cited papers that happen to
+    say MEV once"."""
+    auth_and_limit(x_api_key)
+    _check_layer(body.layer)
+    if body.sort not in EXPLORE_SORTS:
+        raise HTTPException(status_code=400, detail=f"sort must be one of {list(EXPLORE_SORTS)}")
+    vector = None if COARSE_EMBED_URL else embed_query(body.query)
+    dense_error = None
+    try:
+        dense = _coarse_paper_search(vector, body.layer, body.year_from, body.year_to,
+                                     EXPLORE_POOL, timeout=10, query=body.query)
+    except HTTPException as e:
+        dense, dense_error = [], str(e.detail)
+    lexical = _paper_bm25(body.query, body.layer, body.year_from, body.year_to, limit=EXPLORE_POOL)
+    scores = reciprocal_rank_fusion([p["arxiv_id"] for p in dense], lexical,
+                                    weights=[HIER_W_DENSE, HIER_W_LEX])
+    fused = sorted(scores, key=lambda p: -scores[p])
+    # rows first, twins second: a copy without a finished record must not
+    # shadow the one that has it
+    rows = _paper_rows(fused)
+    pool, seen = [], set()
+    for pid in fused:
+        head = canonical_id(pid)
+        if pid not in rows or head in seen:
+            continue
+        seen.add(head)
+        pool.append(rows[pid])
+        if len(pool) >= EXPLORE_POOL:
+            break
+    for n, row in enumerate(pool, start=1):
+        row["relevance_rank"] = n
+    if body.sort != "relevance":
+        pool = pool[:EXPLORE_RESORT_POOL]
+    if body.sort == "citations":
+        pool.sort(key=lambda r: (-(r.get("citation_count") or 0), r["relevance_rank"]))
+    elif body.sort == "recent":
+        pool.sort(key=lambda r: (-(r.get("year") or 0), r["relevance_rank"]))
+    elif body.sort == "foundational":
+        pool = _foundational(pool, body)
+    papers = []
+    for row in pool[:body.limit]:
+        card = _paper_card(row)
+        card["relevance_rank"] = row.get("relevance_rank")
+        if "cited_by_pool" in row:
+            card["cited_by_pool"] = row["cited_by_pool"]
+        papers.append(card)
+    out = {"papers": papers, "count": len(papers), "sort": body.sort,
+           "pool": len(pool), "usage": USAGE_NOTICE}
+    if dense_error:
+        out["partial"] = True
+        out["note"] = f"paper index unavailable ({dense_error}); ranked by title/abstract terms only"
+    if body.sort in ("citations", "recent"):
+        out["note_sort"] = (f"re-sorted from the {EXPLORE_RESORT_POOL} most relevant papers; "
+                            "relevance_rank shows where each stood before")
+    elif body.sort == "foundational":
+        out["note_sort"] = (f"papers most cited by the {EXPLORE_RESORT_POOL} most relevant ones "
+                            "(cited_by_pool); relevance_rank is null for those found only "
+                            "through citations")
+    return out
+
+
+def _foundational(pool, body):
+    """Rank by how many of the relevant papers cite each paper, adding cited
+    papers that wording alone never surfaced. Year and layer filters still
+    apply to what is returned."""
+    ids = [r["arxiv_id"] for r in pool]
+    if not ids:
+        return pool
+    sql = (f"SELECT dst, COUNT(*) AS n FROM citations WHERE src IN ({','.join('?' * len(ids))}) "
+           f"GROUP BY dst HAVING n >= ? ORDER BY n DESC LIMIT 60")
+    try:
+        counts = dict(_ro_conn(STATE_DB_PATH).execute(sql, ids + [FOUNDATIONAL_MIN_CITERS]).fetchall())
+    except sqlite3.Error:
+        _ro_conn_drop(STATE_DB_PATH)
+        return pool
+    by_id = {r["arxiv_id"]: r for r in pool}
+    extra = _paper_rows([d for d in counts if d not in by_id])
+    merged = {}
+    for pid, n in counts.items():
+        row = by_id.get(pid) or extra.get(pid)
+        if row is None:
+            continue
+        if body.layer and body.layer not in (row.get("layers") or []):
+            continue
+        if body.year_from is not None and (row.get("year") or 0) < body.year_from:
+            continue
+        if body.year_to is not None and (row.get("year") or 9999) > body.year_to:
+            continue
+        head = canonical_id(pid)
+        if head in merged:
+            merged[head]["cited_by_pool"] += n
+            continue
+        row = dict(row)
+        row.setdefault("relevance_rank", None)
+        row["cited_by_pool"] = n
+        merged[head] = row
+    return sorted(merged.values(), key=lambda r: (-r["cited_by_pool"], -(r.get("citation_count") or 0)))
+
+
+def _outline(payloads):
+    """Sections in paper order with how much of each is prose, math or tables."""
+    order, sections = [], {}
+    for p in sorted(payloads, key=lambda p: p.get("chunk_index", 0)):
+        title = p.get("section_title") or "(untitled)"
+        if title not in sections:
+            sections[title] = {"section_title": title, "section_type": p.get("section_type"),
+                               "chunks": 0, "chars": 0, "elements": {}}
+            order.append(title)
+        s = sections[title]
+        s["chunks"] += 1
+        s["chars"] += len(p.get("text") or "")
+        et = p.get("element_type") or "prose"
+        s["elements"][et] = s["elements"].get(et, 0) + 1
+    return [sections[t] for t in order]
+
+
+def _neighbours(sql, paper_id):
+    try:
+        ids = [r[0] for r in _ro_conn(STATE_DB_PATH).execute(sql, (paper_id,)).fetchall()]
+    except sqlite3.Error:
+        _ro_conn_drop(STATE_DB_PATH)
+        return [], 0
+    rows = _paper_rows(ids)
+    ranked = sorted(rows.values(), key=lambda r: -(r.get("citation_count") or 0))
+    return ([{"id": r["arxiv_id"], "title": r["title"], "year": r["year"],
+              "citation_count": r["citation_count"]} for r in ranked[:NEIGHBOUR_LIMIT]], len(rows))
+
+
+@app.get("/v1/paper/{paper_id:path}/section")
+def paper_section(paper_id: str, title: Optional[str] = None, section_type: Optional[str] = None,
+                  offset: int = 0, max_chars: int = SECTION_MAX_CHARS,
+                  x_api_key: Optional[str] = Header(default=None)):
+    """Text of one section, in paper order, paged by characters. Pick the
+    section by its exact title from /v1/paper/{id}, or by section_type
+    (method, experiments, limitations, ...) for every section of that kind."""
+    auth_and_limit(x_api_key)
+    if not title and not section_type:
+        raise HTTPException(status_code=400, detail="pass title or section_type")
+    max_chars = max(500, min(max_chars, 20000))
+    points = qdrant_scroll_by_arxiv(paper_id, limit=3000)
+    if not points:
+        raise HTTPException(status_code=404, detail="paper not found")
+    payloads = sorted((pt["payload"] for pt in points), key=lambda p: p.get("chunk_index", 0))
+    if title:
+        chosen = [p for p in payloads if (p.get("section_title") or "") == title]
+    else:
+        chosen = [p for p in payloads if (p.get("section_type") or "") == section_type]
+    if not chosen:
+        raise HTTPException(status_code=404, detail="no such section; see outline in /v1/paper/{id}")
+    text = "\n\n".join(p.get("text") or "" for p in chosen)
+    piece = text[offset:offset + max_chars]
+    end = offset + len(piece)
+    return {"id": paper_id, "title": chosen[0].get("title"),
+            "section_title": title, "section_type": section_type,
+            "text": piece, "offset": offset, "next_offset": end if end < len(text) else None,
+            "total_chars": len(text), "url": source_url(paper_id), "usage": USAGE_NOTICE}
+
+
+@app.get("/v1/paper/{paper_id:path}")
+def paper_card(paper_id: str, x_api_key: Optional[str] = Header(default=None)):
+    """One paper: metadata, full abstract, section outline, and its citation
+    neighbours inside the corpus (what it cites, what cites it), most cited
+    first. The entry point for reading a paper or walking to related work."""
+    auth_and_limit(x_api_key)
+    rows = _paper_rows([paper_id])
+    if paper_id not in rows:
+        head = canonical_id(paper_id)
+        rows = _paper_rows([head])
+        if head not in rows:
+            raise HTTPException(status_code=404, detail="paper not in the corpus")
+        paper_id = head
+    card = _paper_card(rows[paper_id], abstract_chars=None)
+    card["influential_citations"] = rows[paper_id].get("influential_citations")
+    try:
+        points = qdrant_scroll_by_arxiv(paper_id, limit=3000)
+    except HTTPException:
+        points = []
+    card["outline"] = _outline([pt["payload"] for pt in points])
+    card["indexed_chunks"] = len(points)
+    card["cites"], card["cites_in_corpus"] = _neighbours(
+        "SELECT dst FROM citations WHERE src=?", paper_id)
+    card["cited_by"], card["cited_by_in_corpus"] = _neighbours(
+        "SELECT src FROM citations WHERE dst=?", paper_id)
+    card["usage"] = USAGE_NOTICE
+    return card
+
+
 @app.get("/v1/health")
 def health():
     samples = list(search_latencies)

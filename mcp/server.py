@@ -1,7 +1,7 @@
 """
 dtox research MCP server.
 
-Exposes five public read-only tools over MCP (streamable-http transport) that proxy to the
+Exposes public read-only tools over MCP (streamable-http transport) that proxy to the
 internal dtox-research-api (127.0.0.1:8010), which serves semantic search
 over a full-text database of curated AI/LLM/Web3 arxiv papers.
 
@@ -36,8 +36,33 @@ transport_security = TransportSecuritySettings(
     allowed_origins=["https://read.whoim.space", "http://127.0.0.1:*", "http://localhost:*"],
 )
 
+INSTRUCTIONS = """\
+dtox research is a full-text index of research papers, protocol specs (EIPs,
+SIMDs) and whitepapers in four layers: web3 (primary), ai-agents, llm-slm and
+builder-tech. Treat it as a library you explore in steps, not a single search:
+
+- Which papers matter on a subject: find_papers (sort="foundational" for the
+  works the field builds on, "citations" for the most cited, "recent" for the
+  newest, "relevance" by default).
+- One paper in depth: get_paper (abstract, outline, what it cites and what
+  cites it), then read_paper_section for the text of a section, or
+  get_code_or_math_spec for its algorithms, equations and tables.
+- A specific fact, mechanism, number or definition: search_research_paper,
+  narrowed with section_type, element_type, terms or year_from.
+- Two approaches side by side: compare_methods.
+- Where a field is moving: research_trends (use about= for one subject), then
+  find_papers sort="recent" and the limitations sections of what it returns.
+- Whether an idea already exists: validate_project with each claim phrased
+  two or three ways.
+
+Cite every claim with the paper id and url you got it from. An empty result
+over a large corpus_coverage is evidence; over a small one it is an empty
+shelf. The index holds no patents.
+"""
+
 mcp = FastMCP(
     "dtox-research",
+    instructions=INSTRUCTIONS,
     host=MCP_HOST,
     port=MCP_PORT,
     stateless_http=True,
@@ -164,6 +189,125 @@ def search_research_paper(
     except requests.RequestException as e:
         return {"error": f"could not reach research API: {e}"}
 
+    err = _handle_error(resp)
+    if err:
+        return err
+    return resp.json()
+
+
+@mcp.tool()
+def find_papers(
+    query: str,
+    layer: Optional[str] = None,
+    sort: str = "relevance",
+    year_from: Optional[int] = None,
+    year_to: Optional[int] = None,
+    limit: int = 10,
+) -> dict:
+    """List papers on a subject, one row per paper with its abstract, year,
+    venue and citation count. Use this when the question is about papers
+    ("the key papers on MEV", "what should I read on KV cache compression",
+    "newest work on agent memory") rather than about a passage inside them.
+
+    Args:
+        query: The subject in plain words, e.g. "maximal extractable value".
+        layer: Optional: "web3", "ai-agents", "llm-slm" or "builder-tech".
+        sort: "relevance" (default); "foundational" (the papers the relevant
+            ones cite most, found through the citation graph, so classics
+            that predate today's vocabulary still appear: best for "where do
+            I start" and "what are the key papers"); "citations" (most cited
+            among the 30 most relevant); "recent" (newest first among them).
+        year_from / year_to: Publication year window.
+        limit: 1-30, default 10.
+
+    Returns:
+        dict with "papers": each {id, title, year, venue, citation_count,
+        layers, source, url, fulltext, abstract, relevance_rank, and
+        cited_by_pool for sort="foundational"}. Pass an id to get_paper to
+        read further. Copies of the same paper from other sources are listed
+        under "twins".
+    """
+    body = {"query": query, "sort": sort, "limit": limit}
+    if layer:
+        body["layer"] = layer
+    if year_from is not None:
+        body["year_from"] = year_from
+    if year_to is not None:
+        body["year_to"] = year_to
+    try:
+        resp = requests.post(f"{RESEARCH_API_BASE}/v1/papers", headers=_headers(), json=body, timeout=30)
+    except requests.RequestException as e:
+        return {"error": f"could not reach research API: {e}"}
+    err = _handle_error(resp)
+    if err:
+        return err
+    return resp.json()
+
+
+@mcp.tool()
+def get_paper(paper_id: str) -> dict:
+    """Open one paper: title, venue, citation count, full abstract, the
+    outline of its indexed sections (with how much prose, math and tables
+    each holds), and its citation neighbours inside the corpus: what it cites
+    and what cites it, most cited first.
+
+    Use it to judge a paper before reading it, to find the section worth
+    reading, or to walk to earlier and later work on the same idea.
+
+    Args:
+        paper_id: e.g. "2405.15793", "iacr:2025/1040", "eip:1559", "simd:0297".
+
+    Returns:
+        dict with id, title, year, venue, citation_count, abstract, url,
+        outline (each {section_title, section_type, chunks, chars, elements}),
+        cites / cited_by (up to 25 each, with cites_in_corpus and
+        cited_by_in_corpus totals) and twins.
+    """
+    try:
+        resp = requests.get(f"{RESEARCH_API_BASE}/v1/paper/{paper_id}", headers=_headers(), timeout=30)
+    except requests.RequestException as e:
+        return {"error": f"could not reach research API: {e}"}
+    err = _handle_error(resp)
+    if err:
+        return err
+    return resp.json()
+
+
+@mcp.tool()
+def read_paper_section(
+    paper_id: str,
+    section_title: Optional[str] = None,
+    section_type: Optional[str] = None,
+    offset: int = 0,
+    max_chars: int = 8000,
+) -> dict:
+    """Read the text of one section of a paper, in order, a page at a time.
+
+    Args:
+        paper_id: The paper, e.g. "1904.05234".
+        section_title: Exact title from get_paper's outline, e.g. "Limitations".
+        section_type: Instead of a title, every section of one kind:
+            "introduction", "method", "experiments", "analysis",
+            "limitations", "related_work", "conclusion", "appendix".
+        offset: Character offset to continue from (next_offset of the
+            previous call).
+        max_chars: Page size, 500-20000, default 8000 (about 2000 tokens).
+
+    Returns:
+        dict with "text", "offset", "next_offset" (null at the end),
+        "total_chars" and "url". Quote from it with attribution; do not
+        reassemble whole papers.
+    """
+    params = {"offset": offset, "max_chars": max_chars}
+    if section_title:
+        params["title"] = section_title
+    if section_type:
+        params["section_type"] = section_type
+    try:
+        resp = requests.get(f"{RESEARCH_API_BASE}/v1/paper/{paper_id}/section", headers=_headers(),
+                            params=params, timeout=30)
+    except requests.RequestException as e:
+        return {"error": f"could not reach research API: {e}"}
     err = _handle_error(resp)
     if err:
         return err
