@@ -44,9 +44,12 @@ builder-tech. Treat it as a library you explore in steps, not a single search:
 - Which papers matter on a subject: find_papers (sort="foundational" for the
   works the field builds on, "citations" for the most cited, "recent" for the
   newest, "relevance" by default).
+- How big a subject is, whether it is growing, which venues and terms carry
+  it: count_papers (per-year counts; no query = the whole layer).
 - One paper in depth: get_paper (abstract, outline, what it cites and what
   cites it), then read_paper_section for the text of a section, or
   get_code_or_math_spec for its algorithms, equations and tables.
+- What else is like this paper, without shared references: similar_papers.
 - A specific fact, mechanism, number or definition: search_research_paper,
   narrowed with section_type, element_type, terms or year_from.
 - Two approaches side by side: compare_methods.
@@ -305,6 +308,86 @@ def read_paper_section(
         params["section_type"] = section_type
     try:
         resp = requests.get(f"{RESEARCH_API_BASE}/v1/paper/{paper_id}/section", headers=_headers(),
+                            params=params, timeout=30)
+    except requests.RequestException as e:
+        return {"error": f"could not reach research API: {e}"}
+    err = _handle_error(resp)
+    if err:
+        return err
+    return resp.json()
+
+
+@mcp.tool()
+def count_papers(
+    query: Optional[str] = None,
+    layer: Optional[str] = None,
+    year_from: Optional[int] = None,
+    year_to: Optional[int] = None,
+) -> dict:
+    """Count papers instead of listing them: how much the corpus holds on a
+    subject, per year, per layer, in which venues and under which technical
+    terms. Use it to size a topic ("how many papers on account abstraction"),
+    to see whether it is growing (by_year over the last years), to learn who
+    publishes it (top_venues) and what sits next to it (top_terms: "what
+    goes with X"), and to pick the year window before find_papers.
+
+    Args:
+        query: Optional subject in plain words. With it the counts cover the
+            200 papers most relevant to it (a neighbourhood, so a small
+            topic shows fewer than 200 and a big one is capped); without
+            it, every paper in the layer and year window.
+        layer: Optional: "web3", "ai-agents", "llm-slm" or "builder-tech".
+        year_from / year_to: Publication year window.
+
+    Returns:
+        dict with total, by_year (ascending), by_layer, top_venues (15),
+        top_terms (25, each {term, papers}), and with a query top_papers
+        (5 cards). "sampled" appears if terms were counted over a sample.
+        Copies of one paper count once.
+    """
+    body = {}
+    if query:
+        body["query"] = query
+    if layer:
+        body["layer"] = layer
+    if year_from is not None:
+        body["year_from"] = year_from
+    if year_to is not None:
+        body["year_to"] = year_to
+    try:
+        resp = requests.post(f"{RESEARCH_API_BASE}/v1/facets", headers=_headers(), json=body, timeout=30)
+    except requests.RequestException as e:
+        return {"error": f"could not reach research API: {e}"}
+    err = _handle_error(resp)
+    if err:
+        return err
+    return resp.json()
+
+
+@mcp.tool()
+def similar_papers(paper_id: str, limit: int = 10, layer: Optional[str] = None) -> dict:
+    """Papers closest in meaning to one paper, by title and abstract. Use it
+    for "is there anything like this paper", "what else should I read after
+    this one", and to find neighbours that share no references or wording
+    with it (find_papers and the citation lists in get_paper miss those).
+
+    Args:
+        paper_id: e.g. "2310.06770", "iacr:2025/1040".
+        limit: 1-30, default 10.
+        layer: Optional: restrict neighbours to "web3", "ai-agents",
+            "llm-slm" or "builder-tech".
+
+    Returns:
+        dict with "papers": cards as in find_papers plus "similarity"
+        (cosine, higher is closer), most similar first. The paper itself
+        and its copies are excluded. Error if the paper is not in the
+        paper-level index.
+    """
+    params = {"limit": limit}
+    if layer:
+        params["layer"] = layer
+    try:
+        resp = requests.get(f"{RESEARCH_API_BASE}/v1/paper/{paper_id}/similar", headers=_headers(),
                             params=params, timeout=30)
     except requests.RequestException as e:
         return {"error": f"could not reach research API: {e}"}

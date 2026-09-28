@@ -109,5 +109,127 @@ class OutlineAndSectionTest(unittest.TestCase):
                 main.paper_section("2401.1", title="Nope")
 
 
+class FacetsTest(unittest.TestCase):
+    # id, year, venue, layers, matched_terms
+    DB = [("2403.02691", 2024, "ACL", "ai-agents", '["prompt injection", "agent"]'),
+          ("acl:x", 2024, "ACL", "ai-agents", '["prompt injection"]'),
+          ("2406.13352", 2024, "NeurIPS", "ai-agents,llm-slm", '["agent"]'),
+          ("2605.17986", 2026, None, "ai-agents", "not json")]
+
+    def _run(self, body, rank_rows=None):
+        seen = {}
+
+        def source(b, ids):
+            seen["ids"] = ids
+            return self.DB
+        with patch.object(main, "auth_and_limit"), \
+             patch.object(main, "_facet_source", side_effect=source), \
+             patch.object(main, "_rank_papers", return_value=(rank_rows or [], None)) as rank, \
+             patch.object(main, "_twins", return_value=TWINS):
+            return main.paper_facets(body), seen, rank
+
+    def test_without_query_counts_everything_and_folds_twins(self):
+        out, seen, rank = self._run(main.FacetsBody(layer="ai-agents", year_from=2024))
+        rank.assert_not_called()
+        self.assertIsNone(seen["ids"])
+        self.assertEqual(out["total"], 3)
+        self.assertEqual(out["by_year"], {2024: 2, 2026: 1})
+        self.assertEqual(out["by_layer"], {"ai-agents": 3, "llm-slm": 1})
+        self.assertEqual(out["top_venues"][0], {"venue": "ACL", "papers": 1})
+        self.assertEqual(out["top_terms"][0], {"term": "agent", "papers": 2})
+        self.assertNotIn("top_papers", out)
+        self.assertNotIn("sampled", out)
+
+    def test_with_query_uses_the_ranked_pool_and_returns_top_papers(self):
+        pool = [dict(ROWS[i], relevance_rank=n) for n, i in enumerate(ROWS, 1)]
+        out, seen, rank = self._run(main.FacetsBody(query="prompt injection"), pool)
+        rank.assert_called_once_with("prompt injection", None, None, None, main.FACET_POOL)
+        self.assertEqual(seen["ids"], list(ROWS))
+        self.assertEqual([p["id"] for p in out["top_papers"]], list(ROWS))
+        self.assertEqual(out["scope"], "every paper the query reached")
+
+    def test_terms_are_sampled_when_the_filter_is_huge(self):
+        with patch.object(main, "FACET_TERMS_SAMPLE", 2):
+            out, _, _ = self._run(main.FacetsBody())
+        self.assertEqual(out["sampled"], 2)
+
+    def test_bad_layer_is_refused(self):
+        with patch.object(main, "auth_and_limit"):
+            with self.assertRaises(HTTPException):
+                main.paper_facets(main.FacetsBody(layer="biology"))
+
+
+class RankPapersTest(unittest.TestCase):
+    def test_pool_size_reaches_both_retrievers(self):
+        with patch.object(main, "COARSE_EMBED_URL", "http://embed"), \
+             patch.object(main, "_coarse_paper_search", return_value=[]) as dense, \
+             patch.object(main, "_paper_bm25", return_value=["2406.13352"]) as lex, \
+             patch.object(main, "_paper_rows", side_effect=lambda ids: {i: dict(ROWS[i]) for i in ids if i in ROWS}), \
+             patch.object(main, "_twins", return_value=TWINS):
+            pool, err = main._rank_papers("mev", "web3", 2020, None, 200)
+        self.assertEqual(dense.call_args.args[4], 200)
+        self.assertEqual(lex.call_args.kwargs["limit"], 200)
+        self.assertEqual(pool[0]["relevance_rank"], 1)
+        self.assertIsNone(err)
+
+
+class SimilarTest(unittest.TestCase):
+    def _run(self, hits, scroll_points=("pt-1",), layer=None, paper_id="2403.02691"):
+        calls = []
+
+        class Resp:
+            def __init__(self, data):
+                self.data = data
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"result": self.data}
+
+        def post(url, json=None, timeout=None):
+            calls.append((url, json))
+            if url.endswith("/scroll"):
+                return Resp({"points": [{"id": p} for p in scroll_points]})
+            return Resp(hits)
+        with patch.object(main, "auth_and_limit"), \
+             patch.object(main.requests, "post", side_effect=post), \
+             patch.object(main, "_paper_rows", side_effect=lambda ids: {i: dict(ROWS[i]) for i in ids if i in ROWS}), \
+             patch.object(main, "_twins", return_value=TWINS):
+            out = main.similar_papers(paper_id, limit=10, layer=layer)
+        return out, calls
+
+    def test_excludes_self_and_twins_and_reports_similarity(self):
+        hits = [{"score": 0.9, "payload": {"arxiv_id": "acl:x"}},
+                {"score": 0.8, "payload": {"arxiv_id": "2406.13352"}},
+                {"score": 0.7, "payload": {"arxiv_id": "2406.13352"}},
+                {"score": 0.6, "payload": {"arxiv_id": "2605.17986"}},
+                {"score": 0.5, "payload": {"arxiv_id": "unknown"}}]
+        out, calls = self._run(hits)
+        self.assertEqual([p["id"] for p in out["papers"]], ["2406.13352", "2605.17986"])
+        self.assertEqual(out["papers"][0]["similarity"], 0.8)
+        self.assertEqual(calls[-1][1]["positive"], ["pt-1"])
+        self.assertNotIn("filter", calls[-1][1])
+
+    def test_layer_filter_is_passed_to_qdrant(self):
+        _, calls = self._run([], layer="web3")
+        self.assertEqual(calls[-1][1]["filter"], {"must": [{"key": "layers", "match": {"any": ["web3"]}}]})
+
+    def test_missing_paper_is_404(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._run([], scroll_points=(), paper_id="9999.99999")
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_bad_layer_is_refused(self):
+        with patch.object(main, "auth_and_limit"):
+            with self.assertRaises(HTTPException):
+                main.similar_papers("2403.02691", layer="biology")
+
+    def test_route_is_ahead_of_the_catch_all(self):
+        paths = [r.path for r in main.app.routes]
+        self.assertLess(paths.index("/v1/paper/{paper_id:path}/similar"), paths.index("/v1/paper/{paper_id:path}"))
+        self.assertIn("/v1/paper/{arxiv_id}/spec", paths)
+
+
 if __name__ == "__main__":
     unittest.main()

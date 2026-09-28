@@ -4398,6 +4398,39 @@ def _check_layer(layer):
         raise HTTPException(status_code=400, detail=f"layer must be one of {sorted(EXPLORE_LAYERS)}")
 
 
+def _rank_papers(query, layer, year_from, year_to, pool_size):
+    """The pool_size most relevant papers for a query, best first, one row per
+    paper (twins folded into the best ranked copy), each with relevance_rank.
+    Returns (rows, dense_error); dense_error is set when the paper index was
+    down and only title/abstract terms ranked the pool."""
+    vector = None if COARSE_EMBED_URL else embed_query(query)
+    dense_error = None
+    try:
+        dense = _coarse_paper_search(vector, layer, year_from, year_to,
+                                     pool_size, timeout=10, query=query)
+    except HTTPException as e:
+        dense, dense_error = [], str(e.detail)
+    lexical = _paper_bm25(query, layer, year_from, year_to, limit=pool_size)
+    scores = reciprocal_rank_fusion([p["arxiv_id"] for p in dense], lexical,
+                                    weights=[HIER_W_DENSE, HIER_W_LEX])
+    fused = sorted(scores, key=lambda p: -scores[p])
+    # rows first, twins second: a copy without a finished record must not
+    # shadow the one that has it
+    rows = _paper_rows(fused)
+    pool, seen = [], set()
+    for pid in fused:
+        head = canonical_id(pid)
+        if pid not in rows or head in seen:
+            continue
+        seen.add(head)
+        pool.append(rows[pid])
+        if len(pool) >= pool_size:
+            break
+    for n, row in enumerate(pool, start=1):
+        row["relevance_rank"] = n
+    return pool, dense_error
+
+
 class PapersBody(BaseModel):
     query: str = Field(..., min_length=2, max_length=500)
     layer: Optional[str] = None
@@ -4418,31 +4451,8 @@ def find_papers(body: PapersBody, x_api_key: Optional[str] = Header(default=None
     _check_layer(body.layer)
     if body.sort not in EXPLORE_SORTS:
         raise HTTPException(status_code=400, detail=f"sort must be one of {list(EXPLORE_SORTS)}")
-    vector = None if COARSE_EMBED_URL else embed_query(body.query)
-    dense_error = None
-    try:
-        dense = _coarse_paper_search(vector, body.layer, body.year_from, body.year_to,
-                                     EXPLORE_POOL, timeout=10, query=body.query)
-    except HTTPException as e:
-        dense, dense_error = [], str(e.detail)
-    lexical = _paper_bm25(body.query, body.layer, body.year_from, body.year_to, limit=EXPLORE_POOL)
-    scores = reciprocal_rank_fusion([p["arxiv_id"] for p in dense], lexical,
-                                    weights=[HIER_W_DENSE, HIER_W_LEX])
-    fused = sorted(scores, key=lambda p: -scores[p])
-    # rows first, twins second: a copy without a finished record must not
-    # shadow the one that has it
-    rows = _paper_rows(fused)
-    pool, seen = [], set()
-    for pid in fused:
-        head = canonical_id(pid)
-        if pid not in rows or head in seen:
-            continue
-        seen.add(head)
-        pool.append(rows[pid])
-        if len(pool) >= EXPLORE_POOL:
-            break
-    for n, row in enumerate(pool, start=1):
-        row["relevance_rank"] = n
+    pool, dense_error = _rank_papers(body.query, body.layer, body.year_from, body.year_to,
+                                     EXPLORE_POOL)
     if body.sort != "relevance":
         pool = pool[:EXPLORE_RESORT_POOL]
     if body.sort == "citations":
@@ -4538,6 +4548,183 @@ def _neighbours(sql, paper_id):
     ranked = sorted(rows.values(), key=lambda r: -(r.get("citation_count") or 0))
     return ([{"id": r["arxiv_id"], "title": r["title"], "year": r["year"],
               "citation_count": r["citation_count"]} for r in ranked[:NEIGHBOUR_LIMIT]], len(rows))
+
+
+# ---- counts and neighbours --------------------------------------------------
+
+FACET_POOL = 200              # papers a query-scoped count is taken over
+FACET_TERMS_SAMPLE = 40000    # papers whose matched_terms are read without a query
+FACET_TOP_VENUES = 15
+FACET_TOP_TERMS = 25
+SIMILAR_SLACK = 3             # recommend this many times the limit, twins and gaps thin it
+
+
+class FacetsBody(BaseModel):
+    query: Optional[str] = Field(default=None, min_length=2, max_length=500)
+    layer: Optional[str] = None
+    year_from: Optional[int] = None
+    year_to: Optional[int] = None
+
+
+def _terms_of(raw):
+    try:
+        terms = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return []
+    return [t for t in terms if isinstance(t, str)] if isinstance(terms, list) else []
+
+
+def _facet_source(body, pool_ids):
+    """(id, year, venue, layers, matched_terms) of every paper counted: the
+    ranked pool when there is a query, else all finished papers in the filter."""
+    cols = "arxiv_id, year, venue, layers, matched_terms"
+    if pool_ids is not None:
+        parts = [pool_ids[i:i + 500] for i in range(0, len(pool_ids), 500)]
+        sqls = [(f"SELECT {cols} FROM papers WHERE status='done' "
+                 f"AND arxiv_id IN ({','.join('?' * len(part))})", part) for part in parts]
+    else:
+        where, params = ["status='done'"], []
+        if body.layer:
+            where.append("layers LIKE ?")
+            params.append(f"%{body.layer}%")
+        if body.year_from is not None:
+            where.append("year >= ?")
+            params.append(body.year_from)
+        if body.year_to is not None:
+            where.append("year <= ?")
+            params.append(body.year_to)
+        sqls = [(f"SELECT {cols} FROM papers WHERE {' AND '.join(where)}", params)]
+    rows = []
+    for sql, params in sqls:
+        try:
+            rows += _ro_conn(STATE_DB_PATH).execute(sql, params).fetchall()
+        except sqlite3.Error as e:
+            _ro_conn_drop(STATE_DB_PATH)
+            raise HTTPException(status_code=503, detail=f"state db unavailable: {e}")
+    return rows
+
+
+@app.post("/v1/facets")
+def paper_facets(body: FacetsBody, x_api_key: Optional[str] = Header(default=None)):
+    """How much the corpus holds on a subject: paper count, papers per year,
+    per layer, the venues and the technical terms they carry. With a query the
+    count is taken over the FACET_POOL most relevant papers (the size of the
+    neighbourhood, capped, not of every mention); without one it covers every
+    paper in the layer and year window. Copies of one paper count once."""
+    auth_and_limit(x_api_key)
+    _check_layer(body.layer)
+    out, top = {}, []
+    if body.query:
+        pool, dense_error = _rank_papers(body.query, body.layer, body.year_from, body.year_to,
+                                         FACET_POOL)
+        rows = _facet_source(body, [r["arxiv_id"] for r in pool])
+        top = [_paper_card(r) for r in pool[:5]]
+        out["scope"] = (f"the {FACET_POOL} papers most relevant to the query"
+                        if len(pool) >= FACET_POOL else "every paper the query reached")
+        if dense_error:
+            out["partial"] = True
+            out["note"] = f"paper index unavailable ({dense_error}); ranked by title/abstract terms only"
+    else:
+        rows = _facet_source(body, None)
+        out["scope"] = "every paper in the filter"
+    seen, years, layers, venues, kept = set(), {}, {}, {}, []
+    for pid, year, venue, layer_csv, raw in rows:
+        head = canonical_id(pid)
+        if head in seen:
+            continue
+        seen.add(head)
+        kept.append(raw)
+        if year is not None:
+            years[year] = years.get(year, 0) + 1
+        for l in (layer_csv or "").split(","):
+            if l:
+                layers[l] = layers.get(l, 0) + 1
+        if venue:
+            venues[venue] = venues.get(venue, 0) + 1
+    step = max(1, math.ceil(len(kept) / FACET_TERMS_SAMPLE))
+    sample = kept[::step]
+    counts = {}
+    for raw in sample:
+        for t in set(_terms_of(raw)):
+            counts[t] = counts.get(t, 0) + 1
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:FACET_TOP_TERMS]
+    out.update({
+        "total": len(kept),
+        "by_year": dict(sorted(years.items())),
+        "by_layer": dict(sorted(layers.items(), key=lambda kv: -kv[1])),
+        "top_venues": [{"venue": v, "papers": n} for v, n in
+                       sorted(venues.items(), key=lambda kv: (-kv[1], kv[0]))[:FACET_TOP_VENUES]],
+        "top_terms": [{"term": t, "papers": n} for t, n in ranked],
+    })
+    if step > 1:
+        out["sampled"] = len(sample)
+        out["note_terms"] = f"top_terms counted over an even sample of {len(sample)} papers"
+    if body.query:
+        out["top_papers"] = top
+    out["usage"] = USAGE_NOTICE
+    return out
+
+
+def _coarse_point_id(paper_id):
+    """Id of the paper's point in the paper-level index, or None if absent."""
+    body = {"filter": {"must": [{"key": "arxiv_id", "match": {"value": paper_id}}]},
+            "limit": 1, "with_payload": False, "with_vector": False}
+    try:
+        resp = requests.post(f"{QDRANT_URL}/collections/{COARSE_COLLECTION}/points/scroll",
+                             json=body, timeout=10)
+        resp.raise_for_status()
+        pts = resp.json()["result"]["points"]
+    except (requests.RequestException, KeyError, ValueError) as e:
+        raise HTTPException(status_code=502, detail=f"qdrant error: {e}")
+    return pts[0]["id"] if pts else None
+
+
+@app.get("/v1/paper/{paper_id:path}/similar")
+def similar_papers(paper_id: str, limit: int = 10, layer: Optional[str] = None,
+                   x_api_key: Optional[str] = Header(default=None)):
+    """Papers nearest to this one in title+abstract embedding space, whether or
+    not they share citations or wording with it. Copies of the paper itself
+    are left out; copies of a neighbour count once."""
+    auth_and_limit(x_api_key)
+    _check_layer(layer)
+    limit = max(1, min(limit, 30))
+    head = canonical_id(paper_id)
+    point = None
+    for cand in dict.fromkeys([paper_id, head, *_twins()["members"].get(head, [])]):
+        point = _coarse_point_id(cand)
+        if point is not None:
+            break
+    if point is None:
+        raise HTTPException(status_code=404, detail="paper is not in the paper-level index")
+    body = {"positive": [point], "limit": limit * SIMILAR_SLACK + 10, "with_payload": ["arxiv_id"]}
+    if layer:
+        body["filter"] = {"must": [{"key": "layers", "match": {"any": [layer]}}]}
+    try:
+        resp = requests.post(f"{QDRANT_URL}/collections/{COARSE_COLLECTION}/points/recommend",
+                             json=body, timeout=15)
+        resp.raise_for_status()
+        hits = resp.json()["result"]
+    except (requests.RequestException, KeyError, ValueError) as e:
+        raise HTTPException(status_code=502, detail=f"qdrant error: {e}")
+    scored, seen = [], {head}
+    for h in hits:
+        aid = (h.get("payload") or {}).get("arxiv_id")
+        cid = canonical_id(aid) if aid else None
+        if not aid or cid in seen:
+            continue
+        seen.add(cid)
+        scored.append((aid, h.get("score") or 0))
+    rows = _paper_rows([a for a, _ in scored])
+    papers = []
+    for aid, score in scored:
+        if aid not in rows:
+            continue
+        card = _paper_card(rows[aid])
+        card["similarity"] = round(score, 4)
+        papers.append(card)
+        if len(papers) >= limit:
+            break
+    return {"id": paper_id, "papers": papers, "count": len(papers), "usage": USAGE_NOTICE}
 
 
 @app.get("/v1/paper/{paper_id:path}/section")
