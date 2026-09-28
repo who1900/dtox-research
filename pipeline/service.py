@@ -19,6 +19,7 @@ import json
 import logging
 import threading
 import os
+import posixpath
 import random
 import re
 import sqlite3
@@ -2117,6 +2118,96 @@ def write_latex_cache(arxiv_id: str, text: str):
     p.write_text(text, encoding="utf-8", errors="ignore")
 
 
+_INC_RE = re.compile(
+    r"\\(?:input|include|subfile)\s*\{([^}]+)\}"
+    r"|\\input(?![A-Za-z@])[ \t]*([^\s{}\\%]+)"
+    r"|\\(?:sub)?import\*?\s*\{([^}]*)\}\s*\{([^}]+)\}"
+)
+LATEX_MAX_INCLUDE_DEPTH = 8
+
+
+def _is_commented(text: str, pos: int) -> bool:
+    """True if pos sits after an unescaped % on its line."""
+    i = text.rfind("\n", 0, pos) + 1
+    while i < pos:
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "%":
+            return True
+        i += 1
+    return False
+
+
+def assemble_latex_source(arxiv_id: str, files):
+    r"""files: [(archive_path, content)]. Pick the main .tex and inline its
+    \input/\include/\subfile/\import targets, resolved by archive path
+    (relative to the including file, then the archive root, then a unique
+    basename). Unresolved includes become empty and are logged."""
+    by_key = {}   # normalized path without .tex -> content
+    by_base = {}  # basename key -> [path keys]
+    tex_files = []
+    for name, content in files:
+        path = posixpath.normpath(name.replace("\\", "/")).lstrip("/")
+        is_tex = path.endswith(".tex")
+        key = path[:-4] if is_tex else path
+        if key in by_key and not is_tex:
+            continue  # foo.tex wins over an extensionless foo
+        by_key[key] = content
+        by_base.setdefault(key.rsplit("/", 1)[-1], []).append(key)
+        if is_tex:
+            tex_files.append((key, content))
+
+    def lookup(ref, cur_dir):
+        ref = ref.strip().replace("\\", "/")
+        if ref.endswith(".tex"):
+            ref = ref[:-4]
+        for base in (cur_dir, ""):
+            cand = posixpath.normpath(posixpath.join(base, ref))
+            if cand in by_key:
+                return cand
+        keys = by_base.get(ref.rsplit("/", 1)[-1], [])
+        return keys[0] if len(keys) == 1 else None
+
+    def expand(key, text, stack, used, unresolved):
+        cur_dir = posixpath.dirname(key)
+
+        def repl(m):
+            if _is_commented(text, m.start()):
+                return m.group(0)
+            if m.group(4) is not None:
+                ref = posixpath.join(m.group(3).strip(), m.group(4).strip())
+            else:
+                ref = m.group(1) or m.group(2)
+            hit = lookup(ref, cur_dir)
+            if hit is None or hit in stack or len(stack) >= LATEX_MAX_INCLUDE_DEPTH:
+                unresolved.append(ref.strip())
+                return ""
+            used.add(hit)
+            return expand(hit, by_key[hit], stack | {hit}, used, unresolved)
+
+        return _INC_RE.sub(repl, text)
+
+    def build(key, content):
+        used, unresolved = set(), []
+        return expand(key, content, {key}, used, unresolved), used, unresolved
+
+    mains = [(k, c) for k, c in tex_files if "\\documentclass" in c and "\\begin{document}" in c]
+    if not mains:
+        mains = [(k, c) for k, c in tex_files if "\\documentclass" in c]
+    if mains:
+        built = [(k,) + build(k, c) for k, c in mains]
+        # the real root includes the most other files; tie -> longest text
+        key, text, used, unresolved = max(built, key=lambda b: (len(b[2]), len(b[1])))
+    else:
+        key, c = max(tex_files, key=lambda kc: len(kc[1]))
+        text, used, unresolved = build(key, c)
+    if unresolved:
+        log.warning(f"latex: {arxiv_id}: {len(unresolved)} unresolved include(s) in {key}: {sorted(set(unresolved))[:10]}")
+    return text
+
+
 def fetch_latex_source(arxiv_id: str, session: requests.Session = None):
     """Return (text, source) where source in {'latex','abstract-fallback'} or (None, None) on hard fail.
     Checks the on-disk LaTeX cache first so re-processing never re-downloads."""
@@ -2151,34 +2242,20 @@ def fetch_latex_source(arxiv_id: str, session: requests.Session = None):
     try:
         # try tar.gz first
         tf = tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz")
-        tex_parts = []
-        main_candidates = []
+        members = []
         for member in tf.getmembers():
-            if member.isfile() and member.name.endswith(".tex"):
-                content = tf.extractfile(member).read().decode("utf-8", errors="ignore")
-                main_candidates.append((member.name, content))
-        if not main_candidates:
+            if not member.isfile():
+                continue
+            is_tex = member.name.endswith(".tex")
+            # extensionless files can be \input targets (\input{body}); only
+            # read small ones, they are otherwise binaries/figures
+            if not is_tex and ("." in member.name.rsplit("/", 1)[-1] or member.size > 2_000_000):
+                continue
+            content = tf.extractfile(member).read().decode("utf-8", errors="ignore")
+            members.append((member.name, content))
+        if not any(n.endswith(".tex") for n, _ in members):
             return None, "no-tex-in-archive"
-        # crude heuristic: the file with \documentclass is main
-        main = None
-        for name, content in main_candidates:
-            if "\\documentclass" in content:
-                main = content
-                break
-        if main is None:
-            main = max(main_candidates, key=lambda nc: len(nc[1]))[1]
-        combined = main
-        # resolve simple \input{...} / \include{...} one level deep
-        content_by_base = {name.rsplit("/", 1)[-1].replace(".tex", ""): c for name, c in main_candidates}
-        def resolve_inputs(text, depth=0):
-            if depth > 2:
-                return text
-            def repl(m):
-                base = m.group(1).replace(".tex", "")
-                inc = content_by_base.get(base)
-                return resolve_inputs(inc, depth + 1) if inc else ""
-            return re.sub(r"\\(?:input|include)\{([^}]+)\}", repl, text)
-        combined = resolve_inputs(combined)
+        combined = assemble_latex_source(arxiv_id, members)
         write_latex_cache(arxiv_id, combined)
         return combined, "latex"
     except tarfile.ReadError:
