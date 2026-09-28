@@ -21,8 +21,17 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 try:
     from .search_core import fts_query, fts_query_any, merge_layer_hits, merge_layer_hits_calibrated, reciprocal_rank_fusion
+    from .boilerplate import is_boilerplate_chunk
 except ImportError:
     from search_core import fts_query, fts_query_any, merge_layer_hits, merge_layer_hits_calibrated, reciprocal_rank_fusion
+    from boilerplate import is_boilerplate_chunk
+
+# Preamble/author-block/checklist/reference chunks must not stand in for their
+# paper in search results. 0 restores the old behavior.
+BOILERPLATE_FILTER = os.getenv("BOILERPLATE_FILTER", "1") == "1"
+# A paper whose only candidate chunk is boilerplate (often the title page it was
+# found by) drops this many places instead of vanishing from the top.
+BOILERPLATE_DEMOTE = int(os.getenv("BOILERPLATE_DEMOTE", "3"))
 
 ATTESTOR_URL = os.getenv("ATTESTOR_URL", "http://127.0.0.1:8013")
 ATTESTOR_INTERNAL_TOKEN = os.getenv("ATTESTOR_INTERNAL_TOKEN", "")
@@ -1210,6 +1219,32 @@ def _collapse_twins(results):
     return out
 
 
+def _hit_is_boilerplate(hit):
+    p = hit.get("payload") or {}
+    return is_boilerplate_chunk(p.get("text"), p.get("section_title"),
+                                p.get("section_type"), p.get("element_type"))
+
+
+def _dedupe_preferring_content(candidate_hits, floor, lex_exempt_ids, limit):
+    """One hit per paper, like the plain dedupe, but a boilerplate chunk never
+    represents a paper that has a content chunk among the candidates: the best
+    ranked content chunk takes the paper's slot. A paper with nothing but
+    boilerplate is kept, BOILERPLATE_DEMOTE places lower."""
+    slots = {}  # canonical id -> [first hit, first content hit or None]
+    for h in candidate_hits:
+        aid = h["payload"].get("arxiv_id")
+        if (h.get("score") or 0) < floor and aid not in lex_exempt_ids:
+            continue
+        slot = slots.setdefault(canonical_id(aid), [h, None])
+        if slot[1] is None and not _hit_is_boilerplate(h):
+            slot[1] = h
+    ranked = [(i + (0 if s[1] is not None else BOILERPLATE_DEMOTE + 0.5),
+               s[1] if s[1] is not None else s[0])
+              for i, s in enumerate(slots.values())]
+    ranked.sort(key=lambda item: item[0])
+    return [_result_from_hit(h) for _, h in ranked[:limit]]
+
+
 def _result_from_hit(hit):
     payload = hit.get("payload") or {}
     paper_id = payload.get("arxiv_id")
@@ -1593,6 +1628,8 @@ def _run_search(body: SearchBody, x_api_key=None,
     def _filter_and_dedupe(candidate_hits):
         picked = []
         seen = set()
+        if BOILERPLATE_FILTER and body.dedupe:
+            return _dedupe_preferring_content(candidate_hits, floor, lex_exempt_ids, limit)
         for h in candidate_hits:
             p = h["payload"]
             aid = p.get("arxiv_id")

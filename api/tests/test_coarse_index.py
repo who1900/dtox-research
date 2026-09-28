@@ -357,11 +357,14 @@ class ServiceHookTests(unittest.TestCase):
     of the coarse index, and must stay a no-op unless explicitly enabled."""
 
     def test_noop_when_disabled(self):
+        real_import = __import__
         with patch.object(service, "COARSE_INDEX_ENABLED", False), \
-             patch("builtins.__import__") as import_mock:
+             patch("builtins.__import__", side_effect=real_import) as import_mock:
             service._sync_coarse_index(MagicMock(), ["2401.00013"])
-        # coarse_index module must never even be imported when the flag is off
-        import_mock.assert_not_called()
+        # coarse_index module must never even be imported when the flag is off;
+        # other imports (unittest.mock loads warnings lazily) are not the point
+        names = [c.args[0] for c in import_mock.call_args_list if c.args]
+        self.assertNotIn("coarse_index", names)
 
     def test_noop_for_empty_id_list(self):
         with patch.object(service, "COARSE_INDEX_ENABLED", True):

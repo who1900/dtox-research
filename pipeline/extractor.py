@@ -14,6 +14,15 @@ no usable text at all (handled by caller, not here).
 
 import re
 
+try:
+    from boilerplate import BOILERPLATE_FILTER, is_boilerplate_chunk
+except ImportError:
+    try:
+        from api.boilerplate import BOILERPLATE_FILTER, is_boilerplate_chunk
+    except ImportError:  # detector not deployed next to us: embed everything
+        BOILERPLATE_FILTER = False
+        is_boilerplate_chunk = None
+
 CANONICAL_TYPES = [
     "introduction", "related_work", "method", "experiments",
     "analysis", "limitations", "conclusion", "appendix", "other",
@@ -42,10 +51,15 @@ SKIP_ELEMENT_TYPES = {"figure"}
 
 def should_embed(chunk):
     """False if this chunk should be skipped for embedding/Qdrant upsert."""
-    return not (
-        chunk.get("section_type") in SKIP_SECTION_TYPES
-        and chunk.get("element_type") in SKIP_ELEMENT_TYPES
-    )
+    if (chunk.get("section_type") in SKIP_SECTION_TYPES
+            and chunk.get("element_type") in SKIP_ELEMENT_TYPES):
+        return False
+    # preamble / author block / venue header / checklist / references
+    if BOILERPLATE_FILTER and is_boilerplate_chunk(
+            chunk.get("text"), chunk.get("section_title"),
+            chunk.get("section_type"), chunk.get("element_type")):
+        return False
+    return True
 
 # --- Layer 1: keyword/regex classification -----------------------------
 # Proof-style sections come first: they are structurally appendix material and
