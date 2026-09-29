@@ -1,3 +1,4 @@
+import collections
 import json
 import os
 import pathlib
@@ -39,6 +40,94 @@ class BuildTwinsTest(unittest.TestCase):
     def test_two_arxiv_records_are_not_merged(self):
         self.assertEqual(build_twins.build([("2001.00001", TITLE, 2020),
                                             ("2001.00002", TITLE, 2020)]), {})
+
+
+FLASH_ARXIV = "Flash Boys 2.0: Frontrunning, Transaction Reordering, and Consensus Instability in Decentralized Exchanges"
+
+
+class TwinRulesTest(unittest.TestCase):
+    def test_arxiv_id_in_source_url(self):
+        got = build_twins.build([("2309.06180", "Paged attention serving", 2023, None, None),
+                                 ("oa:W1", "Paged attention serving systems", 2023, None,
+                                  "https://arxiv.org/pdf/2309.06180v2")])
+        self.assertEqual(got["oa:W1"], "2309.06180")
+
+    def test_arxiv_doi_in_source_url(self):
+        got = build_twins.build([("2603.07716", "SoK about extractable value", 2026, None, None),
+                                 ("oa:W2", "SoK about extractable value", 2026, None,
+                                  "https://doi.org/10.48550/arXiv.2603.07716")])
+        self.assertEqual(got["oa:W2"], "2603.07716")
+
+    def test_url_of_a_different_paper_is_not_a_twin(self):
+        self.assertEqual(build_twins.build([("2309.06180", "Paged attention serving", 2023, "x", None),
+                                            ("oa:W1", "Something else entirely different", 2023, "y",
+                                             "https://arxiv.org/pdf/2309.06180v2")]), {})
+
+    def test_shared_task_papers_stay_apart(self):
+        self.assertEqual(build_twins.build([
+            ("acl:a", "Team A at SemEval-2026 Task 11: Neuro-Symbolic Syllogistic Reasoning", 2026),
+            ("acl:b", "Team B at SemEval-2026 Task 11: Neuro-Symbolic Syllogistic Reasoning", 2026)]), {})
+
+    def test_url_pointing_outside_corpus_is_ignored(self):
+        self.assertEqual(build_twins.build([("2309.06180", "Paged attention serving", 2023, None, None),
+                                            ("oa:W1", "Something else entirely different", 2023, None,
+                                             "https://arxiv.org/abs/2401.00001")]), {})
+
+    def test_identical_abstract(self):
+        ab = "Blockchains, and specifically smart contracts, have promised to create fair and transparent trading ecosystems. " * 3
+        got = build_twins.build([("1904.05234", "Alpha beta gamma", 2019, ab, None),
+                                 ("oa:W3", "Completely different title words", 2020, ab.replace(". ", "."), None)])
+        self.assertEqual(got["oa:W3"], "1904.05234")
+
+    def test_fuzzy_whitepaper_title(self):
+        got = build_twins.build([("1904.05234", FLASH_ARXIV, 2019),
+                                 ("wp:flashbots-mev",
+                                  "Flash Boys 2.0: Frontrunning, Transaction Reordering and Consensus Instability", 2019)])
+        self.assertEqual(got["wp:flashbots-mev"], "1904.05234")
+
+    def test_fuzzy_subtitle_variant(self):
+        got = build_twins.build([("acl:x", "Efficient Memory Management for Large Language Model Serving", 2023),
+                                 ("2309.06180", "Efficient Memory Management for Large Language Model Serving: PagedAttention", 2023)])
+        self.assertEqual(got.get("acl:x"), "2309.06180")
+
+    def test_part_one_and_two_stay_apart(self):
+        self.assertEqual(build_twins.build([
+            ("acl:a", "Learning Robust Representations for Language Models Part I", 2022),
+            ("oa:b", "Learning Robust Representations for Language Models Part II", 2022)]), {})
+
+    def test_version_numbers_stay_apart(self):
+        self.assertEqual(build_twins.build([
+            ("acl:a", "Scaling Neural Machine Translation Systems v2", 2022),
+            ("oa:b", "Scaling Neural Machine Translation Systems v3", 2022)]), {})
+
+    def test_fuzzy_respects_years(self):
+        self.assertEqual(build_twins.build([
+            ("acl:a", "Efficient Memory Management for Large Language Model Serving", 2020),
+            ("oa:b", "Efficient Memory Management for Large Language Model Serving Systems", 2024)]), {})
+
+    def test_surveys_of_different_topics_stay_apart(self):
+        self.assertEqual(build_twins.build([
+            ("acl:a", "A Survey of Large Language Model Agents and Planning", 2024),
+            ("oa:b", "A Survey of Large Language Model Reasoning and Planning", 2024)]), {})
+
+    def test_fuzzy_never_merges_two_arxiv(self):
+        self.assertEqual(build_twins.build([
+            ("2001.00001", "Efficient Memory Management for Large Language Model Serving", 2023),
+            ("2001.00002", "Efficient Memory Management for Large Language Model Serving Systems", 2023)]), {})
+
+    def test_transitive_chain_never_holds_two_arxiv(self):
+        got = build_twins.build([
+            ("2001.00001", "Efficient Memory Management for Large Language Model Serving", 2023),
+            ("2001.00002", "Efficient Memory Management for Large Language Model Serving Systems", 2023),
+            ("oa:W1", "Efficient Memory Management for Large Language Model Serving Systems", 2023)])
+        self.assertEqual(sum(1 for k in got if k[0].isdigit()), 1)
+        self.assertEqual(len(got), 2)
+
+    def test_group_size_is_capped(self):
+        rows = [("2001.00001", TITLE, 2024)] + [(f"oa:W{i}", TITLE, 2024) for i in range(30)]
+        got = build_twins.build(rows)
+        sizes = collections.Counter(got.values())
+        self.assertLessEqual(max(sizes.values()), build_twins.MAX_GROUP)
 
 
 class CollapseTwinsTest(unittest.TestCase):
