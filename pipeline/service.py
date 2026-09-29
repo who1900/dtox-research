@@ -20,6 +20,7 @@ import logging
 import threading
 import os
 import posixpath
+import queue
 import random
 import re
 import sqlite3
@@ -138,6 +139,14 @@ QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
 COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "papers_fulltext")
 EMBED_BATCH_URL = os.getenv("EMBED_BATCH_URL", "http://127.0.0.1:8005/embed_batch")
 EMBED_TIMEOUT = 90
+# Chunk-embedding backends, comma separated (bge-small, all serving the SAME
+# int8 model so vectors are interchangeable). Unset = the single URL above,
+# exactly as before. The first URL gets EMBED_WORKERS in-flight batches, each
+# further one EMBED_EXTRA_URL_WORKERS.
+EMBED_BATCH_URLS = ([u.strip() for u in os.getenv("EMBED_BATCH_URLS", "").split(",") if u.strip()]
+                    or [EMBED_BATCH_URL])
+EMBED_EXTRA_URL_WORKERS = int(os.getenv("EMBED_EXTRA_URL_WORKERS", "1"))
+EMBED_URL_COOLDOWN = 60   # seconds a failing URL is skipped before being retried
 UPSERT_BATCH_SIZE = 64
 # Off by default: papers_coarse (see coarse_index.py) is a separate, additive
 # article-level index for two-tier search and must never be able to hold up
@@ -2544,16 +2553,70 @@ def ensure_collection(session):
         )
 
 
-def embed_texts_batch(session, texts):
-    resp = session.post(EMBED_BATCH_URL, json={"texts": texts}, timeout=EMBED_TIMEOUT)
+def embed_texts_batch(session, texts, url=None):
+    resp = session.post(url or EMBED_BATCH_URL, json={"texts": texts}, timeout=EMBED_TIMEOUT)
     resp.raise_for_status()
     return resp.json()["vectors"]
 
 
-def _run_embed_batch(session, batch):
-    """Runs in a worker thread. batch: list of (arxiv_id, chunk_dict). Pure HTTP, no DB access."""
+_url_down_until = {}          # url -> monotonic time before which it is skipped
+_url_state_lock = threading.Lock()
+
+
+def _embed_slots(urls=None):
+    """One token per concurrent in-flight batch: EMBED_WORKERS for the first
+    URL, EMBED_EXTRA_URL_WORKERS for each other. Workers take a token, so a
+    faster backend gets its token back sooner and naturally pulls more batches."""
+    urls = urls or EMBED_BATCH_URLS
+    slots = queue.Queue()
+    for i, u in enumerate(urls):
+        for _ in range(EMBED_WORKERS if i == 0 else max(1, EMBED_EXTRA_URL_WORKERS)):
+            slots.put(u)
+    return slots
+
+
+def embed_texts_failover(session, texts, first_url, urls=None):
+    """Embed on first_url; on any failure retry on the other URLs, so a batch is
+    never dropped while at least one backend works. URLs that recently failed
+    are tried last (never skipped outright). Raises requests.RequestException
+    only when every backend failed."""
+    urls = urls or EMBED_BATCH_URLS
+    now = time.monotonic()
+    with _url_state_lock:
+        down = {u for u in urls if _url_down_until.get(u, 0) > now}
+    order = [first_url] + [u for u in urls if u != first_url]
+    order = [u for u in order if u not in down] + [u for u in order if u in down]
+    last = None
+    for u in order:
+        try:
+            vectors = embed_texts_batch(session, texts, u)
+            if len(vectors) != len(texts):
+                raise requests.RequestException(f"{u}: got {len(vectors)} vectors for {len(texts)} texts")
+        except (requests.RequestException, KeyError, ValueError) as e:
+            last = e
+            with _url_state_lock:
+                _url_down_until[u] = time.monotonic() + EMBED_URL_COOLDOWN
+            if len(urls) > 1:
+                log.warning(f"embed: {u} failed ({e}), trying next backend")
+            continue
+        with _url_state_lock:
+            _url_down_until.pop(u, None)
+        return vectors
+    raise requests.RequestException(f"all embed backends failed: {last}")
+
+
+def _run_embed_batch(session, batch, slots=None):
+    """Runs in a worker thread. batch: list of (arxiv_id, chunk_dict). Pure HTTP, no DB access.
+    With slots (a queue of backend URLs, see _embed_slots) the batch goes to the
+    backend whose slot this worker took, failing over to the others."""
     texts = [c["text"] for _, c in batch]
-    vectors = embed_texts_batch(session, texts)
+    if slots is None:
+        return batch, embed_texts_batch(session, texts)
+    url = slots.get()
+    try:
+        vectors = embed_texts_failover(session, texts, url)
+    finally:
+        slots.put(url)
     return batch, vectors
 
 
@@ -2753,8 +2816,10 @@ def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT):
     # cycle finishes. A crash mid-cycle leaves not-yet-closed-out papers at
     # 'chunked' (idempotent point ids), retried next cycle; already-closed papers
     # are already durably 'done'.
-    with ThreadPoolExecutor(max_workers=EMBED_WORKERS) as pool:
-        futures = {pool.submit(_run_embed_batch, session, b): b for b in batches}
+    slots = _embed_slots() if len(EMBED_BATCH_URLS) > 1 else None
+    n_workers = slots.qsize() if slots is not None else EMBED_WORKERS
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_run_embed_batch, session, b, slots): b for b in batches}
         for future in as_completed(futures):
             batch = futures[future]
             try:

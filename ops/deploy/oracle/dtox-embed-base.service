@@ -8,6 +8,9 @@ WorkingDirectory=/opt/dtox-embed
 Environment=HF_HOME=/opt/rerank-hf
 Environment=HF_HUB_OFFLINE=1
 Environment=EMBED_THREADS=2
+# optional bge-small engine for the chunk pipeline (/small/embed_batch); unset = off
+Environment=SMALL_MODEL_DIR=/opt/dtox-embed/small-model
+Environment=SMALL_THREADS=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/opt/rerank-venv/bin/uvicorn embed_service:app --host 127.0.0.1 --port 8090
 User=nobody
@@ -15,7 +18,9 @@ Group=nogroup
 NoNewPrivileges=true
 Restart=always
 RestartSec=5
-MemoryMax=1500M
+MemoryMax=2500M
+# if the host runs short, the kernel kills this unit, never Qdrant (it did once, 2026-09-29)
+OOMScoreAdjust=900
 
 [Install]
 WantedBy=multi-user.target
