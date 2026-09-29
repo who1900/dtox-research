@@ -137,10 +137,14 @@ def search_research_paper(
             "table" (usually benchmark numbers), "code" (listings), or
             "prose". Use this to get implementable detail instead of
             narrative text, e.g. element_type="algorithm" for pseudocode.
-        terms: Optional list of exact technical terms the paper must
-            mention, e.g. ["kv cache"], ["mev", "rollup"], ["durable
-            nonce"]. Matches an indexed vocabulary of concrete techniques
-            and protocols, so it is far more precise than semantics alone.
+        terms: Optional list of technical terms the paper must mention,
+            e.g. ["kv cache"], ["mev", "rollup"]. Matches a CLOSED indexed
+            vocabulary of concrete techniques and protocols (case, hyphens,
+            spaces and plurals do not matter: "Chain of Thoughts" finds
+            "chain-of-thought"). A term outside it (an EIP/ERC number, "pda",
+            "pbs") cannot match anything: it is listed under
+            "terms_resolution.unknown" and the search runs without it, so put
+            such identifiers in query instead.
         min_score: Relevance floor (default 0.79). Cosine scores run high
             on this index, so off-topic queries otherwise return
             confident-looking noise around 0.75; below the floor the
@@ -167,7 +171,15 @@ def search_research_paper(
         each source label seen in the results to its license and reuse
         terms. Also "count",
         "filters_applied", and on an empty result "why_empty" naming the
-        filter to relax. "scope" says whether the
+        filter to relax. "relaxed" appears when fewer than 3 results matched
+        terms / section_type / element_type / year: the search was re-run
+        without those filters, {"dropped": [...], "exact_matches": n,
+        "note"}. Results with matches_filters=false are NOT exact matches
+        (they lack the term / section / element / year you asked for): say so
+        when you cite them, and read "relaxed" as "no exact match exists".
+        Framework documentation (gh: ids) takes at most 2 of 10 places unless
+        the query names that framework ("gh_docs_capped" counts the rest).
+        "scope" says whether the
         query looks like a subject this index covers: {"in_scope": true|false|null,
         "confidence": "high"|"medium"|"low", "reason", "note"}. Results are
         never removed, so read it first: with in_scope=false the rows are

@@ -271,6 +271,17 @@ PAPER_BM25_CANDIDATES = 40
 SEARCH_EMBED_WAIT_TIMEOUT = float(os.getenv("SEARCH_EMBED_WAIT_TIMEOUT", "2"))
 SEARCH_EMBED_HTTP_TIMEOUT = float(os.getenv("SEARCH_EMBED_HTTP_TIMEOUT", "4"))
 SEARCH_QDRANT_TIMEOUT = float(os.getenv("SEARCH_QDRANT_TIMEOUT", "6"))
+# Hard facet filters (terms, section_type, element_type, year) that leave fewer
+# than AUTO_RELAX_MIN results are relaxed automatically, at most
+# AUTO_RELAX_MAX_EXTRA extra searches, and the answer says what was dropped.
+AUTO_RELAX = os.getenv("AUTO_RELAX", "1") == "1"
+AUTO_RELAX_MIN = int(os.getenv("AUTO_RELAX_MIN", "3"))
+AUTO_RELAX_MAX_EXTRA = 2
+# A framework's own documentation (gh: ids) takes at most this many places per
+# 10 requested results unless the query names that framework or project.
+GH_DOC_CAP = int(os.getenv("GH_DOC_CAP", "2"))
+# Per-stage timings of /v1/search in the log (debugging only).
+SEARCH_TIMING = os.getenv("SEARCH_TIMING", "0") == "1"
 
 
 def _fts_query(text):
@@ -1563,6 +1574,10 @@ class SearchBody(BaseModel):
     # return zero. On an empty result the query is re-run with one filter
     # dropped at a time, and the answer names the culprit. Set False to skip it.
     diagnose: bool = True
+    # too few results under terms/section_type/element_type/year: re-run with
+    # those filters dropped one at a time and say so in "relaxed". None = the
+    # AUTO_RELAX default; False gives the strict, exact-filter behaviour.
+    auto_relax: Optional[bool] = None
     # agent-facing shape: the license block is identical for every hit of one
     # source and arxiv_url repeats url, so a result list carries them once
     # (licenses, by source label) instead of per hit. Off by default: the
@@ -1618,6 +1633,178 @@ def _compact_search(full):
     return out
 
 
+# ---------------------------------------------------------------------------
+# terms: closed vocabulary, normalised matching
+# ---------------------------------------------------------------------------
+# The "terms" payload field holds the harvest gate's own vocabulary (pipeline/
+# niche_filter.py), stored as written there ("chain-of-thought" AND "chain of
+# thought" are separate entries). A caller's "EIP-4844" or "Chain of Thoughts"
+# never equals a stored string, so an exact match returned zero silently. Terms
+# are compared by a key that ignores case, hyphens, spaces and a plural "s",
+# and one caller term expands to every stored spelling with that key.
+_TERM_VOCAB = None
+
+
+def _term_key(term):
+    words = re.findall(r"[a-z0-9+#]+", str(term).lower())
+    words = [w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w
+             for w in words]
+    return "".join(words)
+
+
+def _term_vocab():
+    global _TERM_VOCAB
+    if _TERM_VOCAB is None:
+        vocab = {}
+        if _NICHE is not None:
+            for group in (getattr(_NICHE, "BROAD_TERMS", {}), getattr(_NICHE, "SPECIFIC_TERMS", {})):
+                for names in group.values():
+                    for name in names:
+                        vocab.setdefault(_term_key(name), set()).add(name)
+        _TERM_VOCAB = vocab
+    return _TERM_VOCAB
+
+
+def _resolve_terms(raw_terms):
+    """(stored spellings to filter on, caller terms not in the vocabulary).
+    Without a loadable vocabulary the terms pass through lower-cased."""
+    cleaned = [t.strip() for t in (raw_terms or []) if isinstance(t, str) and t.strip()]
+    vocab = _term_vocab()
+    if not vocab:
+        return [t.lower() for t in cleaned], []
+    known, unknown = set(), []
+    for t in cleaned:
+        hit = vocab.get(_term_key(t))
+        if hit:
+            known |= hit
+        elif t not in unknown:
+            unknown.append(t)
+    return sorted(known), unknown
+
+
+# ---------------------------------------------------------------------------
+# gh: documentation must not crowd out papers
+# ---------------------------------------------------------------------------
+# Words by which a query names the project behind each gh:<source> manifest key
+# (pipeline GITHUB_DOC_SOURCES). Unlisted keys fall back to their key's words.
+GH_SOURCE_ALIASES = {
+    "eth-consensus": r"consensus[- ]specs?|beacon|casper|gasper|pyspec|consensus layer",
+    "eth-execution": r"execution[- ]specs?|execution layer|pyspec",
+    "op-specs": r"optimism|op[- ]stack|op[- ]specs?|bedrock|superchain",
+    "nitro": r"nitro|arbitrum",
+    "wormhole": r"wormhole",
+    "hyperlane": r"hyperlane",
+    "sp1": r"sp1|succinct",
+    "risc0": r"risc0|risc[- ]zero",
+    "halo2": r"halo2",
+    "anchor": r"anchor",
+    "solana-docs": r"solana|spl|sealevel",
+    "agave-svm": r"agave|svm|sealevel",
+    "jupiter": r"jupiter|jup",
+    "meteora": r"meteora|dlmm",
+    "orca-whirlpools": r"orca|whirlpools?",
+    "marinade": r"marinade|msol",
+    "jito-stakenet": r"jito|stakenet",
+    "uniswap": r"uniswap",
+    "lido": r"lido|steth",
+    "compound-comet": r"compound|comet",
+    "gmx-synthetics": r"gmx",
+}
+_GH_GENERIC_WORDS = {"docs", "doc", "specs", "spec", "com", "svm", "monorepo"}
+
+
+def _gh_source_key(paper_id):
+    parts = str(paper_id or "").split(":")
+    return parts[1] if len(parts) > 2 and parts[0] == "gh" else None
+
+
+def _query_names_gh_source(query, key):
+    pattern = GH_SOURCE_ALIASES.get(key)
+    if pattern is None:
+        words = [w for w in re.split(r"[^a-z0-9]+", str(key).lower())
+                 if w and w not in _GH_GENERIC_WORDS]
+        if not words:
+            return True
+        pattern = "|".join(re.escape(w) for w in words)
+    return re.search(r"(?<![a-z0-9])(?:" + pattern + r")(?![a-z0-9])", query.lower()) is not None
+
+
+def _cap_gh_docs(results, query, limit):
+    """Drop gh: documents beyond GH_DOC_CAP per 10 requested places, keeping
+    the ones whose project the query names. Returns (results, dropped count).
+    Framework docs are dense, uniform and always "on topic" for an
+    implementation question, so unchecked they fill the top ten."""
+    if GH_DOC_CAP <= 0 or not any(_gh_source_key(r.get("arxiv_id")) for r in results):
+        return results, 0
+    cap = GH_DOC_CAP * max(1, -(-limit // 10))
+    kept, seen, dropped = [], 0, 0
+    for r in results:
+        key = _gh_source_key(r.get("arxiv_id"))
+        if key and not _query_names_gh_source(query, key):
+            seen += 1
+            if seen > cap:
+                dropped += 1
+                continue
+        kept.append(r)
+    return kept, dropped
+
+
+# ---------------------------------------------------------------------------
+# auto-relaxing hard filters
+# ---------------------------------------------------------------------------
+_RELAX_FIELDS = {"terms": ("terms",), "section_type": ("section_type",),
+                 "element_type": ("element_type",), "year": ("year_from", "year_to")}
+
+
+def _describe_filters(body, names, terms):
+    parts = []
+    for n in names:
+        if n == "terms":
+            parts.append(f"terms={list(body.terms or terms)}")
+        elif n == "year":
+            parts.append("year=" + "-".join(str(v) if v is not None else "" for v in
+                                             (body.year_from, body.year_to)))
+        else:
+            parts.append(f"{n}={getattr(body, n)!r}")
+    return ", ".join(parts)
+
+
+def _auto_relax(body, payload, results, active, terms, limit, x_api_key):
+    """Too few results under hard filters: re-run with the filters dropped
+    (first the first one, then all of them; two extra searches at most) and
+    fill up with what comes back. Exact matches stay first; extras carry
+    matches_filters=False. Mutates `payload` (a fresh dict, never the cache's)."""
+    plans = [active[:1]]
+    if len(active) > 1:
+        plans.append(list(active))
+    for dropped in plans[:AUTO_RELAX_MAX_EXTRA]:
+        update = {"auto_relax": False, "diagnose": False, "compact": False, "limit": limit}
+        for n in dropped:
+            update.update({f: None for f in _RELAX_FIELDS[n]})
+        try:
+            got = _run_search(body.model_copy(update=update), x_api_key).get("results", [])
+        except HTTPException:
+            continue
+        have = {canonical_id(r["arxiv_id"]) for r in results}
+        extras = [dict(r, matches_filters=False) for r in got
+                  if canonical_id(r["arxiv_id"]) not in have]
+        if not extras:
+            continue
+        exact = [dict(r, matches_filters=True) for r in results]
+        merged = (exact + extras)[:limit]
+        what = _describe_filters(body, dropped, terms)
+        n_exact = len(exact)
+        which = "that filter" if len(dropped) == 1 else "those filters"
+        note = (f"No result matched {what}; showing results without {which}"
+                if not n_exact else
+                f"Only {n_exact} result{'s' if n_exact != 1 else ''} matched {what}; the rest "
+                f"(matches_filters=false) come from a search without {which}")
+        payload["results"] = merged
+        payload["count"] = len(merged)
+        payload["relaxed"] = {"dropped": list(dropped), "exact_matches": n_exact, "note": note}
+        return
+
+
 def _run_search(body: SearchBody, x_api_key=None,
                 dense_timeout=SEARCH_QDRANT_TIMEOUT,
                 embed_wait_timeout=SEARCH_EMBED_WAIT_TIMEOUT,
@@ -1644,10 +1831,12 @@ def _run_search(body: SearchBody, x_api_key=None,
         raise HTTPException(status_code=400, detail=f"layer must be one of {sorted(ALLOWED_LAYERS)}")
     limit = min(max(body.limit, 1), 50)
 
-    terms = [t.strip().lower() for t in (body.terms or []) if t and t.strip()]
+    terms, unknown_terms = _resolve_terms(body.terms)
+    relax_on = AUTO_RELAX if body.auto_relax is None else bool(body.auto_relax)
+    tm = {"t0": time.monotonic()} if SEARCH_TIMING else None
     cache_key = (query, body.layer, body.section_type, body.element_type,
-                 tuple(sorted(terms)), body.dedupe, body.min_score,
-                 body.year_from, body.year_to, limit, body.hybrid)
+                 tuple(sorted(terms)), tuple(unknown_terms), body.dedupe, body.min_score,
+                 body.year_from, body.year_to, limit, body.hybrid, relax_on)
     cached = search_cache.get(cache_key)
     if cached is not None:
         return cached
@@ -1695,6 +1884,8 @@ def _run_search(body: SearchBody, x_api_key=None,
     try:
         vector = embed_query(query, wait_timeout=embed_wait_timeout,
                              request_timeout=embed_http_timeout)
+        if tm is not None:
+            tm["embed"] = time.monotonic()
         layers = sorted(ALLOWED_LAYERS) if not body.layer else None
         if HIER_SEARCH:
             hits, leftover_pool, dense_partial, hier_extra = _hier_run(
@@ -1705,6 +1896,8 @@ def _run_search(body: SearchBody, x_api_key=None,
                 vector, qfilter, dense_limit, limit, dense_timeout, layers=layers)
     except HTTPException as error:
         dense_error = error
+    if tm is not None:
+        tm["dense"] = time.monotonic()
     # True only when hier search was on AND actually produced its result (not
     # the stage A/B fallback to the old single-tier path).
     hier_used = bool(HIER_SEARCH and hier_extra is not None)
@@ -1764,6 +1957,8 @@ def _run_search(body: SearchBody, x_api_key=None,
             lexical_skipped = True
             lexical_channel = "skipped"
 
+    if tm is not None:
+        tm["lexical"] = time.monotonic()
     if dense_error and not lexical:
         raise dense_error
 
@@ -1900,8 +2095,11 @@ def _run_search(body: SearchBody, x_api_key=None,
     if hier_extra and hier_extra.get("graph_quota"):
         results = _inject_graph_quota(results, hier_extra, floor, lex_exempt_ids, limit)
 
+    if tm is not None:
+        tm["fusion"] = time.monotonic()
     if body.dedupe:
         results = _collapse_twins(results)
+    results, gh_capped = _cap_gh_docs(results, query, limit)
     facts = _paper_facts([r["arxiv_id"] for r in results])
     for r in results:
         r["niche_score"] = facts.get(r["arxiv_id"])
@@ -1941,22 +2139,65 @@ def _run_search(body: SearchBody, x_api_key=None,
                                  ("min_score", body.min_score)) if v is not None}
     if applied:
         payload["filters_applied"] = applied
+    if gh_capped:
+        payload["gh_docs_capped"] = gh_capped
+    if unknown_terms:
+        payload["terms_resolution"] = {
+            "unknown": unknown_terms, "matched": terms,
+            "note": ("terms is a closed vocabulary of technical terms (see the terms field "
+                     "of results); not in it: " + ", ".join(unknown_terms) + ". "
+                     + ("Searched with the recognised terms only." if terms else
+                        "Searched without the terms filter; put such identifiers in the query text."))}
+    tried_relax = False
+    if (relax_on and not dense_error and len(results) < AUTO_RELAX_MIN
+            and not payload.get("partial")):
+        active = [n for n, on in (("terms", bool(terms)), ("section_type", bool(body.section_type)),
+                                  ("element_type", bool(body.element_type)),
+                                  ("year", body.year_from is not None or body.year_to is not None)) if on]
+        if active:
+            tried_relax = True
+            if tm is not None:
+                tm["pre_relax"] = time.monotonic()
+            _auto_relax(body, payload, results, active, terms, limit, x_api_key)
+            results = payload["results"]
     if not results and applied and body.diagnose and not dense_error:
+        # after a relax attempt every relaxable filter is already known not to
+        # be the culprit; only layer / min_score are left to blame
+        names = [n for n in applied if not (tried_relax and n in
+                 ("terms", "section_type", "element_type", "year_from", "year_to"))]
         relaxations = []
-        for name in applied:
-            probe = body.model_copy(update={name: None, "diagnose": False, "limit": 3})
+
+        def _probe(name):
+            probe = body.model_copy(update={name: None, "diagnose": False, "limit": 3,
+                                            "auto_relax": False})
             try:
                 got = _run_search(probe, x_api_key).get("results", [])
             except HTTPException:
-                continue
-            if got:
-                relaxations.append({"drop": name, "would_return": len(got),
-                                    "example": got[0]["title"][:80]})
+                return None
+            return ({"drop": name, "would_return": len(got), "example": got[0]["title"][:80]}
+                    if got else None)
+
+        if names:
+            with ThreadPoolExecutor(max_workers=len(names)) as pool:
+                relaxations = [r for r in pool.map(_probe, names) if r]
         payload["why_empty"] = (
             {"relax_one_of": relaxations} if relaxations else
             {"relax_one_of": [], "note": "no single filter explains it: the query itself "
                                          "has no match above the relevance floor"})
-    if not dense_error and not dense_partial:
+    if tm is not None:
+        end = time.monotonic()
+        prev, parts = tm["t0"], []
+        for m in ("embed", "dense", "lexical", "fusion", "pre_relax"):
+            if m in tm:
+                parts.append(f"{m}={tm[m] - prev:.2f}")
+                prev = tm[m]
+        parts.append(f"tail={end - prev:.2f}")
+        log.warning("search_timing total=%.2f %s q=%r n=%d", end - tm["t0"], " ".join(parts),
+                 query[:60], len(payload["results"]))
+    # a hier search that silently fell back to the old path (coarse stage
+    # hiccup under load) is a degraded answer: caching it pinned the worse
+    # ranking for the whole TTL
+    if not dense_error and not dense_partial and (hier_used or not HIER_SEARCH):
         search_cache.set(cache_key, payload)
     return payload
 
@@ -4097,7 +4338,8 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
         # A paper that also matches in its own method section deserves to be
         # represented by that section instead of by its opening paragraph.
         b = SearchBody(query=query, layer=body.layer, limit=min(50, limit * 3),
-                       min_score=0.60, dedupe=False, diagnose=False, **extra)
+                       min_score=0.60, dedupe=False, diagnose=False,
+                       auto_relax=False, **extra)
         hits = _scored_results_for_audit(
             _run_search(b, x_api_key, dense_timeout=audit_qdrant_timeout,
                         embed_wait_timeout=audit_embed_wait,
@@ -4920,16 +5162,31 @@ def _outline(payloads):
     return [sections[t] for t in order]
 
 
-def _neighbours(sql, paper_id):
+# Ranked in SQL: a landmark paper has thousands of neighbours, and hydrating
+# every one of them (abstracts included) just to keep the top 25 took 18 s.
+# CROSS JOIN pins the order (citations by index, then papers by key); left to
+# itself the planner scans every finished paper first (31 s).
+_NEIGHBOUR_SQL = {
+    "cites": ("SELECT p.arxiv_id, p.title, p.year, p.citation_count, COUNT(*) OVER() "
+              "FROM citations c CROSS JOIN papers p ON p.arxiv_id = c.dst "
+              "WHERE c.src = ? AND p.status = 'done' "
+              "ORDER BY COALESCE(p.citation_count, 0) DESC LIMIT ?"),
+    "cited_by": ("SELECT p.arxiv_id, p.title, p.year, p.citation_count, COUNT(*) OVER() "
+                 "FROM citations c CROSS JOIN papers p ON p.arxiv_id = c.src "
+                 "WHERE c.dst = ? AND p.status = 'done' "
+                 "ORDER BY COALESCE(p.citation_count, 0) DESC LIMIT ?"),
+}
+
+
+def _neighbours(direction, paper_id):
     try:
-        ids = [r[0] for r in _ro_conn(STATE_DB_PATH).execute(sql, (paper_id,)).fetchall()]
+        rows = _ro_conn(STATE_DB_PATH).execute(
+            _NEIGHBOUR_SQL[direction], (paper_id, NEIGHBOUR_LIMIT)).fetchall()
     except sqlite3.Error:
         _ro_conn_drop(STATE_DB_PATH)
         return [], 0
-    rows = _paper_rows(ids)
-    ranked = sorted(rows.values(), key=lambda r: -(r.get("citation_count") or 0))
-    return ([{"id": r["arxiv_id"], "title": r["title"], "year": r["year"],
-              "citation_count": r["citation_count"]} for r in ranked[:NEIGHBOUR_LIMIT]], len(rows))
+    return ([{"id": r[0], "title": r[1], "year": r[2], "citation_count": r[3]} for r in rows],
+            rows[0][4] if rows else 0)
 
 
 # ---- counts and neighbours --------------------------------------------------
@@ -5166,8 +5423,8 @@ def paper_card(paper_id: str, x_api_key: Optional[str] = Header(default=None)):
     # the scroll and both citation lookups are independent; run them together
     with ThreadPoolExecutor(max_workers=3) as pool:
         f_points = pool.submit(outline_points)
-        f_cites = pool.submit(_neighbours, "SELECT dst FROM citations WHERE src=?", paper_id)
-        f_cited = pool.submit(_neighbours, "SELECT src FROM citations WHERE dst=?", paper_id)
+        f_cites = pool.submit(_neighbours, "cites", paper_id)
+        f_cited = pool.submit(_neighbours, "cited_by", paper_id)
         points = f_points.result()
         card["cites"], card["cites_in_corpus"] = f_cites.result()
         card["cited_by"], card["cited_by_in_corpus"] = f_cited.result()

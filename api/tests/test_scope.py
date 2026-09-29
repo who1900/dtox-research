@@ -90,7 +90,8 @@ class ScopeInEndpointsTest(unittest.TestCase):
     def test_real_search_cache_still_serves_second_call(self):
         body = main.SearchBody(query="AlphaFold")
         cached = {"results": [{"arxiv_id": "x"}], "count": 1, "usage": "u"}
-        key = ("AlphaFold", None, None, None, (), True, None, None, None, 8, True)
+        key = ("AlphaFold", None, None, None, (), (), True, None, None, None, 8, True,
+               main.AUTO_RELAX)
         main.search_cache.set(key, cached)
         with patch.object(main, "auth_and_limit"), \
              patch.object(main, "_scope_dense_probe", return_value=None):
