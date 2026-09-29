@@ -165,11 +165,40 @@ BROAD_WEIGHT = 1
 SPECIFIC_WEIGHT = 5
 
 
+# Terms whose lowercase or title-case form means something else, matched only
+# in the spellings listed (case-sensitive, same boundaries as the rest). The
+# matched term is still reported under its normal name, so stored
+# matched_terms keep their shape. "MeV photons" (mega-electron-volts, particle
+# physics) admitted a paper to web3 through "mev"; "Eagle" and "Yarn" are
+# spinning and simulation papers, "stark" an adjective. "rust" was tried and
+# dropped: lowercase "rust" is real in Solana SIMDs and repo docs (3 of the 6
+# papers it would have orphaned were on topic).
+# Add a term here only after checking its lowercase hits by hand: "llm" and
+# "rag" are deliberately NOT listed where lowercase use is genuine.
+CASE_SENSITIVE_TERMS = {
+    "mev": ("MEV",),
+    "moe": ("MoE", "MOE"),
+    "stark": ("STARK",),
+    "eagle": ("EAGLE",),
+    "yarn": ("YaRN", "YARN"),
+    "dora": ("DoRA", "DORA"),
+    "kto": ("KTO",),
+    "snark": ("SNARK",),
+    "wormhole": ("Wormhole",),
+    "swift": ("Swift", "SWIFT"),
+}
+
+
 def _compile_group(terms_dict):
     compiled = {}
     for layer, terms in terms_dict.items():
         entries = []
         for term in terms:
+            forms = CASE_SENSITIVE_TERMS.get(term)
+            if forms:
+                alt = "|".join(re.escape(f) for f in forms)
+                entries.append((term, re.compile(r"(?<!\w)(?:" + alt + r")s?(?!\w)")))
+                continue
             # \b works fine around internal hyphens/spaces; term is escaped
             # so literal regex metachars in any future term stay literal.
             # Trailing "s?" tolerates plurals ("LLM agent" vs "LLM agents",

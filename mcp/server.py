@@ -167,7 +167,16 @@ def search_research_paper(
         each source label seen in the results to its license and reuse
         terms. Also "count",
         "filters_applied", and on an empty result "why_empty" naming the
-        filter to relax.
+        filter to relax. "scope" says whether the
+        query looks like a subject this index covers: {"in_scope": true|false|null,
+        "confidence": "high"|"medium"|"low", "reason", "note"}. Results are
+        never removed, so read it first: with in_scope=false the rows are
+        only the nearest neighbours of an uncovered subject (the index
+        covers web3, AI agents, LLMs and developer tooling), not literature
+        on it; say so instead of presenting them as an answer. in_scope=true
+        with confidence "low" means no indexed-topic term was recognised in
+        the query, so judge relevance from the titles; in_scope=null means few
+        close papers (a thin shelf or an uncovered subject), so check before relying.
     """
     body = {"query": query, "limit": limit, "compact": True}
     if layer:
@@ -231,6 +240,16 @@ def find_papers(
         cited_by_pool for sort="foundational"}. Pass an id to get_paper to
         read further. Copies of the same paper from other sources are listed
         under "twins".
+        Also "scope": whether the
+        query looks like a subject this index covers: {"in_scope": true|false|null,
+        "confidence": "high"|"medium"|"low", "reason", "note"}. Results are
+        never removed, so read it first: with in_scope=false the rows are
+        only the nearest neighbours of an uncovered subject (the index
+        covers web3, AI agents, LLMs and developer tooling), not literature
+        on it; say so instead of presenting them as an answer. in_scope=true
+        with confidence "low" means no indexed-topic term was recognised in
+        the query, so judge relevance from the titles; in_scope=null means few
+        close papers (a thin shelf or an uncovered subject), so check before relying.
     """
     body = {"query": query, "sort": sort, "limit": limit}
     if layer:
@@ -346,6 +365,10 @@ def count_papers(
         top_terms (25, each {term, papers}), and with a query top_papers
         (5 cards). "sampled" appears if terms were counted over a sample.
         Copies of one paper count once.
+        With a query also "scope" (as in find_papers): in_scope=false means
+        the counts describe the nearest neighbours of a subject the index
+        does not cover, so a large total there is not evidence of coverage.
+        "counted_over" says what the counts were taken over.
     """
     body = {}
     if query:

@@ -220,7 +220,7 @@ class FacetsTest(unittest.TestCase):
         rank.assert_called_once_with("prompt injection", None, None, None, main.FACET_POOL)
         self.assertEqual(seen["ids"], list(ROWS))
         self.assertEqual([p["id"] for p in out["top_papers"]], list(ROWS))
-        self.assertEqual(out["scope"], "every paper the query reached")
+        self.assertEqual(out["counted_over"], "every paper the query reached")
 
     def test_terms_are_sampled_when_the_filter_is_huge(self):
         with patch.object(main, "FACET_TERMS_SAMPLE", 2):

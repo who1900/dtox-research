@@ -1440,7 +1440,9 @@ def auth_and_limit(x_api_key: Optional[str], cost: str = "search"):
 @app.post("/v1/search")
 def search(body: SearchBody, x_api_key: Optional[str] = Header(default=None)):
     auth_and_limit(x_api_key)
-    return _run_search(body, x_api_key)
+    payload = _run_search(body, x_api_key)
+    # a copy: `payload` may be the cached object, and scope has its own cache
+    return {**payload, "scope": _query_scope(body.query)}
 
 
 def _compact_search(full):
@@ -2495,7 +2497,8 @@ INDEX_SCOPE_ANCHORS = re.compile(
     r"transformer|kv[ -]?cache|retrieval[ -]?augmented|rag|ai agent|llm agent|"
     r"agentic|autonomous agent|multi[ -]?agent|blockchain|web3|smart contract|"
     r"zero[ -]?knowledge|zk[ -]?(?:proof|rollup|snark|stark)|rollup|solana|"
-    r"ethereum|defi|mev|cryptograph\w*|consensus|validator|wallet)\b", re.I)
+    r"ethereum|defi|(?-i:MEVs?)|maximal extractable|cryptograph\w*|consensus|validator|"
+    r"wallet)\b", re.I)
 FOREIGN_SCOPE_DOMAINS = {
     "biomedicine": re.compile(
         r"\b(?:crispr|gene[ -]?edit\w*|genome[ -]?edit\w*|hepatocyte\w*|"
@@ -2517,6 +2520,151 @@ def _foreign_scope_domain(text):
         if pattern.search(text or ""):
             return domain
     return None
+
+
+# ---------------- query-level scope signal (search / papers / facets) ----------------
+#
+# /v1/validate refuses out-of-index ideas, but /v1/search, /v1/papers and
+# /v1/facets used to answer "CRISPR" or "AlphaFold" with the same confident
+# rows as "MEV": the corpus always has a nearest neighbour, and cosine cannot
+# say that the neighbour is beside the point. Results are never removed here
+# (the agent decides); the response only says whether the query looks like a
+# subject the index covers. Cheap rules first, one small vector probe last.
+
+SCOPE_NOTE = ("the index covers web3, AI agents, LLMs and developer tooling; "
+              "this query looks outside it. Treat the results below as nearest "
+              "neighbours, not as literature on the subject.")
+
+# Foreign domains beyond validate's list. Only the scope signal uses them: the
+# audit gate stays as strict as it was, this one is allowed to be broader
+# because it does not refuse anything.
+SCOPE_FOREIGN_EXTRA = {
+    "biology": re.compile(
+        r"\b(?:alphafold|protein (?:structure|folding)|cancer|tumou?r\w*|"
+        r"immunotherap\w*|genom\w*|dna sequenc\w*|neuroscien\w*)\b", re.I),
+    "physics": re.compile(
+        r"\b(?:dark matter|dark energy|photons?|gamma[- ]rays?|neutrinos?|quarks?|"
+        r"particle physics|astrophysic\w*|cosmolog\w*|galax(?:y|ies)|"
+        r"black holes?|gravitational waves?|quantum (?:computing|field))\b", re.I),
+    "sports": re.compile(
+        r"\b(?:foot?ball|soccer|basketball|tennis|baseball|cricket|olympic\w*)\b", re.I),
+    "food": re.compile(
+        r"\b(?:sourdough|bread|recipes?|baking|cooking|cuisine|cake)\b", re.I),
+}
+
+# Below this mean cosine of the five nearest papers the corpus has nothing near
+# the query at all (measured on the coarse index: sourdough 0.52, football
+# 0.57, "footbal tactics" 0.62, cake 0.58; real topics sit at 0.66-0.80).
+SCOPE_DENSE_FLOOR = float(os.getenv("SCOPE_DENSE_FLOOR", "0.63"))
+SCOPE_PROBE_K = 5
+_scope_cache = TTLCache(ttl_seconds=600, max_size=1000)
+
+
+def _load_niche_filter():
+    """The harvest gate's vocabulary is the index's own definition of its
+    topics. Loaded by path (the API is deployed without the pipeline package):
+    next to this file first, then the repo's pipeline dir, then the live one."""
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    for d in (here, os.path.join(here, "..", "pipeline"), "/opt/dtox-research"):
+        path = os.path.join(d, "niche_filter.py")
+        if not os.path.isfile(path):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location("dtox_niche_filter", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+        except Exception:
+            log.warning("niche_filter at %s could not be loaded", path)
+    return None
+
+
+_NICHE = _load_niche_filter()
+
+
+def _query_names_indexed_topic(query):
+    """(True, [terms]) when the query itself contains a term the harvest gate
+    treats as on-topic, judged the way the gate judges paper text (case-aware
+    for abbreviations, so "MEV" counts and "MeV photons" does not)."""
+    if INDEX_SCOPE_ANCHORS.search(query):
+        return True, []
+    if _NICHE is None:
+        return False, []
+    try:
+        scores = _NICHE.niche_score(query)
+        layers = _NICHE.admitted_layers(scores)
+    except Exception:
+        return False, []
+    terms = sorted({t for l in layers for t in scores[l]["matched_terms"]})
+    return bool(layers), terms
+
+
+def _scope_dense_probe(query):
+    """Mean cosine of the nearest papers in the paper-level index, or None when
+    it cannot be measured. Shares the coarse embedding and the Qdrant result
+    caches with the search that normally ran a moment earlier."""
+    if not (COARSE_EMBED_URL and HIER_SEARCH):
+        return None
+    try:
+        vector = embed_query_coarse(query)
+        hits = qdrant_search(vector, None, 60, timeout=SEARCH_QDRANT_TIMEOUT,
+                             with_payload=True, collection=COARSE_COLLECTION)
+    except (HTTPException, requests.RequestException):
+        return None
+    scores = sorted((h.get("score") or 0 for h in hits), reverse=True)[:SCOPE_PROBE_K]
+    return sum(scores) / len(scores) if scores else None
+
+
+def _scope_out(in_scope, confidence, reason, **extra):
+    note = (None if in_scope else SCOPE_NOTE if in_scope is False else
+            "Coverage looks thin for this query: check the results before relying on them.")
+    out = {"in_scope": in_scope, "confidence": confidence, "reason": reason, "note": note}
+    out.update(extra)
+    return out
+
+
+def _query_scope(query):
+    """{"in_scope", "confidence", "reason", "note"} for one query. Rules in
+    order: an explicit foreign domain with no index anchor is out; a term the
+    index is built around is in; otherwise the nearest papers can only say
+    "in" or "uncertain" (in_scope None), and a query that cannot be measured
+    is assumed in scope rather than flagged."""
+    query = (query or "").strip()
+    cached = _scope_cache.get(query)
+    if cached is not None:
+        return dict(cached)
+    named, terms = _query_names_indexed_topic(query)
+    domain = None
+    if not named:
+        domain = _foreign_scope_domain(query)
+        if domain is None:
+            for name, pattern in SCOPE_FOREIGN_EXTRA.items():
+                if pattern.search(query):
+                    domain = name
+                    break
+    if named:
+        out = _scope_out(True, "high", "query names an indexed topic",
+                         **({"matched_terms": terms[:5]} if terms else {}))
+    elif domain:
+        out = _scope_out(False, "high", f"query is about {domain}, which the index does not cover")
+    else:
+        mean = _scope_dense_probe(query)
+        if mean is None:
+            out = _scope_out(True, "low", "not measured")
+        elif mean < SCOPE_DENSE_FLOOR:
+            # uncertain, never "out": "token vesting schedules" and "parimutuel
+            # market oracle" fall under this floor and are web3, while "football
+            # tactics" sat 0.01 below it; only a named foreign domain says out
+            out = _scope_out(None, "low",
+                             "few close papers; the topic may be thin here or outside the index",
+                             nearest_similarity=round(mean, 3))
+        else:
+            out = _scope_out(True, "low",
+                             "no indexed-topic term in the query, but close papers exist",
+                             nearest_similarity=round(mean, 3))
+    _scope_cache.set(query, out)
+    return dict(out)
 
 
 def _topic_coverage(text, layer=None, strict=False, probe_limit=None,
@@ -4539,7 +4687,7 @@ def find_papers(body: PapersBody, x_api_key: Optional[str] = Header(default=None
             card["cited_by_pool"] = row["cited_by_pool"]
         papers.append(card)
     out = {"papers": papers, "count": len(papers), "sort": body.sort,
-           "pool": len(pool), "usage": USAGE_NOTICE}
+           "pool": len(pool), "scope": _query_scope(body.query), "usage": USAGE_NOTICE}
     if dense_error:
         out["partial"] = True
         out["note"] = f"paper index unavailable ({dense_error}); ranked by title/abstract terms only"
@@ -4693,14 +4841,17 @@ def paper_facets(body: FacetsBody, x_api_key: Optional[str] = Header(default=Non
                                          FACET_POOL)
         rows = _facet_source(body, [r["arxiv_id"] for r in pool])
         top = [_paper_card(r) for r in pool[:5]]
-        out["scope"] = (f"the {FACET_POOL} papers most relevant to the query"
-                        if len(pool) >= FACET_POOL else "every paper the query reached")
+        out["counted_over"] = (f"the {FACET_POOL} papers most relevant to the query"
+                               if len(pool) >= FACET_POOL else "every paper the query reached")
+        out["scope"] = _query_scope(body.query)
         if dense_error:
             out["partial"] = True
             out["note"] = f"paper index unavailable ({dense_error}); ranked by title/abstract terms only"
     else:
         rows = _facet_source(body, None)
-        out["scope"] = "every paper in the filter"
+        out["counted_over"] = "every paper in the filter"
+        out["scope"] = {"in_scope": True, "confidence": "high",
+                        "reason": "no query: counts cover the index itself", "note": None}
     seen, years, layers, venues, kept = set(), {}, {}, {}, []
     for pid, year, venue, layer_csv, raw in rows:
         head = canonical_id(pid)
