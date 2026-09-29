@@ -538,6 +538,7 @@ def main():
     ap.add_argument("--mcp", default=MCP_URL)
     ap.add_argument("--refetch", action="store_true",
                     help="with --rejudge: re-run read-only tool calls of legacy traces to recover full id sets")
+    ap.add_argument("--questions-from", help="reuse the questions of this results file instead of generating")
     ap.add_argument("--rejudge", help="reuse agent traces from this results file, only re-run the judge")
     a = ap.parse_args()
 
@@ -572,10 +573,16 @@ def main():
             results = list(ex.map(rj, old))
         finish(a, llm, results, t_start, out_path, a.rejudge)
         return
-    try:
-        qs = gen_questions(llm, a.n, a.seed)
-    except Exception as e:
-        sys.exit(f"question generation failed: {e}")
+    if a.questions_from:
+        # same questions as an earlier run, so two builds are compared on equal terms
+        src = json.loads(Path(a.questions_from).read_text(encoding="utf-8"))
+        qs = src.get("questions") or [{k: r[k] for k in ("id", "type", "topic", "question") if k in r}
+                                      for r in src.get("results", [])]
+    else:
+        try:
+            qs = gen_questions(llm, a.n, a.seed)
+        except Exception as e:
+            sys.exit(f"question generation failed: {e}")
     for q in qs:
         print(f"  Q{q['id']} [{q['type']}] {q['question']}")
     if a.dry:
