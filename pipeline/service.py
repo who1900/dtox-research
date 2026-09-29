@@ -2799,9 +2799,15 @@ def _sync_paper_fts(arxiv_ids):
 
 
 def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT):
+    # Specs and docs first, oldest first after that: they are short, and while
+    # thousands of reprocessed 300-chunk papers queued ahead of them, Geyser,
+    # RISC Zero and Aave v3 sat unsearchable for a day
     rows = conn.execute(
         "SELECT arxiv_id, title, year, layers, citation_count, venue, niche_score, matched_terms, "
-        "source_url FROM papers WHERE status='chunked' LIMIT ?",
+        "source_url FROM papers WHERE status='chunked' "
+        "ORDER BY CASE WHEN substr(arxiv_id, 1, 3) IN ('gh:', 'wp:') "
+        "OR substr(arxiv_id, 1, 4) = 'eip:' OR substr(arxiv_id, 1, 5) = 'simd:' THEN 0 ELSE 1 END, "
+        "updated_at LIMIT ?",
         (limit,),
     ).fetchall()
     if not rows:
