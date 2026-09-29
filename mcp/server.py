@@ -862,4 +862,8 @@ def validate_project(
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    import uvicorn
+    from utf8_guard import Utf8Guard
+
+    uvicorn.run(Utf8Guard(mcp.streamable_http_app()), host=MCP_HOST, port=MCP_PORT,
+                log_level="info")
