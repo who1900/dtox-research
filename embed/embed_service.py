@@ -70,6 +70,10 @@ SMALL_MODEL_DIR = os.getenv("SMALL_MODEL_DIR", "")
 SMALL_MODEL_FILE = os.getenv("SMALL_MODEL_FILE", "model_int8.onnx")
 SMALL_THREADS = int(os.getenv("SMALL_THREADS", "1"))
 SMALL_MAX_LEN = int(os.getenv("SMALL_MAX_LEN", "512"))
+# 32 chunks of 512 tokens held ~2.5 GB of activations in the ORT arena, which
+# sat at the unit's memory cap beside an 8.8 GB Qdrant on a 12 GB host. Eight
+# at a time and no arena keeps the peak small and gives it back after a batch.
+SMALL_SUB_BATCH = int(os.getenv("SMALL_SUB_BATCH", "8"))
 _small = None
 _small_lock = threading.Lock()
 
@@ -80,6 +84,8 @@ if SMALL_MODEL_DIR:
     _sopts = ort.SessionOptions()
     _sopts.intra_op_num_threads = SMALL_THREADS
     _sopts.inter_op_num_threads = 1
+    _sopts.enable_cpu_mem_arena = False
+    _sopts.enable_mem_pattern = False
     _small = ort.InferenceSession(os.path.join(SMALL_MODEL_DIR, SMALL_MODEL_FILE), _sopts,
                                   providers=["CPUExecutionProvider"])
     _snames = {i.name for i in _small.get_inputs()}
@@ -90,8 +96,8 @@ def encode_small(texts, query=False):
     if query:
         texts = [QUERY_INSTRUCTION + t for t in texts]
     out = []
-    for i in range(0, len(texts), 32):
-        enc = _stok.encode_batch(texts[i:i + 32])
+    for i in range(0, len(texts), SMALL_SUB_BATCH):
+        enc = _stok.encode_batch(texts[i:i + SMALL_SUB_BATCH])
         feed = {"input_ids": np.array([e.ids for e in enc], dtype=np.int64),
                 "attention_mask": np.array([e.attention_mask for e in enc], dtype=np.int64)}
         if "token_type_ids" in _snames:
