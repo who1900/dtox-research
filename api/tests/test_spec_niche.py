@@ -67,5 +67,63 @@ class SpecsAreAlwaysWeb3Tests(unittest.TestCase):
         self.assertEqual(self._row(conn, "2401.99999")["status"], "off_niche")
 
 
+class GithubDocsNicheTests(unittest.TestCase):
+    ABSTRACT = "How durable nonces work for offline signing and delayed transaction submission."
+
+    def _row(self, conn, pid):
+        return conn.execute("SELECT status, layers FROM papers WHERE arxiv_id=?", (pid,)).fetchone()
+
+    def test_solana_gh_doc_is_web3_without_niche_words(self):
+        conn = make_conn()
+        pid = "gh:solana-docs:122a8c29499d39a9"
+        service.upsert_discovered(conn, pid, "Durable Nonces", None, "web3", abstract=self.ABSTRACT)
+        row = self._row(conn, pid)
+        self.assertEqual(row["status"], "discovered")
+        self.assertIn("web3", row["layers"].split(","))
+
+    def test_unflagged_gh_source_still_goes_through_gate(self):
+        conn = make_conn()
+        pid = "gh:nitro:0123456789abcdef"
+        service.upsert_discovered(conn, pid, "Cooking pasta at altitude", None, "web3",
+                                  abstract="We measure boiling points of water in mountain kitchens.")
+        self.assertEqual(self._row(conn, pid)["status"], "off_niche")
+
+    def test_forced_web3(self):
+        self.assertTrue(service.forced_web3("gh:jupiter:abc123"))
+        self.assertTrue(service.forced_web3("wp:aave-v3"))
+        self.assertFalse(service.forced_web3("gh:nitro:abc123"))
+        self.assertFalse(service.forced_web3("gh:unknown-source:abc123"))
+        self.assertFalse(service.forced_web3("2401.00001"))
+
+    def test_manifest_entries(self):
+        for key in ("solana-docs", "jupiter", "meteora", "uniswap", "compound-comet", "anchor"):
+            cfg = service.GITHUB_DOC_SOURCES[key]
+            self.assertTrue(cfg.get("web3"), key)
+            self.assertTrue(cfg["repo"] and cfg["paths"], key)
+        # solana-com ships 19 machine translations beside en/: only en/ may be listed
+        for path in service.GITHUB_DOC_SOURCES["solana-docs"]["paths"]:
+            self.assertTrue(path.startswith(("apps/docs/content/docs/en/", "apps/docs/content/cookbook/")), path)
+
+    def test_title_prefers_front_matter(self):
+        text = "---\ntitle: Durable Nonces\n---\n\n```bash\n# not a title\n```\n"
+        self.assertEqual(service._github_doc_title(text, "x/durable-nonces.mdx"), "Durable Nonces")
+        self.assertEqual(service._github_doc_title("intro\n# Real Title\n", "a.md"), "Real Title")
+
+    def test_whitepapers_skip_semantic_scholar_gate(self):
+        self.assertTrue(service.is_non_arxiv("wp:aave"))
+
+
+class WhitepaperListTests(unittest.TestCase):
+    def test_slugs_unique_and_urls_https(self):
+        import whitepapers
+        slugs = [w[0] for w in whitepapers.WHITEPAPERS]
+        self.assertEqual(len(slugs), len(set(slugs)))
+        for slug in ("uniswap-v4", "curve-cryptoswap", "aave-v2", "aave-v3", "chainlink-v1", "pyth"):
+            self.assertIn(slug, slugs)
+        for _slug, _title, year, url in whitepapers.WHITEPAPERS:
+            self.assertTrue(1990 < year < 2030)
+            self.assertTrue(url.startswith(("https://", "http://")))
+
+
 if __name__ == "__main__":
     unittest.main()

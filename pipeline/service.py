@@ -522,7 +522,39 @@ GITHUB_DOC_SOURCES = {
     "sp1": {"repo": "succinctlabs/sp1", "branch": "main", "paths": ("docs/", "crates/recursion/")},
     "risc0": {"repo": "risc0/risc0", "branch": "main", "paths": ("risc0/zkvm/", "website/api/blockchain-integration/")},
     "halo2": {"repo": "privacy-scaling-explorations/halo2", "branch": "main", "paths": ("book/",)},
-    "anchor": {"repo": "coral-xyz/anchor", "branch": "master", "paths": ("docs/content/docs/",)},
+    "anchor": {"repo": "coral-xyz/anchor", "branch": "master",
+               "paths": ("docs/content/docs/", "docs-v2/src/content/docs/v2/"), "web3": True},
+    # Solana and Solana-DeFi first-party documentation.  "web3": True marks a
+    # source as Web3 by construction (see forced_web3): plain-language docs such
+    # as durable nonces or Jupiter routing never trip the lexical niche gate.
+    # solana-com keeps 19 machine translations next to en/, so only en/ and the
+    # (English-only) cookbook are listed; tools/ (vendor SDK pages) and payments/
+    # are left out.
+    "solana-docs": {"repo": "solana-foundation/solana-com", "branch": "main", "web3": True,
+                    "paths": tuple(f"apps/docs/content/docs/en/{d}/" for d in (
+                        "core", "intro", "programs", "clients", "references", "tokens",
+                        "rpc", "tokenization", "defi", "finance", "frontend"))
+                    + ("apps/docs/content/cookbook/",)},
+    "agave-svm": {"repo": "anza-xyz/agave", "branch": "master", "paths": ("svm/doc/",), "web3": True},
+    "jupiter": {"repo": "jup-ag/docs", "branch": "main", "web3": True,
+                "paths": ("swap/", "lend/", "perps/", "trigger/", "ultra/", "recurring/", "guides/")},
+    "meteora": {"repo": "MeteoraAG/docs", "branch": "main", "web3": True,
+                "paths": ("core-products/", "developer-guides/")},
+    "orca-whirlpools": {"repo": "orca-so/whirlpools", "branch": "main", "web3": True,
+                        "paths": ("README.md", "docs/")},
+    "marinade": {"repo": "marinade-finance/liquid-staking-program", "branch": "main", "web3": True,
+                 "paths": ("README.md", "Docs/")},
+    "jito-stakenet": {"repo": "jito-foundation/stakenet", "branch": "master", "web3": True,
+                      "paths": ("README.md", "programs/steward/README.md")},
+    # EVM DeFi first-party docs
+    "uniswap": {"repo": "Uniswap/docs", "branch": "main", "web3": True,
+                "paths": ("content/protocols/v2/", "content/protocols/v3/", "content/protocols/v4/")},
+    "lido": {"repo": "lidofinance/docs", "branch": "main", "web3": True,
+             "paths": ("docs/", "earn/architecture/")},
+    "compound-comet": {"repo": "compound-finance/comet", "branch": "main", "web3": True,
+                       "paths": ("README.md", "SPEC.md")},
+    "gmx-synthetics": {"repo": "gmx-io/gmx-synthetics", "branch": "main", "web3": True,
+                       "paths": ("README.md",)},
 }
 GITHUB_DOCS_PER_CYCLE = 20
 GITHUB_DOC_DELAY_SECONDS = 0.2
@@ -543,7 +575,7 @@ def is_spec_source(paper_id) -> bool:
 def is_non_arxiv(paper_id) -> bool:
     """True for sources Semantic Scholar does not index (IACR, EIP, SIMD)."""
     return str(paper_id).startswith((IACR_ID_PREFIX, EIP_ID_PREFIX, SIMD_ID_PREFIX,
-                                     GITHUB_DOC_ID_PREFIX,
+                                     GITHUB_DOC_ID_PREFIX, WHITEPAPER_ID_PREFIX,
                                      ACL_ID_PREFIX, OPENALEX_ID_PREFIX,
                                      PMLR_ID_PREFIX))
 
@@ -701,8 +733,27 @@ def github_doc_files(source_key):
 
 
 def _github_doc_title(text, path):
-    match = re.search(r"^\s*#\s+(.+?)\s*$", text, re.M)
+    # MDX docs (solana-com, Anchor) carry the title in YAML front matter; the
+    # first "# " line of the body may instead be a shell comment in a code block.
+    fm_title = _parse_front_matter(text).get("title")
+    if fm_title:
+        return " ".join(fm_title.split())
+    match = re.search(r"^\s*#\s+(.+?)\s*$", _spec_body(text), re.M)
     return " ".join((match.group(1) if match else Path(path).stem.replace("-", " ")).split())
+
+
+def forced_web3(arxiv_id) -> bool:
+    """True for documents that are Web3 by construction and skip the lexical
+    niche gate: EIP/SIMD specs, curated whitepapers, and gh: docs from manifest
+    sources flagged "web3" (gh ids look like gh:<source_key>:<digest>)."""
+    pid = str(arxiv_id)
+    if pid.startswith((EIP_ID_PREFIX, SIMD_ID_PREFIX, WHITEPAPER_ID_PREFIX)):
+        return True
+    if pid.startswith(GITHUB_DOC_ID_PREFIX):
+        parts = pid.split(":")
+        cfg = GITHUB_DOC_SOURCES.get(parts[1]) if len(parts) > 2 else None
+        return bool(cfg and cfg.get("web3"))
+    return False
 
 
 def fetch_github_doc_batch(source_key, start, count):
@@ -730,7 +781,7 @@ def fetch_github_doc_batch(source_key, start, count):
             "arxiv_id": f"{GITHUB_DOC_ID_PREFIX}{source_key}:{digest}",
             "title": title,
             "year": None,
-            "abstract": text[:1200],
+            "abstract": (_parse_front_matter(text).get("description") or _spec_body(text).strip()[:1200]).strip(),
             "full_text": text,
             "url": page_base + path,
         })
@@ -1251,7 +1302,7 @@ def upsert_discovered(conn, arxiv_id, title, year, layer, abstract=None,
     # A protocol spec is Web3 by construction, but it is written in opcodes and
     # gas rather than "blockchain": the lexical gate had thrown out 237 of 686
     # EIPs, EIP-1559 and EIP-155 among them, and the Aave whitepaper.
-    if str(arxiv_id).startswith((EIP_ID_PREFIX, SIMD_ID_PREFIX, WHITEPAPER_ID_PREFIX)) and "web3" not in matched_layers:
+    if forced_web3(arxiv_id) and "web3" not in matched_layers:
         matched_layers = sorted(matched_layers + ["web3"])
     _, primary_score = niche_filter.primary_layer(scores)
     matched_terms_json = json.dumps(niche_filter.all_matched_terms(scores))
