@@ -87,6 +87,8 @@ WHITEPAPERS = [
      "https://research.chain.link/whitepaper-v1.pdf"),
     ("pyth", "Pyth Network: A First-Party Financial Oracle", 2023,
      "https://pythdataassociation.com/whitepaper.pdf"),
+    ("risc0-proof-system", "RISC Zero zkVM: Proof System in Detail (STARK-based RISC-V proofs)", 2023,
+     "https://dev.risczero.com/proof-system-in-detail.pdf"),
 ]
 
 

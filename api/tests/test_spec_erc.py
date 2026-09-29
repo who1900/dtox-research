@@ -104,7 +104,8 @@ class ErcSourceTests(unittest.TestCase):
         self.assertEqual(e["arxiv_id"], "eip:4337")
         self.assertEqual(e["url"], "https://eips.ethereum.org/EIPS/eip-4337")
         self.assertEqual(e["year"], 2021)
-        self.assertEqual(e["title"], "Account Abstraction Using Alt Mempool")
+        self.assertEqual(e["title"], "Account Abstraction Using Alt Mempool [Draft]")
+        self.assertTrue(e["abstract"].startswith("Status: Draft. "))
         self.assertEqual(e["full_text"], ERC)
 
     def test_eip_source_drops_stubs_but_keeps_real_eips(self):
@@ -116,6 +117,19 @@ class ErcSourceTests(unittest.TestCase):
     def test_withdrawn_erc_is_skipped(self):
         entries, _ = self._fetch("erc@all", {"erc-1.md": ERC.replace("status: Draft", "status: Withdrawn")})
         self.assertEqual(entries, [])
+
+    def test_stagnant_and_review_are_kept_with_status_mark(self):
+        for status, label in (("Stagnant", "Stagnant"), ("Review", "Review"), ("Last Call", "Last Call")):
+            text = ERC.replace("status: Draft", f"status: {status}")
+            entries, _ = self._fetch("eip@all", {"eip-7547.md": text})
+            self.assertEqual(len(entries), 1, status)
+            self.assertTrue(entries[0]["title"].endswith(f"[{label}]"), status)
+
+    def test_final_eip_title_is_not_marked(self):
+        real = "---" + chr(10) + "title: Fee market" + chr(10) + "status: Final" + chr(10) + "created: 2019-04-13" + chr(10) + "---" + chr(10) + chr(10) + "## Abstract" + chr(10) + "x" + chr(10)
+        entries, _ = self._fetch("eip@all", {"eip-1559.md": real})
+        self.assertEqual(entries[0]["title"], "Fee market")
+        self.assertEqual(service.SPEC_SKIP_STATUSES, {"withdrawn"})
 
     def test_missing_title_falls_back_to_erc_label(self):
         entries, _ = self._fetch("erc@all", {"erc-9.md": "---\nstatus: Final\n---\n\nbody\n"})
@@ -185,7 +199,8 @@ class RefreshScriptTests(unittest.TestCase):
         self.assertTrue(rme.erc_usable(ERC)[0])
         self.assertFalse(rme.erc_usable(STUB)[0])
         self.assertFalse(rme.erc_usable(None)[0])
-        self.assertFalse(rme.erc_usable(ERC.replace("status: Draft", "status: Stagnant"))[0])
+        self.assertTrue(rme.erc_usable(ERC.replace("status: Draft", "status: Stagnant"))[0])
+        self.assertFalse(rme.erc_usable(ERC.replace("status: Draft", "status: Withdrawn"))[0])
 
     def test_dry_run_writes_nothing(self):
         s = self._session()

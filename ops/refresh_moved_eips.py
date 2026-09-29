@@ -41,7 +41,7 @@ import reprocess_lost_body as rlb
 RAW_BASE = "https://raw.githubusercontent.com/ethereum/ERCs/master/ERCS/"
 LIST_URL = "https://api.github.com/repos/ethereum/ERCs/contents/ERCS"
 UA = "dtox-research/1.0 (mailto:aybatanime@gmail.com)"
-SKIP_STATUSES = {"withdrawn", "stagnant"}
+SKIP_STATUSES = {"withdrawn"}  # keep in step with service.SPEC_SKIP_STATUSES
 LIVE_STATUSES = ("done", "chunked", "fulltext_fetched")
 MIN_ERC_CHARS = 400
 _STUB_RE = re.compile(r"this file was moved to\s+https?://github\.com/ethereum/ercs", re.I)
@@ -152,7 +152,7 @@ def erc_usable(text):
     if not text or is_moved_stub(text) or len(text) < MIN_ERC_CHARS:
         return False, "no real text"
     if (parse_front_matter(text).get("status") or "").strip().lower() in SKIP_STATUSES:
-        return False, "withdrawn/stagnant"
+        return False, "withdrawn"
     return True, ""
 
 
@@ -242,7 +242,7 @@ def run(conn, session, args, log=print):
         try:
             have = {r["arxiv_id"] for r in conn.execute("SELECT arxiv_id FROM papers WHERE arxiv_id LIKE 'eip:%'")}
             new = sorted(int(n) for n in list_erc_numbers(session) if f"eip:{n}" not in have)
-            log(f"ERCs not in the corpus yet (erc@all will add them, minus withdrawn/stagnant): {len(new)}")
+            log(f"ERCs not in the corpus yet (erc@all will add them, minus withdrawn): {len(new)}")
         except (requests.RequestException, ValueError) as e:
             log(f"ERC listing failed: {e}")
         log("dry run, nothing written (use --apply)")

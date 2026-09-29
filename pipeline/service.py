@@ -503,9 +503,19 @@ SPEC_SOURCES = {
 }
 SPEC_FILES_PER_CYCLE = 40
 SPEC_DELAY_SECONDS = 0.4
-# Withdrawn/Stagnant proposals describe roads not taken; keeping them would let
-# an agent implement against a dead standard.
-SPEC_SKIP_STATUSES = {"withdrawn", "stagnant"}
+# Only Withdrawn proposals are dropped: their authors abandoned them.  Draft,
+# Review, Last Call and Stagnant proposals are kept because much of what an
+# agent is asked about (EIP-7702 while Draft, EIP-7547 inclusion lists, Stagnant)
+# lives there; the status is put into the title and abstract so a reader can
+# tell a live standard from a road not taken.
+SPEC_SKIP_STATUSES = {"withdrawn"}
+SPEC_STATUS_MARKED = {"draft", "review", "last call", "stagnant"}
+
+
+def spec_status_label(status):
+    """Human label for a non-final EIP/ERC status, or None when it needs no mark."""
+    status = (status or "").strip().lower()
+    return status.title() if status in SPEC_STATUS_MARKED else None
 
 # Curated technical documentation from canonical protocol and ZK repositories.
 # This is intentionally a manifest, not GitHub-wide search: every repository
@@ -555,6 +565,16 @@ GITHUB_DOC_SOURCES = {
                        "paths": ("README.md", "SPEC.md")},
     "gmx-synthetics": {"repo": "gmx-io/gmx-synthetics", "branch": "main", "web3": True,
                        "paths": ("README.md",)},
+    # Solana validator/runtime docs moved out of anza-xyz/agave (docs/README.md
+    # is a pointer) to anza-xyz/docs.anza.xyz; the Geyser plugin interface
+    # guide is src/validator/geyser.md.
+    "anza-docs": {"repo": "anza-xyz/docs.anza.xyz", "branch": "main", "web3": True,
+                  "paths": ("src/validator/", "src/runtime/", "src/consensus/",
+                            "src/implemented-proposals/", "src/proposals/")},
+    # Yellowstone gRPC (Geyser-based streaming): the root README is the protocol
+    # and deployment guide, the example READMEs cover each client language.
+    "yellowstone-grpc": {"repo": "rpcpool/yellowstone-grpc", "branch": "master", "web3": True,
+                         "paths": ("README.md", "examples/", "yellowstone-grpc-client-nodejs/README.md")},
 }
 GITHUB_DOCS_PER_CYCLE = 20
 GITHUB_DOC_DELAY_SECONDS = 0.2
@@ -690,11 +710,17 @@ def fetch_spec_batch(query_key, start, count):
         if m:
             year = int(m.group(1))
         body = _spec_body(text)
+        title = meta.get("title") or f"{cfg.get('label') or cfg['source'].upper()}-{number}"
+        abstract = (meta.get("description") or body.strip()[:800]).strip()
+        label = spec_status_label(meta.get("status")) if cfg["source"] == "eip" else None
+        if label:
+            title = f"{title} [{label}]"
+            abstract = f"Status: {label}. {abstract}"
         entries.append({
             "arxiv_id": f"{cfg['prefix']}{number}",
-            "title": meta.get("title") or f"{cfg.get('label') or cfg['source'].upper()}-{number}",
+            "title": title,
             "year": year,
-            "abstract": (meta.get("description") or body.strip()[:800]).strip(),
+            "abstract": abstract,
             "full_text": text,
             "url": spec_page_url(cfg, number, name),
             "source": cfg["source"],

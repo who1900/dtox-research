@@ -96,13 +96,24 @@ class GithubDocsNicheTests(unittest.TestCase):
         self.assertFalse(service.forced_web3("2401.00001"))
 
     def test_manifest_entries(self):
-        for key in ("solana-docs", "jupiter", "meteora", "uniswap", "compound-comet", "anchor"):
+        for key in ("solana-docs", "jupiter", "meteora", "uniswap", "compound-comet", "anchor",
+                    "anza-docs", "yellowstone-grpc"):
             cfg = service.GITHUB_DOC_SOURCES[key]
             self.assertTrue(cfg.get("web3"), key)
             self.assertTrue(cfg["repo"] and cfg["paths"], key)
         # solana-com ships 19 machine translations beside en/: only en/ may be listed
         for path in service.GITHUB_DOC_SOURCES["solana-docs"]["paths"]:
             self.assertTrue(path.startswith(("apps/docs/content/docs/en/", "apps/docs/content/cookbook/")), path)
+
+    def test_geyser_and_yellowstone_sources(self):
+        anza = service.GITHUB_DOC_SOURCES["anza-docs"]
+        self.assertEqual(anza["repo"], "anza-xyz/docs.anza.xyz")
+        self.assertIn("src/validator/", anza["paths"])  # holds geyser.md
+        ys = service.GITHUB_DOC_SOURCES["yellowstone-grpc"]
+        self.assertEqual(ys["repo"], "rpcpool/yellowstone-grpc")
+        self.assertIn("README.md", ys["paths"])
+        self.assertTrue(service.forced_web3("gh:anza-docs:0123456789abcdef"))
+        self.assertTrue(service.forced_web3("gh:yellowstone-grpc:0123456789abcdef"))
 
     def test_title_prefers_front_matter(self):
         text = "---\ntitle: Durable Nonces\n---\n\n```bash\n# not a title\n```\n"
@@ -118,7 +129,7 @@ class WhitepaperListTests(unittest.TestCase):
         import whitepapers
         slugs = [w[0] for w in whitepapers.WHITEPAPERS]
         self.assertEqual(len(slugs), len(set(slugs)))
-        for slug in ("uniswap-v4", "curve-cryptoswap", "aave-v2", "aave-v3", "chainlink-v1", "pyth"):
+        for slug in ("uniswap-v4", "curve-cryptoswap", "aave-v2", "aave-v3", "chainlink-v1", "pyth", "risc0-proof-system"):
             self.assertIn(slug, slugs)
         for _slug, _title, year, url in whitepapers.WHITEPAPERS:
             self.assertTrue(1990 < year < 2030)
