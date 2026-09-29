@@ -72,6 +72,15 @@ HIER_FUSION = os.getenv("HIER_FUSION", "mix")
 HIER_W_DENSE = float(os.getenv("HIER_W_DENSE", "1.0"))
 HIER_W_LEX = float(os.getenv("HIER_W_LEX", "0.8"))
 HIER_W_GLOBAL = float(os.getenv("HIER_W_GLOBAL", "0.5"))
+# Fourth RRF channel ("graph", HIER_FUSION="rrf" only): papers cited by >=
+# HIER_GRAPH_MIN of the top HIER_GRAPH_POOL fused candidates -- the canon the
+# relevant derivative works build on. Each must still pass stage-B chunk
+# evidence and the relevance floor like any other candidate. 0 = off.
+HIER_GRAPH = os.getenv("HIER_GRAPH", "1") == "1"
+HIER_W_GRAPH = float(os.getenv("HIER_W_GRAPH", "0.8"))
+HIER_GRAPH_POOL = int(os.getenv("HIER_GRAPH_POOL", "30"))
+HIER_GRAPH_MIN = int(os.getenv("HIER_GRAPH_MIN", "3"))
+HIER_GRAPH_MAX = int(os.getenv("HIER_GRAPH_MAX", "15"))
 # When a hierarchical search actually runs (not the stage A/B fallback), its
 # own paper-level BM25 channel (PAPER_LEXICAL, folded in via _hier_run/the
 # paper+chunk fusion below) already covers exact-term matches, so the old
@@ -820,6 +829,55 @@ def _hier_stage_b_hits(vector, must, arxiv_ids, dense_limit, timeout):
     return hits
 
 
+def _graph_channel(pool_ids, known_ids, chunk_ids, vector, must, timeout):
+    """Fourth RRF channel: articles cited by >= HIER_GRAPH_MIN of `pool_ids`
+    (same idea as _foundational), best-first, each with a stage-B best chunk.
+
+    `known_ids` are ids already in the fused pool (a twin of one of them is
+    reused instead of a second id for the same paper); `chunk_ids` those that
+    already have chunk evidence. Layer/year/section filters are applied by the
+    stage-B chunk search itself (`must`); a cited paper with no chunk under
+    them is dropped. Returns (ranked ids, {id: chunk}). Never raises.
+    """
+    try:
+        ids = list(pool_ids)[:HIER_GRAPH_POOL]
+        if not ids:
+            return [], {}
+        sql = (f"SELECT dst, COUNT(*) AS n FROM citations WHERE src IN ({','.join('?' * len(ids))}) "
+               f"GROUP BY dst ORDER BY n DESC LIMIT 60")
+        try:
+            # threshold applied after twin merge below: two copies of one paper
+            # may each fall under it while together clearing it
+            counts = _ro_conn(STATE_DB_PATH).execute(sql, ids).fetchall()
+        except sqlite3.Error:
+            _ro_conn_drop(STATE_DB_PATH)
+            return [], {}
+        heads = {}
+        for pid, n in counts:
+            head = canonical_id(pid)
+            slot = heads.setdefault(head, {"n": 0, "ids": []})
+            slot["n"] += n
+            slot["ids"].append(pid)
+        state = _twins()
+        ranked = []
+        qualified = [kv for kv in heads.items() if kv[1]["n"] >= HIER_GRAPH_MIN]
+        for head, slot in sorted(qualified, key=lambda kv: -kv[1]["n"])[:HIER_GRAPH_MAX]:
+            members = set(state["members"].get(head, [head])) | set(slot["ids"])
+            pick = next((m for m in members if m in known_ids), None) or slot["ids"][0]
+            ranked.append(pick)
+        need = [a for a in ranked if a not in chunk_ids]
+        chunks = {}
+        if need:
+            for h in _hier_stage_b_hits(vector, must, need, HIER_CHUNKS, timeout):
+                aid = (h.get("payload") or {}).get("arxiv_id")
+                if aid and (aid not in chunks or (h.get("score") or 0) > (chunks[aid].get("score") or 0)):
+                    chunks[aid] = h
+        return [a for a in ranked if a in chunk_ids or a in chunks], chunks
+    except Exception as exc:
+        log.warning(f"HIER_GRAPH: channel failed, continuing without it: {exc}")
+        return [], {}
+
+
 def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, layers, query=""):
     """Stages A+B+C of HIER_SEARCH, sharing _run_search's old dense-retrieval
     shape so the caller doesn't need to know which path ran.
@@ -931,6 +989,18 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
         l_dense, l_lex, l_global,
         weights=[HIER_W_DENSE, HIER_W_LEX, HIER_W_GLOBAL])
 
+    l_graph = []
+    graph_chunk = {}
+    if HIER_GRAPH:
+        pre = sorted(set(l_dense) | set(l_lex) | set(l_global), key=lambda a: -fused.get(a, 0.0))
+        have = set(best_chunk) | set(global_chunk)
+        pre = [a for a in pre if a in have]
+        l_graph, graph_chunk = _graph_channel(pre, set(pre), have, vector, must, dense_timeout)
+        if l_graph:
+            fused = reciprocal_rank_fusion(
+                l_dense, l_lex, l_global, l_graph,
+                weights=[HIER_W_DENSE, HIER_W_LEX, HIER_W_GLOBAL, HIER_W_GRAPH])
+
     dense_rank = {aid: i + 1 for i, aid in enumerate(l_dense)}
     lex_rank = {aid: i + 1 for i, aid in enumerate(l_lex)}
     global_rank = {aid: i + 1 for i, aid in enumerate(l_global)}
@@ -938,8 +1008,10 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
     chunk_by_id = dict(best_chunk)
     for aid, h in global_chunk.items():
         chunk_by_id.setdefault(aid, h)
+    for aid, h in graph_chunk.items():
+        chunk_by_id.setdefault(aid, h)
 
-    all_ids = set(l_dense) | set(l_lex) | set(l_global)
+    all_ids = set(l_dense) | set(l_lex) | set(l_global) | set(l_graph)
     ordered_ids = sorted(all_ids, key=lambda aid: -fused.get(aid, 0.0))
 
     lex_exempt = {aid for aid in l_lex if lex_rank[aid] <= 3}
@@ -948,6 +1020,13 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
     fusion_ranks = {aid: {"dense": dense_rank.get(aid), "lex": lex_rank.get(aid),
                           "global": global_rank.get(aid)}
                     for aid in ordered_ids}
+    if HIER_GRAPH:
+        graph_rank = {aid: i + 1 for i, aid in enumerate(l_graph)}
+        for aid in ordered_ids:
+            fusion_ranks[aid]["graph"] = graph_rank.get(aid)
+            if (aid in graph_rank and found_via[aid] == "paper"
+                    and aid not in dense_rank and aid not in global_rank):
+                found_via[aid] = "paper graph"
 
     hits = [chunk_by_id[aid] for aid in ordered_ids if aid in chunk_by_id]
     extra = {
@@ -1698,7 +1777,7 @@ def _run_search(body: SearchBody, x_api_key=None,
         # otherwise the channel is invisible exactly when the two agree
         lex_all = set(lexical)
         for r in results:
-            base = "paper" if r.get("found_via") == "paper" else "dense"
+            base = "paper" if r.get("found_via") in ("paper", "paper graph") else "dense"
             r["channels"] = [base, "lexical"] if r["arxiv_id"] in lex_all else [base]
         # HIER_CHUNK_LEXICAL=0, hier used: `lexical` here is the paper-level
         # BM25 list only, already folded into hier's own ranking -- scoring
@@ -1725,7 +1804,7 @@ def _run_search(body: SearchBody, x_api_key=None,
         fused = _rrf(dense_order, lexical, weights=[1.0, 0.6])
         lex_set = set(lexical)
         for r in results:
-            base = "paper" if r.get("found_via") == "paper" else "dense"
+            base = "paper" if r.get("found_via") in ("paper", "paper graph") else "dense"
             r["channels"] = ([base, "lexical"] if r["arxiv_id"] in lex_set
                              else [base])
         pool = {r["arxiv_id"]: r for r in results}
@@ -1737,8 +1816,11 @@ def _run_search(body: SearchBody, x_api_key=None,
                          key=lambda r: -r.get("fusion_score", 0))[:limit]
     elif results:
         for result in results:
-            result["channels"] = (["paper"] if result.get("found_via") == "paper"
+            result["channels"] = (["paper"] if result.get("found_via") in ("paper", "paper graph")
                                   else ["dense"])
+    for r in results:
+        if (r.get("fusion_ranks") or {}).get("graph") is not None and "graph" not in r.get("channels", []):
+            r.setdefault("channels", []).append("graph")
 
     if body.dedupe:
         results = _collapse_twins(results)
