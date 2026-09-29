@@ -481,6 +481,18 @@ SPEC_SOURCES = {
         "file_re": re.compile(r"^eip-(\d+)\.md$", re.I),
         "source": "eip",
     },
+    # The ERC category left ethereum/EIPs in 2023 for ethereum/ERCs; EIPs keeps a
+    # one-line "moved" stub per file. Same eip:N ids (one numbering), so the ERC
+    # text lands on the id the stub used to occupy. Own cursor: eip@all is
+    # untouched.
+    "erc@all": {
+        "prefix": EIP_ID_PREFIX,
+        "list_url": "https://api.github.com/repos/ethereum/ERCs/contents/ERCS",
+        "raw_base": "https://raw.githubusercontent.com/ethereum/ERCs/master/ERCS/",
+        "file_re": re.compile(r"^erc-(\d+)\.md$", re.I),
+        "source": "eip",
+        "label": "ERC",
+    },
     "simd@all": {
         "prefix": SIMD_ID_PREFIX,
         "list_url": "https://api.github.com/repos/solana-foundation/solana-improvement-documents/contents/proposals",
@@ -560,6 +572,34 @@ def _spec_body(text):
     return text
 
 
+_MOVED_STUB_RE = re.compile(r"this file was moved to\s+https?://github\.com/ethereum/ercs", re.I)
+
+
+def is_moved_stub(text) -> bool:
+    """True for the placeholder ethereum/EIPs keeps in place of a file that moved
+    to ethereum/ERCs ("This file was moved to https://github.com/ethereum/ercs/...",
+    front matter status: Moved). It carries no specification."""
+    if not text:
+        return False
+    body = _spec_body(text)
+    if len(body.strip()) > 600:
+        return False
+    if _MOVED_STUB_RE.search(body):
+        return True
+    return (_parse_front_matter(text).get("status") or "").strip().lower() == "moved"
+
+
+def write_spec_cache(arxiv_id, text) -> bool:
+    """write_latex_cache for specs, but a moved-stub never replaces real text.
+    Returns True when the cache was written."""
+    if is_moved_stub(text):
+        existing = read_latex_cache(arxiv_id)
+        if existing and not is_moved_stub(existing):
+            return False
+    write_latex_cache(arxiv_id, text)
+    return True
+
+
 def spec_page_url(cfg, number, name):
     if cfg["source"] == "eip":
         return f"https://eips.ethereum.org/EIPS/eip-{number}"
@@ -608,6 +648,8 @@ def fetch_spec_batch(query_key, start, count):
             log.warning(f"spec: fetch failed for {name}: {e}")
             continue
         time.sleep(SPEC_DELAY_SECONDS)
+        if is_moved_stub(text):
+            continue  # the real text is read from the ERCs source (erc@all)
         meta = _parse_front_matter(text)
         if (meta.get("status") or "").strip().lower() in SPEC_SKIP_STATUSES:
             continue
@@ -618,7 +660,7 @@ def fetch_spec_batch(query_key, start, count):
         body = _spec_body(text)
         entries.append({
             "arxiv_id": f"{cfg['prefix']}{number}",
-            "title": meta.get("title") or f"{cfg['source'].upper()}-{number}",
+            "title": meta.get("title") or f"{cfg.get('label') or cfg['source'].upper()}-{number}",
             "year": year,
             "abstract": (meta.get("description") or body.strip()[:800]).strip(),
             "full_text": text,
@@ -1543,7 +1585,7 @@ def refresh_live_cursors(conn):
         # idempotent, so newly merged EIPs, SIMDs and ACL papers are admitted.
         cur_specs = conn.execute(
             "UPDATE harvest_cursor SET next_start=0,done=0,last_run_at=NULL "
-            "WHERE query_key IN ('eip@all','simd@all')")
+            "WHERE query_key IN ('eip@all','erc@all','simd@all')")
         cur_acl = conn.execute(
             "UPDATE harvest_cursor SET next_start=0,done=0,last_run_at=NULL "
             "WHERE query_key LIKE ?", (f"acl@{year}%",))
@@ -1584,7 +1626,7 @@ def harvest_step(conn):
                                   abstract=e.get("abstract"))
                 # markdown is the fulltext: cache it now, nothing else to fetch
                 try:
-                    write_latex_cache(e["arxiv_id"], e["full_text"])
+                    write_spec_cache(e["arxiv_id"], e["full_text"])
                 except Exception:
                     pass
                 new_count += 1
