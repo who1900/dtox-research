@@ -81,6 +81,17 @@ HIER_W_GRAPH = float(os.getenv("HIER_W_GRAPH", "0.8"))
 HIER_GRAPH_POOL = int(os.getenv("HIER_GRAPH_POOL", "30"))
 HIER_GRAPH_MIN = int(os.getenv("HIER_GRAPH_MIN", "3"))
 HIER_GRAPH_MAX = int(os.getenv("HIER_GRAPH_MAX", "15"))
+# Source quota (needs HIER_GRAPH): an article cited by >= max(HIER_GRAPH_QUOTA_MIN,
+# HIER_GRAPH_QUOTA_FRAC of the pool) candidates is the field's primary source;
+# RRF alone cannot lift it over dense-ranked derivatives, so it is guaranteed
+# rank HIER_GRAPH_QUOTA_POS (1-based) in the pre-filter order, at most
+# HIER_GRAPH_QUOTA_MAX such articles per query. It still needs a stage-B chunk
+# and must clear the same relevance floor/filters as every other hit. 0 = off.
+HIER_GRAPH_QUOTA = os.getenv("HIER_GRAPH_QUOTA", "1") == "1"
+HIER_GRAPH_QUOTA_MIN = int(os.getenv("HIER_GRAPH_QUOTA_MIN", "8"))
+HIER_GRAPH_QUOTA_FRAC = float(os.getenv("HIER_GRAPH_QUOTA_FRAC", "0.4"))
+HIER_GRAPH_QUOTA_POS = int(os.getenv("HIER_GRAPH_QUOTA_POS", "3"))
+HIER_GRAPH_QUOTA_MAX = int(os.getenv("HIER_GRAPH_QUOTA_MAX", "1"))
 # When a hierarchical search actually runs (not the stage A/B fallback), its
 # own paper-level BM25 channel (PAPER_LEXICAL, folded in via _hier_run/the
 # paper+chunk fusion below) already covers exact-term matches, so the old
@@ -829,7 +840,61 @@ def _hier_stage_b_hits(vector, must, arxiv_ids, dense_limit, timeout):
     return hits
 
 
-def _graph_channel(pool_ids, known_ids, chunk_ids, vector, must, timeout):
+def _select_graph_quota(l_graph, graph_counts, pool_size, chunk_ids):
+    """Primary sources per HIER_GRAPH_QUOTA: {id: citing count}, most cited
+    first, at most HIER_GRAPH_QUOTA_MAX. Only ids with stage-B chunk evidence.
+    """
+    if not (HIER_GRAPH_QUOTA and l_graph and graph_counts and pool_size):
+        return {}
+    need = max(HIER_GRAPH_QUOTA_MIN, HIER_GRAPH_QUOTA_FRAC * pool_size)
+    cands = [a for a in l_graph if a in chunk_ids and graph_counts.get(a, 0) >= need]
+    cands.sort(key=lambda a: -graph_counts[a])
+    return {a: graph_counts[a] for a in cands[:HIER_GRAPH_QUOTA_MAX]}
+
+
+def _inject_graph_quota(results, extra, floor, exempt_ids, limit):
+    """Guarantee each quota article rank HIER_GRAPH_QUOTA_POS in the final
+    `results` (already fused/sorted). An article that is already at or above
+    the slot stays; otherwise it is moved or built from its stage-B chunk, but
+    only if that chunk clears the same relevance floor as any other hit.
+    Displaces at most HIER_GRAPH_QUOTA_MAX articles out of the top `limit`.
+    """
+    quota = extra.get("graph_quota") or {}
+    chunks = extra.get("quota_chunks") or {}
+    if not quota:
+        return results
+    results = list(results)
+    slot = max(HIER_GRAPH_QUOTA_POS - 1, 0)
+    placed = 0
+    for aid, note in quota.items():
+        chunk = chunks.get(aid)
+        if chunk is None:
+            continue
+        if (chunk.get("score") or 0) < floor and aid not in exempt_ids:
+            continue
+        key = canonical_id(aid)
+        cur = next((i for i, r in enumerate(results) if canonical_id(r["arxiv_id"]) == key), None)
+        target = min(slot + placed, len(results))
+        if cur is not None and cur <= target:
+            results[cur]["graph_quota"] = note
+            placed += 1
+            continue
+        if cur is not None:
+            item = results.pop(cur)
+        else:
+            item = _result_from_hit(chunk)
+            item["paper_score"] = (extra.get("paper_scores") or {}).get(item["arxiv_id"])
+            item["fusion_ranks"] = (extra.get("fusion_ranks") or {}).get(item["arxiv_id"])
+            item["channels"] = ["paper", "graph"]
+        item["found_via"] = ("paper graph" if item.get("found_via") in (None, "paper")
+                             else item["found_via"])
+        item["graph_quota"] = note
+        results.insert(target, item)
+        placed += 1
+    return results[:limit]
+
+
+def _graph_channel(pool_ids, known_ids, chunk_ids, vector, must, timeout, counts_out=None):
     """Fourth RRF channel: articles cited by >= HIER_GRAPH_MIN of `pool_ids`
     (same idea as _foundational), best-first, each with a stage-B best chunk.
 
@@ -865,6 +930,8 @@ def _graph_channel(pool_ids, known_ids, chunk_ids, vector, must, timeout):
             members = set(state["members"].get(head, [head])) | set(slot["ids"])
             pick = next((m for m in members if m in known_ids), None) or slot["ids"][0]
             ranked.append(pick)
+            if counts_out is not None:
+                counts_out[pick] = slot["n"]
         need = [a for a in ranked if a not in chunk_ids]
         chunks = {}
         if need:
@@ -991,11 +1058,16 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
 
     l_graph = []
     graph_chunk = {}
+    graph_counts = {}
+    graph_pool = 0
     if HIER_GRAPH:
         pre = sorted(set(l_dense) | set(l_lex) | set(l_global), key=lambda a: -fused.get(a, 0.0))
         have = set(best_chunk) | set(global_chunk)
         pre = [a for a in pre if a in have]
-        l_graph, graph_chunk = _graph_channel(pre, set(pre), have, vector, must, dense_timeout)
+        graph_counts = {}
+        l_graph, graph_chunk = _graph_channel(pre, set(pre), have, vector, must, dense_timeout,
+                                              counts_out=graph_counts)
+        graph_pool = min(len(pre), HIER_GRAPH_POOL)
         if l_graph:
             fused = reciprocal_rank_fusion(
                 l_dense, l_lex, l_global, l_graph,
@@ -1013,6 +1085,7 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
 
     all_ids = set(l_dense) | set(l_lex) | set(l_global) | set(l_graph)
     ordered_ids = sorted(all_ids, key=lambda aid: -fused.get(aid, 0.0))
+    quota_ids = _select_graph_quota(l_graph, graph_counts, graph_pool, set(chunk_by_id))
 
     lex_exempt = {aid for aid in l_lex if lex_rank[aid] <= 3}
     found_via = {aid: ("paper lexical" if aid in lex_exempt else "paper")
@@ -1027,6 +1100,7 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
             if (aid in graph_rank and found_via[aid] == "paper"
                     and aid not in dense_rank and aid not in global_rank):
                 found_via[aid] = "paper graph"
+    graph_quota = {aid: f"cited by {n} of the top {graph_pool}" for aid, n in quota_ids.items()}
 
     hits = [chunk_by_id[aid] for aid in ordered_ids if aid in chunk_by_id]
     extra = {
@@ -1036,6 +1110,8 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
         "fusion_ranks": fusion_ranks,
         "lex_exempt": lex_exempt,
         "found_via": found_via,
+        "graph_quota": graph_quota,
+        "quota_chunks": {aid: chunk_by_id[aid] for aid in graph_quota},
     }
     return hits, [], [], extra
 
@@ -1821,6 +1897,8 @@ def _run_search(body: SearchBody, x_api_key=None,
     for r in results:
         if (r.get("fusion_ranks") or {}).get("graph") is not None and "graph" not in r.get("channels", []):
             r.setdefault("channels", []).append("graph")
+    if hier_extra and hier_extra.get("graph_quota"):
+        results = _inject_graph_quota(results, hier_extra, floor, lex_exempt_ids, limit)
 
     if body.dedupe:
         results = _collapse_twins(results)

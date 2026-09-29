@@ -198,5 +198,88 @@ class HierGraphChannelTests(unittest.TestCase):
         self.assertEqual(len(result["results"]), 3)
 
 
+class GraphQuotaUnitTests(unittest.TestCase):
+    def _q(self, graph, counts, pool=30, have=None, on=True, mx=2):
+        with patch.multiple(main, HIER_GRAPH_QUOTA=on, HIER_GRAPH_QUOTA_MIN=8,
+                            HIER_GRAPH_QUOTA_FRAC=0.4, HIER_GRAPH_QUOTA_MAX=mx):
+            return main._select_graph_quota(graph, counts, pool,
+                                            set(graph) if have is None else have)
+
+    def test_only_above_threshold(self):
+        # need = max(8, 0.4 * 30) = 12
+        self.assertEqual(self._q(["g"], {"g": 11}), {})
+        self.assertEqual(self._q(["g"], {"g": 12}), {"g": 12})
+
+    def test_small_pool_uses_absolute_min(self):
+        self.assertEqual(self._q(["f"], {"f": 7}, pool=10), {})
+        self.assertEqual(self._q(["f"], {"f": 8}, pool=10), {"f": 8})
+
+    def test_max_articles_most_cited_first(self):
+        counts = {"f": 19, "g": 20, "h": 18}
+        self.assertEqual(list(self._q(["f", "g", "h"], counts)), ["g", "f"])
+        self.assertEqual(list(self._q(["f", "g", "h"], counts, mx=1)), ["g"])
+
+    def test_no_chunk_and_flag_off(self):
+        self.assertEqual(self._q(["e"], {"e": 20}, have={"a"}), {})
+        self.assertEqual(self._q(["e"], {"e": 20}, on=False), {})
+
+
+class GraphQuotaSearchTests(unittest.TestCase):
+    """Integration: canon is cited by every shortlisted paper but has no dense
+    rank, so plain RRF leaves it last."""
+
+    _run = HierGraphChannelTests._run
+    _body = HierGraphChannelTests._body
+
+    def setUp(self):
+        HierGraphChannelTests.setUp(self)
+        ids = [f"p{i}" for i in range(1, 8)]
+        self.coarse = [_coarse_hit(a, 0.95 - 0.01 * i) for i, a in enumerate(ids)]
+        self.chunks = [_chunk_hit(f"c{a}", a, 0.95 - 0.01 * i) for i, a in enumerate(ids)]
+        self.chunks.append(_chunk_hit("cc", "canon", 0.80))
+        self.edges = [(a, "canon") for a in ids]
+        for name, value in (("HIER_GRAPH_QUOTA", True), ("HIER_GRAPH_QUOTA_MIN", 3),
+                            ("HIER_GRAPH_QUOTA_FRAC", 0.4)):
+            p = patch.object(main, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _ids(self, **kw):
+        main.qdrant_result_cache.data.clear(); main.search_cache.data.clear()
+        res = self._run(self._body(limit=8, **kw))
+        return res["results"]
+
+    def test_promoted_with_reason(self):
+        results = self._ids()
+        ids = [r["arxiv_id"] for r in results]
+        self.assertEqual(ids.index("canon"), 2)
+        canon = results[2]
+        self.assertEqual(canon["found_via"], "paper graph")
+        self.assertIn("cited by 7 of the top 7", canon["graph_quota"])
+        self.assertNotIn("graph_quota", results[0])
+
+    def test_flag_off_keeps_rrf_order(self):
+        with patch.object(main, "HIER_GRAPH_QUOTA", False):
+            results = self._ids()
+        self.assertEqual(results[-1]["arxiv_id"], "canon")
+        self.assertTrue(all("graph_quota" not in r for r in results))
+
+    def test_below_threshold_not_promoted(self):
+        with patch.object(main, "HIER_GRAPH_QUOTA_MIN", 9):
+            results = self._ids()
+        self.assertEqual(results[-1]["arxiv_id"], "canon")
+
+    def test_no_chunk_not_inserted(self):
+        main.qdrant_result_cache.data.clear(); main.search_cache.data.clear()
+        res = self._run(self._body(limit=8), chunks=self.chunks[:-1])
+        self.assertNotIn("canon", [r["arxiv_id"] for r in res["results"]])
+
+    def test_below_floor_not_inserted(self):
+        weak = self.chunks[:-1] + [_chunk_hit("cc", "canon", 0.10)]
+        main.qdrant_result_cache.data.clear(); main.search_cache.data.clear()
+        res = self._run(self._body(limit=8, min_score=0.5, query="floor quota"), chunks=weak)
+        self.assertNotIn("canon", [r["arxiv_id"] for r in res["results"]])
+
+
 if __name__ == "__main__":
     unittest.main()
