@@ -2,6 +2,8 @@
 
 An isolated paid MCP surface for dtox research. It does not replace the existing MCP server. It exposes only read-only research tools plus one narrow write path: `record_signed_verdict`, which never touches the shared-API-key claim registry directly -- it accepts only a caller's own wallet-signed verdict, gated by payment as a sybil mitigation. Every other mutation tool on the upstream dtox MCP stays unreachable through this gateway.
 
+**Production status:** the deployment at `https://read.whoim.space/x402/mcp` runs in `live` mode, Solana-only, on devnet (no EVM scheme registered). Settlement transactions and paid verdict attestations are visible on Solana Explorer (devnet). Mainnet is not enabled.
+
 ## Modes
 
 - `disabled`: tools execute without payment metadata. Safe default.

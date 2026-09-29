@@ -6,6 +6,8 @@ Do not open a public issue for a suspected vulnerability. Contact the repository
 owner through the private contact method on their GitHub profile and include the
 affected component, reproduction steps, and expected impact.
 
+TODO(owner): add a direct security contact (email or GitHub private advisory link) here.
+
 ## Trust boundaries
 
 - Qdrant, the embedding service, and the research API are internal services and

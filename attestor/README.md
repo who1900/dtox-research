@@ -10,14 +10,14 @@ dtox's `/v1/adjudicate` records an agent's verdict on whether a paper asserts,
 does not assert, or partially asserts a claim. Today the only identity behind
 a verdict is the caller's dtox API key. A public, keyless MCP endpoint shares
 one identity across every anonymous caller, so nothing stops that shared
-identity from filing contradictory or bad-faith verdicts — the registry has
+identity from filing contradictory or bad-faith verdicts, the registry has
 no way to tell readers apart.
 
 This service moves the trust anchor from "the API key" to "the agent's own
 wallet." An agent signs its verdict with an ed25519 keypair it controls;
 `attestor` verifies that signature and writes the verdict on devnet as a SAS
 attestation, with the reviewer's public key and signature embedded in the
-attested data. Anyone — dtox included — can later verify that a specific
+attested data. Anyone, dtox included, can later verify that a specific
 wallet signed a specific verdict, without trusting dtox's own honesty about
 who said what. dtox is the *issuer* of the attestation (it holds the
 Credential and pays for the transaction); the reviewer's signature inside the
@@ -25,7 +25,7 @@ attestation is what a third party actually verifies.
 
 Network: **devnet only**. On startup the service calls `getGenesisHash` on
 the configured RPC and compares it against Solana devnet's known genesis
-hash (`EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG`) — not a pattern match
+hash (`EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG`), not a pattern match
 on the URL, since an RPC provider's mainnet endpoint doesn't have to contain
 the word "mainnet". It refuses to start on a mismatch unless
 `ATTESTOR_ALLOW_MAINNET=1` is set.
@@ -40,7 +40,7 @@ agent wallet --sign--> canonical message --POST /attest--> attestor --SAS tx--> 
 ```
 
 1. The agent builds the canonical message (see below) and signs it with its
-   own ed25519 keypair — the same key it would use for any Solana wallet.
+   own ed25519 keypair, the same key it would use for any Solana wallet.
 2. It POSTs the verdict, the claim text, its public key, and the signature to
    `attestor`'s internal `/attest` endpoint.
 3. `attestor` recomputes `claim_sha256` from the claim text itself (never
@@ -62,11 +62,11 @@ agent wallet --sign--> canonical message --POST /attest--> attestor --SAS tx--> 
 - **One attestation per `(claim_id, paper_id, reviewer)`**, enforced by a
   deterministic nonce, not by application-level bookkeeping. A changed
   verdict from the same reviewer for the same claim/paper closes the old
-  attestation and creates a new one — you can't quietly have two live
+  attestation and creates a new one, you can't quietly have two live
   verdicts from the same identity.
 - **Replay is bounded**: `issued_at` must be within the last 10 minutes (and
   no more than 1 minute in the future), so a captured request body can't be
-  replayed indefinitely — though since attestation is idempotent on the same
+  replayed indefinitely, though since attestation is idempotent on the same
   triple, replaying a stale-but-still-valid request only ever reproduces the
   same on-chain state.
 
@@ -88,7 +88,7 @@ lowercase, trim, collapse all whitespace runs to a single space. This makes
 trailing newlines) without changing what is actually being asserted.
 
 The signature is a standard ed25519 signature over the UTF-8 bytes of this
-message, base58-encoded — the same primitive any Solana wallet already uses.
+message, base58-encoded, the same primitive any Solana wallet already uses.
 
 ## On-chain schema
 
@@ -99,7 +99,7 @@ message, base58-encoded — the same primitive any Solana wallet already uses.
 - Fields (all Borsh strings): `claim_id`, `claim_sha256`, `paper_id`,
   `verdict`, `evidence_sha256`, `reviewer`, `reviewer_sig`, `issued_at`.
 - Attestation nonce: `sha256("dtox:v1:" + claim_id + "|" + paper_id + "|" + reviewer)`,
-  base58-encoded and used as the PDA seed — deterministic, not random, so the
+  base58-encoded and used as the PDA seed, deterministic, not random, so the
   same triple always maps to the same attestation address.
 - Expiry: none (0).
 
@@ -115,30 +115,30 @@ npm run build   # or `npm run dev` for tsx without a build step
 
 | Variable | Required | Default | Notes |
 |---|---|---|---|
-| `ATTESTOR_KEYPAIR_PATH` | yes | — | Path to a solana-keygen JSON keypair file (64-byte array) for the issuer/payer authority. Keep it outside the repo. |
+| `ATTESTOR_KEYPAIR_PATH` | yes | none | Path to a solana-keygen JSON keypair file (64-byte array) for the issuer/payer authority. Keep it outside the repo. |
 | `SOLANA_RPC_URL` | no | `https://api.devnet.solana.com` | Must be a devnet (or local) RPC. Refuses to start if it looks like mainnet. |
 | `SOLANA_WS_URL` | no | derived from `SOLANA_RPC_URL` (http→ws, https→wss) | Override if your RPC provider uses a different websocket host. |
 | `ATTESTOR_ALLOW_MAINNET` | no | unset | Set to `1` to bypass the mainnet guard. Not recommended; this service is designed for devnet. |
-| `ATTESTOR_PORT` | no | `8013` | The server only ever binds `127.0.0.1` — it is an internal service, not meant to be exposed. |
+| `ATTESTOR_PORT` | no | `8013` | The server only ever binds `127.0.0.1`, it is an internal service, not meant to be exposed. |
 | `ATTESTOR_INTERNAL_TOKEN` | yes (for any write) | unset | Required value of the `X-Internal-Token` header. If unset, every endpoint except `/healthz` refuses with 403. |
 
 ### Endpoints
 
-- `POST /message` — body: `{claim_id, claim_text, paper_id, verdict, evidence_sha256?, issued_at?}`.
+- `POST /message`, body: `{claim_id, claim_text, paper_id, verdict, evidence_sha256?, issued_at?}`.
   Returns the exact canonical message to sign (`issued_at` is stamped by the
   server when omitted). Lets a caller build the message once here and get
   back exactly what `/attest` will later verify against, instead of
   reimplementing the canonical format itself.
-- `POST /attest` — body: `{claim_id, claim_text, paper_id, verdict, evidence_sha256?, reviewer, signature, issued_at}`.
+- `POST /attest`, body: `{claim_id, claim_text, paper_id, verdict, evidence_sha256?, reviewer, signature, issued_at}`.
   Returns `{attestation, signature, explorer_url, reused, claim_sha256}`.
   400 on bad fields or a signature that doesn't verify; 429 on rate limit;
   502 on an RPC failure.
-- `GET /attestation/:pda` — reads back and decodes an attestation.
-- `GET /healthz` — credential/schema PDAs, whether they exist yet, authority
+- `GET /attestation/:pda`, reads back and decodes an attestation.
+- `GET /healthz`, credential/schema PDAs, whether they exist yet, authority
   pubkey, and SOL balance. Does not require the internal token.
 
 Rate limit: 30 verdicts per hour per `reviewer` pubkey, enforced in memory
-(resets on restart — this is a basic abuse guard, not a durable ledger).
+(resets on restart, this is a basic abuse guard, not a durable ledger).
 
 ### Demo signer
 
@@ -170,21 +170,19 @@ timing-safe `X-Internal-Token` check, and `POST /message` returning the
 message `/attest` will verify against.
 
 `scripts/e2e-devnet.ts` is a manual, network-touching smoke test (airdrop,
-credential/schema creation, one attestation, read-back) — not run in CI.
+credential/schema creation, one attestation, read-back), not run in CI.
 
-## What is not done
+## Status and what is not done
 
-- The devnet end-to-end run (airdrop → credential → schema → attestation →
-  read-back) is implemented in `scripts/e2e-devnet.ts` but could not be
-  executed during development because `api.devnet.solana.com`'s faucet
-  returned `429 airdrop limit reached / faucet dry`. The code path itself is
-  exercised by the unit tests up to (not including) the network calls; it
-  has not been confirmed against a live devnet transaction.
+- The devnet end-to-end path has run. Two live attestations exist on Solana devnet from two different reviewer wallets, on two different claims (GRPO, arXiv 2402.03300, and DeepSeek-R1-Zero, arXiv 2501.12948):
+  - https://explorer.solana.com/address/729nUikYt2SUJaq1Brx2YwXvgLT5J1eVp9sfo31ncswu?cluster=devnet
+  - https://explorer.solana.com/address/6pC4NS96euD9G7jPtjvXbVs1ffaWAjKdJMkX799Mq6eL?cluster=devnet
+  Both reviewers are demo wallets run by the team, so this shows the mechanism works, not independent consensus. `scripts/e2e-devnet.ts` remains a manual smoke test and is not run in CI.
 - `api/main.py` now proxies to this service (`POST /v1/verdict/message`,
   `POST /v1/adjudicate/signed`), and the public MCP exposes it as
   `get_verdict_message` / `record_signed_verdict`. A wallet is still free to
-  create, so this does not by itself stop sybil registrations — quorum
-  requires multiple distinct wallets, and an x402 payment gate on writes is
-  the planned next mitigation.
+  create, so this does not by itself stop sybil registrations. Quorum
+  requires multiple distinct wallets. The paid x402 path (`/x402/mcp`)
+  adds a cost per write but does not remove it.
 - The in-memory rate limiter is per-process and resets on restart; it is not
   meant to survive a restart-based bypass attempt.

@@ -1,3 +1,5 @@
+> Historical snapshot from 2026-09-11; see README.md and SUBMISSION.md for the current state.
+
 # dtox research — Colosseum pitch deck template
 
 Версия: 11 сентября 2026  
@@ -64,12 +66,17 @@ Validate the hypothesis. Inspect the evidence. Build on what is real.
 **One MCP for Web3 R&D**
 
 1. `search_research_paper`
-2. `get_code_or_math_spec`
-3. `compare_methods`
-4. `research_trends`
-5. `validate_project`
-6. `record_claim_judgment`
-7. `link_claim_nodes`
+2. `find_papers`
+3. `get_paper`
+4. `read_paper_section`
+5. `count_papers`
+6. `similar_papers`
+7. `get_code_or_math_spec`
+8. `compare_methods`
+9. `research_trends`
+10. `validate_project`
+11. `get_verdict_message`
+12. `record_signed_verdict`
 
 ### Визуал
 
@@ -140,7 +147,7 @@ Validate the hypothesis. Inspect the evidence. Build on what is real.
 - **13,792** Web3-документа в активном индексе
 - **8,040,959** структурных поисковых чанков
 - **2,858,368** рёбер графа цитирований
-- **7** MCP-инструментов
+- **12** MCP-инструментов
 - **8** типов источников
 - **15,867** документов обработано за последние 24 часа*
 

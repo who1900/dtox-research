@@ -412,20 +412,20 @@
   <div class="wrap">
     <p class="section-label">What it returns</p>
     <h2>Method sections, not paraphrases</h2>
-    <p class="why">Papers are fetched as LaTeX sources and split by structure: equations in raw LaTeX, algorithms, tables and the paragraph where the authors admit what did not work are first-class chunks, not prose a model has to re-derive.</p>
+    <p class="why">Papers are fetched as LaTeX sources and split by structure: equations in raw LaTeX, algorithms, tables and the paragraph where the authors admit what did not work are first-class chunks, not prose a model has to re-derive. Twelve MCP tools cover exploring by paper (<code>find_papers</code>, <code>get_paper</code>, <code>read_paper_section</code>, <code>count_papers</code>, <code>similar_papers</code>), by passage (<code>search_research_paper</code>, <code>get_code_or_math_spec</code>, <code>compare_methods</code>, <code>research_trends</code>), and by claim (<code>validate_project</code>, <code>get_verdict_message</code>, <code>record_signed_verdict</code>).</p>
 
     <div class="grid3">
       <div>
         <h3>Dense</h3>
-        <p class="card-desc">bge-small-en-v1.5, int8 ONNX, 384 dim, over millions of structural chunks in Qdrant.</p>
+        <p class="card-desc">Papers by title and abstract with bge-base-en-v1.5 (768 dim), and millions of structural chunks with bge-small-en-v1.5 (384 dim), both int8 ONNX in Qdrant.</p>
       </div>
       <div>
         <h3>Lexical</h3>
-        <p class="card-desc">BM25 over the same chunks in SQLite FTS5, fused by reciprocal rank. Exact terms like <code>GRPO</code> survive here and drown in embeddings alone.</p>
+        <p class="card-desc">BM25 over papers and over chunks in SQLite FTS5, fused with the dense channels by reciprocal rank. Exact terms like <code>GRPO</code> survive here and drown in embeddings alone.</p>
       </div>
       <div>
         <h3>Citation graph</h3>
-        <p class="card-desc">One hop through the bibliography of the best hits. Does not depend on wording, which is the failure mode the other two channels share.</p>
+        <p class="card-desc">One hop through the bibliography of the best hits. Does not depend on wording, which is the failure mode the other channels share. Copies of one paper from different sources are merged into one result.</p>
       </div>
     </div>
   </div>
@@ -446,15 +446,17 @@
 
     <div class="example">
       <p class="tag">Live example, devnet</p>
-      <p>Claim: <em>GRPO removes the separate value critic model...</em>. Paper arXiv 2402.03300. Verdict: asserts. Two independent wallets agree &rarr; confirmed_prior_art.</p>
+      <p>Claim: <em>GRPO removes the separate value critic model...</em>. Paper arXiv 2402.03300. Verdict: asserts, signed by reviewer wallet A. The registry reports this claim as confirmed_prior_art.</p>
       <a class="explorer" href="https://explorer.solana.com/address/729nUikYt2SUJaq1Brx2YwXvgLT5J1eVp9sfo31ncswu?cluster=devnet" target="_blank" rel="noopener">explorer.solana.com/address/729nUikYt2SUJaq1Brx2YwXvgLT5J1eVp9sfo31ncswu</a>
     </div>
 
     <div class="example">
       <p class="tag">Live example, devnet</p>
-      <p>Paper arXiv 2501.12948, verdict written through a paid x402 call.</p>
+      <p>Claim: <em>DeepSeek-R1-Zero is trained with large-scale reinforcement learning without supervised fine-tuning...</em>. Paper arXiv 2501.12948. Verdict: asserts, signed by a different reviewer wallet (B) and written through a paid x402 call.</p>
       <a class="explorer" href="https://explorer.solana.com/address/6pC4NS96euD9G7jPtjvXbVs1ffaWAjKdJMkX799Mq6eL?cluster=devnet" target="_blank" rel="noopener">explorer.solana.com/address/6pC4NS96euD9G7jPtjvXbVs1ffaWAjKdJMkX799Mq6eL</a>
     </div>
+
+    <p class="why" style="margin-top: 20px;">Both reviewer wallets are demo wallets run by the team, so these two attestations show the mechanism, not independent consensus. Writing through the free endpoint costs nothing; the paid x402 path adds a cost per write but does not remove sybil risk.</p>
   </div>
 </section>
 
@@ -503,9 +505,9 @@
     <p class="section-label">What it does not do</p>
     <h2>Honesty as a feature</h2>
     <ul class="plain divided">
-      <li>Three subjects only: LLMs and small language models, AI agents, and web3. An idea outside that scope is refused, not force-fit.</li>
+      <li>Four layers only: web3 (primary), AI agents, LLMs and small language models, and builder technology. An idea outside that scope is refused, not force-fit.</li>
       <li>No patents. There are none in the corpus, and the service says that rather than letting absence read as novelty.</li>
-      <li>No guarantee that any given paper is present, inside the three subjects or otherwise.</li>
+      <li>No guarantee that any given paper is present, inside the indexed layers or otherwise.</li>
       <li>IACR records are abstract-only and carry <code>fulltext: false</code>.</li>
       <li>Verdicts and attestations are devnet only.</li>
     </ul>
