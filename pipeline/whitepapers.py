@@ -150,6 +150,32 @@ def html_to_text(raw):
     return re.sub(r"[ \t]+", " ", text)
 
 
+ABSTRACT_CHARS = 1200
+_ABSTRACT_HEAD = re.compile(r"(?im)^[#*_\s]*abstract\b[*_:.\s]*")
+_MARKUP = re.compile(r"<sup>.*?</sup>|<[^>]+>|[#*_`]+")
+
+
+def whitepaper_abstract(text):
+    """What the paper-level index embeds beside the title. The first 1200
+    characters of a PDF are usually its author block ("Lorenz Breidenbach<sup>1
+    </sup> Christian Cachin<sup>2</sup> ..."), and Chainlink 2.0 dropped out of
+    the top ten for "decentralized oracle network" on exactly that. Take the
+    text after an Abstract heading, else the first paragraph that reads like
+    prose."""
+    m = _ABSTRACT_HEAD.search(text[:20000])
+    if m:
+        body = _MARKUP.sub(" ", text[m.end():m.end() + ABSTRACT_CHARS * 3])
+        return " ".join(body.split())[:ABSTRACT_CHARS]
+    for para in re.split(r"\n\s*\n", text[:60000]):
+        clean = " ".join(_MARKUP.sub(" ", para).split())
+        words = clean.split()
+        # prose: long enough, mostly lower-case words, few digits or emails
+        if (len(words) >= 40 and "@" not in clean
+                and sum(w[:1].islower() for w in words) > len(words) * 0.5):
+            return clean[:ABSTRACT_CHARS]
+    return " ".join(_MARKUP.sub(" ", text).split())[:ABSTRACT_CHARS]
+
+
 def main():
     dry = "--dry-run" in sys.argv
     conn = sqlite3.connect(service.DB_PATH, timeout=30)
@@ -188,7 +214,7 @@ def main():
         service.write_latex_cache(pid, text)
         (service.FULLTEXT_DIR / f"{service.safe_id(pid)}.tex").write_text(
             text, encoding="utf-8", errors="ignore")
-        abstract = " ".join(text.split())[:1200]
+        abstract = whitepaper_abstract(text)
         conn.execute(
             """INSERT INTO papers (arxiv_id, title, year, layers, status, passed,
                                    abstract, fulltext_source, updated_at, niche_score)
