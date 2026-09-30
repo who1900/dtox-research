@@ -2606,7 +2606,8 @@ def _make_embed_fn(session):
 
 
 def chunk_step(conn, session, limit=CHUNK_CYCLE_LIMIT):
-    rows = conn.execute("SELECT arxiv_id FROM papers WHERE status='fulltext_fetched' LIMIT ?", (limit,)).fetchall()
+    rows = conn.execute("SELECT arxiv_id, fulltext_source FROM papers WHERE status='fulltext_fetched' LIMIT ?",
+                        (limit,)).fetchall()
     processed = 0
     CHUNK_DIR.mkdir(exist_ok=True)
     embed_fn = _make_embed_fn(session)
@@ -2620,7 +2621,9 @@ def chunk_step(conn, session, limit=CHUNK_CYCLE_LIMIT):
             # ACL arrives as markdown too (pymupdf4llm keeps the headings), so
             # it takes the markdown path rather than the LaTeX parser, which
             # would find no \section commands and fall back to one flat blob.
-            if is_spec_source(arxiv_id) or str(arxiv_id).startswith(
+            # oa-mirror-pdf: an IACR paper whose text came from an open copy
+            # (ops/iacr_oa_fulltext.py); it is a PDF conversion, so markdown too
+            if is_spec_source(arxiv_id) or row["fulltext_source"] == "oa-mirror-pdf" or str(arxiv_id).startswith(
                     (ACL_ID_PREFIX, OPENALEX_ID_PREFIX, PMLR_ID_PREFIX, HAL_ID_PREFIX)):
                 chunks, mode = extractor.build_chunks_markdown(text)
             else:
