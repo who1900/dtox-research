@@ -274,15 +274,74 @@ def citation_check(answer, trace, question=""):
             "seen_total": len(seen), "seen_complete": complete}
 
 
+READ_ONLY_TOOLS = {"search_research_paper", "read_paper_section", "get_paper", "find_papers", "count_papers",
+                   "get_code_or_math_spec", "research_trends", "similar_papers", "compare_methods",
+                   "validate_project"}
+RESULT_LIST_CAP = 60
+
+
+def _items(obj):
+    """Result-like dicts (having id/arxiv_id/paper_id) found in a parsed tool response."""
+    out = []
+    if isinstance(obj, dict):
+        if any(isinstance(obj.get(k), str) for k in ("id", "arxiv_id", "paper_id")) and obj.get("title"):
+            out.append(obj)
+        for v in obj.values():
+            if isinstance(v, (list, dict)):
+                out.extend(_items(v))
+    elif isinstance(obj, list):
+        for v in obj:
+            out.extend(_items(v))
+    return out
+
+
+def compact_results(text):
+    """Compact list of results (id, title, section_title, rank/score) from a FULL tool response."""
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return []
+    res, seen = [], set()
+    for i, it in enumerate(_items(obj), 1):
+        rid = it.get("id") or it.get("arxiv_id") or it.get("paper_id")
+        row = {"id": rid, "title": (it.get("title") or "")[:140]}
+        if it.get("section_title"):
+            row["section_title"] = str(it["section_title"])[:80]
+        rank = it.get("relevance_rank") or it.get("rank")
+        row["rank"] = rank if rank is not None else i
+        for k in ("score", "rank_score"):
+            if isinstance(it.get(k), (int, float)):
+                row["score"] = round(it[k], 3)
+                break
+        key = (rid, row.get("section_title"))
+        if key in seen:
+            continue
+        seen.add(key)
+        res.append(row)
+    return res
+
+
+def full_seen(text, results):
+    ids = extract_ids(text)
+    for r in results:
+        if isinstance(r.get("id"), str):
+            ids.add(norm_id(r["id"]) if ":" in r["id"] else r["id"].strip())
+    return sorted(ids)
+
+
 def refetch_seen(mcp, trace):
-    """Legacy traces only: re-run the (read-only) tool calls to recover full result ids."""
+    """Legacy traces: re-run the (read-only) tool calls to recover full-response ids and result lists."""
     for t in trace:
-        if t.get("seen_ids") is not None:
+        if t.get("seen_ids") is not None and t.get("results") is not None:
+            continue
+        if t.get("tool") not in READ_ONLY_TOOLS:
+            t["refetch_skipped"] = True
             continue
         try:
             text, _ = tool_result_text(mcp.rpc("tools/call", {"name": t["tool"], "arguments": t["args"]},
                                               TOOL_CALL_TIMEOUT))
-            t["seen_ids"] = sorted(extract_ids(text[:TOOL_RESULT_CAP]))
+            t["results"] = compact_results(text)
+            t["seen_ids"] = full_seen(text, t["results"])
             t["refetched"] = True
         except Exception:
             pass
@@ -353,8 +412,10 @@ def run_agent(llm, mcp, fn_tools, server_instr, q):
                     exc = f"{type(e).__name__}: {str(e)[:300]}"
                     text, is_err = f"TOOL ERROR: {exc}", True
                 dt = time.time() - ts
+                results = compact_results(text)
                 trace.append({"step": step, "tool": name, "args": args, "seconds": round(dt, 2),
                               "resp_chars": len(text), "error": is_err, "exception": exc,
+                              "seen_ids": full_seen(text, results), "results": results,
                               "excerpt": text[:JUDGE_EXCERPT_CAP]})
                 send = text
                 if len(send) > TOOL_RESULT_CAP:
@@ -368,7 +429,7 @@ def run_agent(llm, mcp, fn_tools, server_instr, q):
 
 
 # ---------------------------------------------------------------- 3. judge
-JUDGE_SYS = """You are a strict, skeptical reviewer of a research-paper search tool used by AI agents. You get the question, the agent's final answer, a DETERMINISTIC CITATION CHECK (ids cited in the answer vs ids that tools actually returned), and raw excerpts of tool results (each excerpt is truncated, so absence from an excerpt alone is not proof of absence; trust the citation check for id provenance). Separate two things:
+JUDGE_SYS = """You are a strict, skeptical reviewer of a research-paper search tool used by AI agents. You get the question, the agent's final answer, a DETERMINISTIC CITATION CHECK (ids cited in the answer vs ids that tools actually returned), and raw excerpts of tool results (each excerpt is truncated, but every call also lists ALL results of the complete response; absence from an excerpt is not proof of absence, and a cited id is unseen only if the citation check says so; trust the citation check for id provenance). Separate two things:
 - PRODUCT = the index and tools (did they surface the right, non-junk sources, fast, without errors).
 - AGENT = the model using them (faithful use of results, honest scope handling, no invented ids).
 Use your own expert knowledge to name canonical works an expert would expect that never appeared. Be concrete and use the FULL 0-2 range; do not default to 1.
@@ -435,8 +496,20 @@ def judge(llm, q, res):
     cc = citation_check(res["answer"], res["trace"], q.get("question", ""))
     parts, total = [], 0
     for i, t in enumerate(res["trace"]):
-        e = f"[call {i + 1}] {t['tool']}({json.dumps(t['args'], ensure_ascii=False)[:300]}) " \
-            f"{t['seconds']}s err={t['error']} chars={t.get('resp_chars')}\n{t['excerpt']}"
+        head = (f"[call {i + 1}] {t['tool']}({json.dumps(t['args'], ensure_ascii=False)[:300]}) "
+                f"{t['seconds']}s err={t['error']} chars={t.get('resp_chars')}")
+        lst = ""
+        rs = t.get("results")
+        if rs:
+            lines = [f"  #{r.get('rank')} {r.get('id')} | {r.get('title')}"
+                     + (f" | sec: {r['section_title']}" if r.get("section_title") else "")
+                     + (f" | score {r['score']}" if r.get("score") is not None else "")
+                     for r in rs[:RESULT_LIST_CAP]]
+            lst = (f"\nFULL RESULT LIST ({len(rs)} results in the complete response, ids+titles only):\n"
+                   + "\n".join(lines))
+        elif t.get("results") is None and t.get("resp_chars", 0) > len(t.get("excerpt", "")):
+            lst = "\n(full result list unavailable for this call; excerpt below is truncated)"
+        e = f"{head}{lst}\nEXCERPT (first {JUDGE_EXCERPT_CAP} chars of the response):\n{t['excerpt']}"
         if total + len(e) > JUDGE_TOTAL_CAP:
             e = e[:max(0, JUDGE_TOTAL_CAP - total)]
         total += len(e)
