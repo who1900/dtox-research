@@ -115,6 +115,61 @@ class GithubDocsNicheTests(unittest.TestCase):
         self.assertTrue(service.forced_web3("gh:anza-docs:0123456789abcdef"))
         self.assertTrue(service.forced_web3("gh:yellowstone-grpc:0123456789abcdef"))
 
+    NEW_SOURCES = ("flashbots-docs", "builder-specs", "mev-share", "suave-docs", "foundry-book",
+                   "openzeppelin-docs", "solidity-docs", "slither", "chainlink-docs", "aave-v3-origin",
+                   "morpho-blue", "morpho-vault-v2", "metamorpho", "cow-protocol", "zksync-docs",
+                   "starknet-docs", "starkex-resources")
+
+    def test_builder_defi_tooling_sources(self):
+        for key in self.NEW_SOURCES:
+            cfg = service.GITHUB_DOC_SOURCES[key]
+            self.assertTrue(cfg.get("web3"), key)
+            self.assertRegex(cfg["repo"], r"^[\w.-]+/[\w.-]+$")
+            self.assertTrue(cfg["paths"] and cfg["branch"], key)
+            self.assertTrue(service.forced_web3(f"gh:{key}:0123456789abcdef"), key)
+            # no translated trees: only English content is listed
+            for path in cfg["paths"]:
+                self.assertNotRegex(path, r"/(fr|fil|pt|ja|zh|zh_t|th|de|vi|tr|kr|id|es|ru)/", (key, path))
+        self.assertEqual(service.GITHUB_DOC_SOURCES["solidity-docs"]["exts"], (".rst",))
+        self.assertIn("src/pages/forge/linting/", service.GITHUB_DOC_SOURCES["foundry-book"]["exclude"])
+        self.assertIn("src/operations/", service.GITHUB_DOC_SOURCES["anza-docs"]["paths"])
+        self.assertIn("docs/", service.GITHUB_DOC_SOURCES["compound-comet"]["paths"])
+
+    def test_tree_filter_extensions_and_exclude(self):
+        import io
+        import json
+        tree = {"tree": [{"type": "blob", "path": p} for p in (
+            "docs/a.rst", "docs/b.md", "docs/brand-guide.rst", "docs/sub/c.rst", "test/x.rst", "docs/conf.py")]}
+
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        service._github_tree_cache.pop("solidity-docs", None)
+        with patch.object(service.urllib.request, "urlopen", return_value=Resp(json.dumps(tree).encode())):
+            paths = service.github_doc_files("solidity-docs")
+        service._github_tree_cache.pop("solidity-docs", None)
+        self.assertEqual(paths, ["docs/a.rst", "docs/sub/c.rst"])
+
+    def test_rst_to_markdown(self):
+        rst = "\n".join([
+            ".. index:: ! visibility", "", ".. _label:", "", "*****", "Title", "*****", "",
+            "A ``public`` var, see :ref:`the guide <x>`.", "", "Example::", "", "    uint x;", "",
+            "Sub", "===", "", ".. code-block:: solidity", "    :force:", "", "    uint y;", ""])
+        md = service.rst_to_markdown(rst)
+        self.assertIn("# Title", md)
+        self.assertIn("## Sub", md)
+        self.assertIn("`public`", md)
+        self.assertIn("`the guide`", md)
+        self.assertIn("```solidity\nuint y;\n```", md)
+        self.assertIn("```\nuint x;\n```", md)
+        self.assertNotIn("index::", md)
+        self.assertNotIn(":force:", md)
+        self.assertEqual(service._github_doc_title(md, "docs/x.rst"), "Title")
+
     def test_title_prefers_front_matter(self):
         text = "---\ntitle: Durable Nonces\n---\n\n```bash\n# not a title\n```\n"
         self.assertEqual(service._github_doc_title(text, "x/durable-nonces.mdx"), "Durable Nonces")

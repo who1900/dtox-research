@@ -566,7 +566,7 @@ GITHUB_DOC_SOURCES = {
     "lido": {"repo": "lidofinance/docs", "branch": "main", "web3": True,
              "paths": ("docs/", "earn/architecture/")},
     "compound-comet": {"repo": "compound-finance/comet", "branch": "main", "web3": True,
-                       "paths": ("README.md", "SPEC.md")},
+                       "paths": ("README.md", "SPEC.md", "docs/")},
     "gmx-synthetics": {"repo": "gmx-io/gmx-synthetics", "branch": "main", "web3": True,
                        "paths": ("README.md",)},
     # Solana validator/runtime docs moved out of anza-xyz/agave (docs/README.md
@@ -574,11 +574,65 @@ GITHUB_DOC_SOURCES = {
     # guide is src/validator/geyser.md.
     "anza-docs": {"repo": "anza-xyz/docs.anza.xyz", "branch": "main", "web3": True,
                   "paths": ("src/validator/", "src/runtime/", "src/consensus/",
-                            "src/implemented-proposals/", "src/proposals/")},
+                            "src/implemented-proposals/", "src/proposals/",
+                            "src/operations/", "src/clusters/", "src/cli/")},
     # Yellowstone gRPC (Geyser-based streaming): the root README is the protocol
     # and deployment guide, the example READMEs cover each client language.
     "yellowstone-grpc": {"repo": "rpcpool/yellowstone-grpc", "branch": "master", "web3": True,
                          "paths": ("README.md", "examples/", "yellowstone-grpc-client-nodejs/README.md")},
+    # --- Builder/MEV, tooling, DeFi, oracle and zk-rollup docs (English only) ---
+    # "exts" widens the default (.md, .mdx); "exclude" drops path prefixes that
+    # sit inside an included prefix (machine-generated CLI pages, legal pages).
+    "flashbots-docs": {"repo": "flashbots/flashbots-docs", "branch": "main", "web3": True,
+                       "paths": ("docs/flashbots-auction/", "docs/flashbots-mev-boost/",
+                                 "docs/flashbots-mev-share/", "docs/flashbots-protect/", "docs/specs/",
+                                 "docs/new-to-mev.mdx", "docs/welcome.mdx", "docs/cheatsheet.mdx",
+                                 "docs/guide-send-tx-bundle.mdx")},
+    "builder-specs": {"repo": "ethereum/builder-specs", "branch": "main", "web3": True,
+                      "paths": ("README.md", "specs/")},
+    "mev-share": {"repo": "flashbots/mev-share", "branch": "main", "web3": True,
+                  "paths": ("README.md", "specs/")},
+    "suave-docs": {"repo": "flashbots/suave-docs", "branch": "main", "web3": True,
+                   "paths": ("docs/concepts/", "docs/tools/", "docs/tutorials/", "docs/index.mdx")},
+    "foundry-book": {"repo": "foundry-rs/book", "branch": "master", "web3": True,
+                     "paths": ("src/pages/anvil/", "src/pages/cast/", "src/pages/chisel/", "src/pages/config/",
+                               "src/pages/forge/", "src/pages/guides/", "src/pages/projects/",
+                               "src/pages/introduction/", "src/pages/help/",
+                               "src/pages/reference/cheatcodes/", "src/pages/reference/forge-std/"),
+                     "exclude": ("src/pages/forge/linting/",)},
+    "openzeppelin-docs": {"repo": "OpenZeppelin/docs", "branch": "main", "web3": True,
+                          "paths": ("content/contracts/5.x/", "content/contracts/index.mdx",
+                                    "content/community-contracts/", "content/upgrades-plugins/")},
+    "solidity-docs": {"repo": "ethereum/solidity", "branch": "develop", "web3": True,
+                      "paths": ("docs/",), "exts": (".rst",),
+                      "exclude": ("docs/brand-guide", "docs/credits-and-attribution", "docs/contributing",
+                                  "docs/language-influences")},
+    "slither": {"repo": "crytic/slither", "branch": "master", "web3": True,
+                "paths": ("README.md", "docs/src/")},
+    "chainlink-docs": {"repo": "smartcontractkit/documentation", "branch": "main", "web3": True,
+                       "paths": ("src/content/data-feeds/", "src/content/data-streams/", "src/content/vrf/",
+                                 "src/content/chainlink-automation/", "src/content/chainlink-functions/",
+                                 "src/content/architecture-overview/", "src/content/ccip/v2/",
+                                 "src/content/ccip/v1/concepts/", "src/content/ccip/v1/overview.mdx",
+                                 "src/content/cre/concepts/"),
+                       "exclude": ("src/content/ccip/v2/canton/",)},
+    "aave-v3-origin": {"repo": "bgd-labs/aave-v3-origin", "branch": "main", "web3": True,
+                       "paths": ("README.md", "docs/")},
+    "morpho-blue": {"repo": "morpho-org/morpho-blue", "branch": "main", "web3": True, "paths": ("README.md",)},
+    "morpho-vault-v2": {"repo": "morpho-org/vault-v2", "branch": "main", "web3": True,
+                        "paths": ("README.md", "src/periphery/README.md")},
+    "metamorpho": {"repo": "morpho-org/metamorpho-v1.1", "branch": "main", "web3": True,
+                   "paths": ("README.md",)},
+    "cow-protocol": {"repo": "cowprotocol/docs", "branch": "main", "web3": True,
+                     "paths": ("docs/cow-protocol/", "docs/mevblocker/")},
+    "zksync-docs": {"repo": "matter-labs/zksync-docs", "branch": "main", "web3": True,
+                    "paths": ("content/10.zk-stack/", "content/20.zksync-protocol/")},
+    "starknet-docs": {"repo": "starknet-io/starknet-docs", "branch": "main", "web3": True,
+                      "paths": ("learn/protocol/", "learn/S-two-book/", "learn/cheatsheets/", "learn/intro.mdx",
+                                "build/quickstart/", "build/starknet-by-example/", "secure/quickstart/")},
+    "starkex-resources": {"repo": "starkware-libs/starkex-resources", "branch": "master", "web3": True,
+                          "paths": ("README.md", "committee/README.md", "stark_ex_objects/README.md",
+                                    "storage/README.md")},
 }
 GITHUB_DOCS_PER_CYCLE = 20
 GITHUB_DOC_DELAY_SECONDS = 0.2
@@ -626,6 +680,96 @@ def _spec_body(text):
         if end != -1:
             return text[end + 4:]
     return text
+
+
+_RST_ADORN_RE = re.compile(r"^([=\-~^\"'`#*+._:])\1{2,}\s*$")
+_RST_CODE_DIRECTIVE_RE = re.compile(r"^\.\.\s+(?:code-block|sourcecode|code)::\s*(\S*)")
+_RST_SKIP_DIRECTIVE_RE = re.compile(r"^\.\.\s+(?:index::|toctree::|contents::|include::|only::|_[^:]+:|\|[^|]+\|)")
+_RST_ADMONITION_RE = re.compile(r"^\.\.\s+(note|warning|tip|important|caution|danger|hint|attention|seealso)::\s*(.*)$", re.I)
+
+
+def _rst_inline(line):
+    line = re.sub(r":[A-Za-z:_-]+:`~?([^`<]*?)(?:\s*<[^`>]*>)?`", lambda m: f"`{m.group(1).strip()}`", line)
+    return re.sub(r"``([^`]+)``", r"`\1`", line)
+
+
+def rst_to_markdown(text):
+    """Minimal reStructuredText -> markdown so Solidity's docs go through the
+    markdown chunker: adornment headings become #-headings (level by first
+    appearance), code-block/:: literal blocks become fences, index/toctree
+    directives are dropped, roles and ``literals`` are flattened."""
+    lines = text.replace("\t", "    ").splitlines()
+    out, levels, i, n = [], {}, 0, len(lines)
+
+    def take_block(start):
+        j, block = start, []
+        while j < n and (not lines[j].strip() or lines[j].startswith((" ", "\t"))):
+            block.append(lines[j])
+            j += 1
+        while block and not block[-1].strip():
+            block.pop()
+        while block and not block[0].strip():
+            block.pop(0)
+        return block, j
+
+    def fence(block, lang=""):
+        body = [b for b in block if not re.match(r"^\s+:[\w-]+:", b)]
+        while body and not body[0].strip():
+            body.pop(0)
+        pad = min((len(b) - len(b.lstrip()) for b in body if b.strip()), default=0)
+        out.append("```" + lang)
+        out.extend(b[pad:] for b in body)
+        out.append("```")
+        out.append("")
+
+    while i < n:
+        line = lines[i]
+        m = _RST_CODE_DIRECTIVE_RE.match(line)
+        if m:
+            block, i = take_block(i + 1)
+            fence(block, m.group(1))
+            continue
+        if _RST_SKIP_DIRECTIVE_RE.match(line):
+            _, i = take_block(i + 1)
+            continue
+        m = _RST_ADMONITION_RE.match(line)
+        if m:
+            body, i = take_block(i + 1)
+            pad = min((len(x) - len(x.lstrip()) for x in body if x.strip()), default=0)
+            first = _rst_inline(m.group(2)) or (_rst_inline(body.pop(0)[pad:]) if body else "")
+            out.append(f"**{m.group(1).title()}:** {first}".rstrip())
+            out.extend(_rst_inline(x[pad:]) for x in body)
+            out.append("")
+            continue
+        if line.startswith(".. "):  # any other directive or comment: keep the body, drop the marker
+            i += 1
+            continue
+        if (line.strip() and not _RST_ADORN_RE.match(line) and i + 1 < n
+                and _RST_ADORN_RE.match(lines[i + 1]) and len(lines[i + 1].strip()) >= len(line.strip()) - 1):
+            key = lines[i + 1].strip()[0]
+            out.append("#" * levels.setdefault(key, len(levels) + 1) + " " + _rst_inline(line.strip()))
+            i += 2
+            continue
+        if (_RST_ADORN_RE.match(line) and i + 2 < n and lines[i + 1].strip()
+                and _RST_ADORN_RE.match(lines[i + 2])):  # over- and underlined title
+            key = "o" + line.strip()[0]
+            out.append("#" * levels.setdefault(key, len(levels) + 1) + " " + _rst_inline(lines[i + 1].strip()))
+            i += 3
+            continue
+        stripped = line.rstrip()
+        if stripped.endswith("::") and not stripped.lstrip().startswith(".."):
+            out.append(_rst_inline(stripped[:-2].rstrip() + (":" if stripped[:-2].strip() else "")))
+            block, j = take_block(i + 1)
+            if block:
+                out.append("")
+                fence(block)
+                i = j
+                continue
+            i += 1
+            continue
+        out.append(_rst_inline(line))
+        i += 1
+    return "\n".join(out)
 
 
 _MOVED_STUB_RE = re.compile(r"this file was moved to\s+https?://github\.com/ethereum/ercs", re.I)
@@ -755,8 +899,9 @@ def github_doc_files(source_key):
     paths = sorted(
         item.get("path") for item in tree
         if isinstance(item, dict) and item.get("type") == "blob"
-        and str(item.get("path", "")).lower().endswith((".md", ".mdx"))
+        and str(item.get("path", "")).lower().endswith(tuple(cfg.get("exts", (".md", ".mdx"))))
         and any(str(item.get("path", "")).startswith(prefix) for prefix in cfg["paths"])
+        and not any(str(item.get("path", "")).startswith(prefix) for prefix in cfg.get("exclude", ()))
     )
     _github_tree_cache[source_key] = paths
     return paths
@@ -803,6 +948,8 @@ def fetch_github_doc_batch(source_key, start, count):
         except Exception as e:
             log.warning(f"github_docs: fetch failed for {cfg['repo']}:{path}: {e}")
             continue
+        if path.lower().endswith(".rst"):
+            text = rst_to_markdown(text)
         if len(text.strip()) < 200 or len(text) > 500_000:
             continue
         digest = hashlib.sha256(f"{cfg['repo']}:{path}".encode()).hexdigest()[:16]
