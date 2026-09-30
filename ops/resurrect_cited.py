@@ -40,6 +40,7 @@ import argparse
 import collections
 import contextlib
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -156,6 +157,8 @@ def parse_args(argv=None):
     ap.add_argument("--gate", choices=("skip", "keep"), default="skip")
     ap.add_argument("--limit", type=int, default=500, help="max papers changed per --apply (0 = no cap)")
     ap.add_argument("--top", type=int, default=30, help="rows to print")
+    ap.add_argument("--title-include", default="", help="regex a candidate's title must match")
+    ap.add_argument("--title-exclude", default="", help="regex a candidate's title must not match")
     ap.add_argument("--db", default=os.path.join(DATA_DIR, "state.db"))
     ap.add_argument("--lock", default=os.path.join(DATA_DIR, "resurrect_cited.lock"))
     return ap.parse_args(argv)
@@ -189,6 +192,14 @@ def main(argv=None):
             conn = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True, timeout=30)
         try:
             cands = find_candidates(conn, args.min_citers, layers=layers or None)
+            # citers carry their own mistakes: astronomy reached web3 through
+            # papers mislabelled web3, so the title must still say the subject
+            if args.title_include:
+                inc = re.compile(args.title_include, re.I)
+                cands = [c for c in cands if inc.search(c.get("title") or "")]
+            if args.title_exclude:
+                exc = re.compile(args.title_exclude, re.I)
+                cands = [c for c in cands if not exc.search(c.get("title") or "")]
             report(cands, args.top, "would resurrect" if not args.apply else "candidates")
             if args.apply:
                 n = resurrect(conn, cands, args.gate, args.limit)
