@@ -12,6 +12,7 @@ MCP clients never see it.
 import json
 import os
 from pathlib import Path
+from urllib.parse import quote
 from typing import List, Optional, Union
 
 import requests
@@ -58,6 +59,19 @@ builder-tech. Treat it as a library you explore in steps, not a single search:
 - Whether an idea already exists: validate_project with each claim phrased
   two or three ways.
 
+How to ask:
+- Keep queries short and exact: a paper's name ("HotStuff", "Reflexion") or
+  an identifier ("EIP-7702", "SIMD-96", "2303.11366", "iacr:2019/953") finds
+  that document first. Do not pad a name with keywords.
+- To find the canon on a subject start with find_papers (sort="foundational"
+  or "relevance"), or open a known id with get_paper.
+- "Does this idea already exist": validate_project, not search.
+  "A versus B": compare_methods.
+- Leave min_score unset: scores on this index are calibrated per layer and a
+  high min_score only removes good hits (it is capped, and the answer says so).
+- Leave layer unset unless you are sure: ai-agents and llm-slm overlap (agent
+  papers are often tagged llm-slm), so layer there is a soft preference.
+
 Cite every claim with the paper id and url you got it from. An empty result
 over a large corpus_coverage is evidence; over a small one it is an empty
 shelf. The index holds no patents.
@@ -71,6 +85,13 @@ mcp = FastMCP(
     stateless_http=True,
     transport_security=transport_security,
 )
+
+
+def _path_id(paper_id):
+    """A document id as URL path: ids such as iacr:2019/953 keep their slash and
+    colon (the API routes take a path), anything else that could break the URL
+    (spaces, ?, #) is percent-encoded."""
+    return quote(str(paper_id).strip(), safe="/:")
 
 
 def _headers():
@@ -120,13 +141,19 @@ def search_research_paper(
     method, architecture, results, limitations, etc), not just abstracts.
 
     Args:
-        query: Natural language search query (e.g. "graph neural network
+        query: Short natural language query (e.g. "graph neural network
             for molecule generation", "sybil resistance in prediction
-            markets").
+            markets"), or a document's name or identifier ("HotStuff",
+            "EIP-7702", "2303.11366"), which returns that document first
+            (found_via "exact id" or "title match"). Prefer short and
+            precise over long keyword lists.
         layer: Optional filter restricting results to one topical layer.
             One of: "llm-slm" (LLMs / small language models), "web3"
             (blockchain/crypto), "ai-agents" (agentic systems). Omit to
-            search across all layers.
+            search across all layers, and omit it when unsure. "ai-agents"
+            and "llm-slm" are soft: each also searches the other, since
+            agent classics are often tagged llm-slm only. "web3" and
+            "builder-tech" are strict.
         section_type: Optional filter restricting results to a specific
             paper section. One of: "method", "experiments" (results and
             benchmarks), "limitations", "analysis", "introduction",
@@ -145,11 +172,12 @@ def search_research_paper(
             "pbs") cannot match anything: it is listed under
             "terms_resolution.unknown" and the search runs without it, so put
             such identifiers in query instead.
-        min_score: Relevance floor (default 0.79). Cosine scores run high
-            on this index, so off-topic queries otherwise return
-            confident-looking noise around 0.75; below the floor the
-            database reports no results instead. Lower it only to see
-            weak matches deliberately.
+        min_score: Leave unset. The default floor is calibrated per layer
+            (0.79 for LLM text, 0.70 for web3) because cosine scores run high
+            on this index. A value above the floor is capped at floor + 0.03
+            (see "min_score_note"; hits under your value carry
+            "below_min_score"), since 0.7-0.9 would drop good web3 hits.
+            Lower it only to see weak matches deliberately.
         year_from: Earliest publication year to accept. In these fields a
             2019 result can be actively misleading, so pin recency when the
             question is about current practice: year_from=2025 for "what do
@@ -236,13 +264,19 @@ def find_papers(
     "newest work on agent memory") rather than about a passage inside them.
 
     Args:
-        query: The subject in plain words, e.g. "maximal extractable value".
-        layer: Optional: "web3", "ai-agents", "llm-slm" or "builder-tech".
+        query: The subject in plain words, e.g. "maximal extractable value",
+            or a paper's name or identifier ("Reflexion", "EIP-7702"), which
+            is returned first (found_via "title match" / "exact id").
+        layer: Optional, leave unset if unsure: "web3", "ai-agents",
+            "llm-slm" or "builder-tech". A named paper is found in any layer.
         sort: "relevance" (default); "foundational" (the papers the relevant
             ones cite most, found through the citation graph, so classics
             that predate today's vocabulary still appear: best for "where do
             I start" and "what are the key papers"); "citations" (most cited
             among the 30 most relevant); "recent" (newest first among them).
+            For documents with no citation data (EIPs, whitepapers, code
+            docs) foundational falls back to citations inside the corpus,
+            then to relevance; it is never empty when relevance is not.
         year_from / year_to: Publication year window.
         limit: 1-30, default 10.
 
@@ -300,7 +334,7 @@ def get_paper(paper_id: str) -> dict:
         cited_by_in_corpus totals) and twins.
     """
     try:
-        resp = requests.get(f"{RESEARCH_API_BASE}/v1/paper/{paper_id}", headers=_headers(), timeout=30)
+        resp = requests.get(f"{RESEARCH_API_BASE}/v1/paper/{_path_id(paper_id)}", headers=_headers(), timeout=30)
     except requests.RequestException as e:
         return {"error": f"could not reach research API: {e}"}
     err = _handle_error(resp)
@@ -340,7 +374,7 @@ def read_paper_section(
     if section_type:
         params["section_type"] = section_type
     try:
-        resp = requests.get(f"{RESEARCH_API_BASE}/v1/paper/{paper_id}/section", headers=_headers(),
+        resp = requests.get(f"{RESEARCH_API_BASE}/v1/paper/{_path_id(paper_id)}/section", headers=_headers(),
                             params=params, timeout=30)
     except requests.RequestException as e:
         return {"error": f"could not reach research API: {e}"}
@@ -424,7 +458,7 @@ def similar_papers(paper_id: str, limit: int = 10, layer: Optional[str] = None) 
     if layer:
         params["layer"] = layer
     try:
-        resp = requests.get(f"{RESEARCH_API_BASE}/v1/paper/{paper_id}/similar", headers=_headers(),
+        resp = requests.get(f"{RESEARCH_API_BASE}/v1/paper/{_path_id(paper_id)}/similar", headers=_headers(),
                             params=params, timeout=30)
     except requests.RequestException as e:
         return {"error": f"could not reach research API: {e}"}
@@ -469,7 +503,7 @@ def get_code_or_math_spec(
         params["target_elements"] = target_elements
     try:
         resp = requests.get(
-            f"{RESEARCH_API_BASE}/v1/paper/{arxiv_id}/spec",
+            f"{RESEARCH_API_BASE}/v1/paper/{_path_id(arxiv_id)}/spec",
             headers=_headers(), params=params, timeout=30,
         )
     except requests.RequestException as e:

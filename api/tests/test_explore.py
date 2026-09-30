@@ -73,7 +73,7 @@ class FindPapersTest(unittest.TestCase):
              patch.object(main, "_ro_conn", return_value=Conn()), \
              patch.object(main, "_twins", return_value=TWINS):
             out = main.find_papers(body)
-        self.assertEqual([p["id"] for p in out["papers"]], ["1904.05234", "2406.13352"])
+        self.assertEqual([p["id"] for p in out["papers"]][:2], ["1904.05234", "2406.13352"])
         self.assertIsNone(out["papers"][0]["relevance_rank"])
         self.assertEqual(out["papers"][0]["cited_by_pool"], 5)
 
@@ -302,7 +302,7 @@ class SimilarTest(unittest.TestCase):
     def test_route_is_ahead_of_the_catch_all(self):
         paths = [r.path for r in main.app.routes]
         self.assertLess(paths.index("/v1/paper/{paper_id:path}/similar"), paths.index("/v1/paper/{paper_id:path}"))
-        self.assertIn("/v1/paper/{arxiv_id}/spec", paths)
+        self.assertIn("/v1/paper/{arxiv_id:path}/spec", paths)
 
 
 if __name__ == "__main__":

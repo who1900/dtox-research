@@ -22,9 +22,11 @@ from pydantic import BaseModel, Field
 try:
     from .search_core import fts_query, fts_query_any, merge_layer_hits, merge_layer_hits_calibrated, reciprocal_rank_fusion
     from .boilerplate import is_boilerplate_chunk
+    from .exact_match import TitleIndex, extract_ids
 except ImportError:
     from search_core import fts_query, fts_query_any, merge_layer_hits, merge_layer_hits_calibrated, reciprocal_rank_fusion
     from boilerplate import is_boilerplate_chunk
+    from exact_match import TitleIndex, extract_ids
 
 # Preamble/author-block/checklist/reference chunks must not stand in for their
 # paper in search results. 0 restores the old behavior.
@@ -1782,7 +1784,8 @@ def _auto_relax(body, payload, results, active, terms, limit, x_api_key):
         for n in dropped:
             update.update({f: None for f in _RELAX_FIELDS[n]})
         try:
-            got = _run_search(body.model_copy(update=update), x_api_key).get("results", [])
+            got = _run_search(body.model_copy(update=update), x_api_key,
+                              _top=False).get("results", [])
         except HTTPException:
             continue
         have = {canonical_id(r["arxiv_id"]) for r in results}
@@ -1805,10 +1808,174 @@ def _auto_relax(body, payload, results, active, terms, limit, x_api_key):
         return
 
 
+# ---------------- exact names, soft layers ----------------
+
+EXACT_MATCH = os.getenv("EXACT_MATCH", "1") == "1"
+SOFT_LAYERS = os.getenv("SOFT_LAYERS", "1") == "1"
+EXACT_MAX = 3
+_TITLE_INDEX = {"built": 0.0, "index": None}
+_TITLE_INDEX_LOCK = threading.Lock()
+TITLE_INDEX_TTL = 3600
+
+
+def _build_title_index():
+    try:
+        rows = _ro_conn(STATE_DB_PATH).execute(
+            "SELECT arxiv_id, title, citation_count FROM papers WHERE status='done'").fetchall()
+        built = TitleIndex(rows)
+    except Exception:
+        _ro_conn_drop(STATE_DB_PATH)
+        built = None
+    with _TITLE_INDEX_LOCK:
+        if built is not None:
+            _TITLE_INDEX["index"] = built
+            _TITLE_INDEX["built"] = time.time()
+        _TITLE_INDEX["loading"] = False
+
+
+def _title_index():
+    """Title phrases of every finished paper, rebuilt hourly in the background.
+
+    Building takes seconds, so a request never waits for it: until the first
+    build finishes (started at startup) title matching is simply skipped."""
+    with _TITLE_INDEX_LOCK:
+        stale = _TITLE_INDEX["index"] is None or time.time() - _TITLE_INDEX["built"] >= TITLE_INDEX_TTL
+        if stale and not _TITLE_INDEX.get("loading"):
+            _TITLE_INDEX["loading"] = True
+            threading.Thread(target=_build_title_index, daemon=True).start()
+        return _TITLE_INDEX["index"]
+
+
+@app.on_event("startup")
+def _warm_title_index():
+    if EXACT_MATCH:
+        _title_index()
+
+
+def _exact_matches(query):
+    """[(paper_id, "exact id" | "title match")] for documents the query names, verified in the corpus."""
+    if not EXACT_MATCH:
+        return []
+    named = [(d, "exact id") for d in extract_ids(query)]
+    index = _title_index()
+    if index is not None:
+        named += index.match(query)
+    if not named:
+        return []
+    rows = _paper_rows([d for d, _ in named])
+    out, seen = [], set()
+    for doc_id, via in named:
+        head = canonical_id(doc_id)
+        if doc_id not in rows and head in rows:
+            doc_id = head
+        if doc_id not in rows or head in seen:
+            continue
+        seen.add(head)
+        out.append((doc_id, via))
+    return out[:EXACT_MAX]
+
+
+TITLE_MATCH_SLOT = 2  # a title match may be a coincidence of wording: third place at best
+
+
+def _place_named(named_items, rest):
+    """Identifier matches lead; title matches take at most the third place, or
+    keep the better place they already held in `rest`."""
+    ids = [r for r in named_items if r.get("found_via") == "exact id"]
+    titles = [r for r in named_items if r.get("found_via") != "exact id"]
+    heads = {canonical_id(r["arxiv_id"]) for r in named_items}
+    others = [r for r in rest if canonical_id(r["arxiv_id"]) not in heads]
+    out = ids + others
+    for item in titles:
+        old = next((i for i, r in enumerate(rest) if canonical_id(r["arxiv_id"]) == canonical_id(item["arxiv_id"])), None)
+        slot = min(TITLE_MATCH_SLOT, len(out))
+        if old is not None and old < slot:
+            slot = old
+        out.insert(slot, item)
+    return out
+
+
+def _inject_exact(results, query, constraints, limit, timeout):
+    """Put the documents the query names at the top, whatever else was found.
+
+    Identifiers and titles are not subject queries: EIP-7702 came back outside
+    the first ten, and a long HotStuff query lost the paper whose name it
+    carried. The filters other than layer still apply, so a named paper the
+    caller excluded by year or section stays excluded."""
+    named = _exact_matches(query)
+    if not named:
+        return results
+    by_head = {canonical_id(r["arxiv_id"]): r for r in results}
+    missing = [d for d, _ in named if canonical_id(d) not in by_head]
+    fresh = {}
+    if missing:
+        for item in _score_specific_papers(query, missing, None, timeout=timeout,
+                                           constraints=constraints):
+            fresh[item["arxiv_id"]] = item
+    front = []
+    for doc_id, via in named:
+        item = by_head.get(canonical_id(doc_id)) or fresh.get(doc_id)
+        if item is None:
+            continue
+        item["found_via"] = via
+        channels = item.setdefault("channels", [])
+        if "exact" not in channels:
+            channels.append("exact")
+        if item not in front:
+            front.append(item)
+    if not front:
+        return results
+    new_ids = [r["arxiv_id"] for r in front if "niche_score" not in r]
+    if new_ids:
+        facts = _paper_facts(new_ids)
+        for r in front:
+            if "niche_score" not in r:
+                r["niche_score"] = facts.get(r["arxiv_id"])
+                r["rank_score"] = round(_rank_score(r), 4)
+    return _collapse_twins(_place_named(front, results))[:limit]
+
+
+# The agent's own cut-offs are read against this index's calibrated bands: an
+# on-topic web3 hit scores 0.72-0.77 and an on-topic LLM hit 0.82-0.92, so a
+# min_score of 0.8 or 0.9 silently empties whole layers. A caller may raise the
+# calibrated floor by this much and no further; the answer says when it did not
+# get exactly what it asked for.
+MIN_SCORE_MAX_RAISE = 0.03
+
+# Canon by layer: MemGPT, Generative Agents, Voyager, AutoGen, SayCan and RAG are
+# tagged llm-slm only, so layer=ai-agents dropped them. For these two layers the
+# other one is searched too and the lists are fused; web3 and builder-tech stay
+# hard filters, where excluding the rest is what keeps noise out.
+SOFT_LAYER_PARTNER = {"ai-agents": "llm-slm", "llm-slm": "ai-agents"}
+_AGENT_CONTEXT = re.compile(
+    r"\b(agents?|agentic|multi-?agent|autonomous|tool[\s-]?use|tool[\s-]?calling|"
+    r"function[\s-]?calling|planner|planning|embodied)\b", re.I)
+
+
+def _soft_partner(layer, query):
+    partner = SOFT_LAYER_PARTNER.get(layer)
+    if not SOFT_LAYERS or partner is None:
+        return None
+    if layer == "llm-slm" and not _AGENT_CONTEXT.search(query or ""):
+        return None
+    return partner
+
+
+def _merge_soft_layers(primary, partner_payload, limit):
+    """Rank-fuse the requested layer with its partner, one row per paper."""
+    lists = [[r["arxiv_id"] for r in p.get("results", [])] for p in (primary, partner_payload)]
+    fused = reciprocal_rank_fusion(*lists)
+    pool = {}
+    for r in [*partner_payload.get("results", []), *primary.get("results", [])]:
+        pool[r["arxiv_id"]] = r
+    order = sorted(pool, key=lambda a: (-fused.get(a, 0), lists[0].index(a) if a in lists[0] else 99))
+    return _collapse_twins([pool[a] for a in order])[:limit]
+
+
 def _run_search(body: SearchBody, x_api_key=None,
                 dense_timeout=SEARCH_QDRANT_TIMEOUT,
                 embed_wait_timeout=SEARCH_EMBED_WAIT_TIMEOUT,
-                embed_http_timeout=SEARCH_EMBED_HTTP_TIMEOUT):
+                embed_http_timeout=SEARCH_EMBED_HTTP_TIMEOUT, _top=True):
     """The search itself, without the rate limiter.
 
     /v1/validate runs several searches per claim (each phrasing, the corpus
@@ -1821,7 +1988,7 @@ def _run_search(body: SearchBody, x_api_key=None,
         # the cache holds the full shape; compacting a copy afterwards keeps
         # both shapes correct without a second cache entry per query
         full = _run_search(body.model_copy(update={"compact": False}), x_api_key,
-                           dense_timeout, embed_wait_timeout, embed_http_timeout)
+                           dense_timeout, embed_wait_timeout, embed_http_timeout, _top)
         return _compact_search(full)
 
     query = (body.query or "").strip()
@@ -1837,6 +2004,8 @@ def _run_search(body: SearchBody, x_api_key=None,
     cache_key = (query, body.layer, body.section_type, body.element_type,
                  tuple(sorted(terms)), tuple(unknown_terms), body.dedupe, body.min_score,
                  body.year_from, body.year_to, limit, body.hybrid, relax_on)
+    if not _top:
+        cache_key += ("inner",)
     cached = search_cache.get(cache_key)
     if cached is not None:
         return cached
@@ -1858,6 +2027,38 @@ def _run_search(body: SearchBody, x_api_key=None,
             rng["lte"] = body.year_to
         must.append({"key": "year", "range": rng})
     qfilter = {"must": must} if must else None
+    constraints = [m for m in must if m["key"] != "layers"]
+
+    partner = _soft_partner(body.layer, query) if _top else None
+    if partner:
+        sibling_body = body.model_copy(update={"layer": partner, "diagnose": False,
+                                               "auto_relax": False, "limit": limit})
+        with ThreadPoolExecutor(max_workers=1) as side:
+            side_future = side.submit(_run_search, sibling_body, x_api_key, dense_timeout,
+                                      embed_wait_timeout, embed_http_timeout, False)
+            payload = dict(_run_search(body, x_api_key, dense_timeout, embed_wait_timeout,
+                                       embed_http_timeout, False))
+            try:
+                other = side_future.result(timeout=dense_timeout + 5)
+            except (HTTPException, FuturesTimeoutError):
+                other = None
+        if other and other.get("results"):
+            payload["results"] = _merge_soft_layers(payload, other, limit)
+            payload["count"] = len(payload["results"])
+            payload["layer_expanded"] = {
+                "requested": body.layer, "also_searched": partner,
+                "note": (f"{body.layer} is a soft filter: papers tagged {partner} are merged in, "
+                         "because canonical work on agents is often tagged llm-slm only")}
+            payload.pop("why_empty", None)
+        payload["results"] = _inject_exact(payload["results"], query, constraints, limit, dense_timeout)
+        payload["count"] = len(payload["results"])
+        if payload.get("title_lookup") and payload["count"]:
+            named = _lookup_note(query, payload["results"])
+            if named is None:
+                payload.pop("title_lookup")
+        if not payload.get("partial"):
+            search_cache.set(cache_key, payload)
+        return payload
 
     # HIER_CHUNK_LEXICAL=0: skip firing the chunk-level BM25 query up front,
     # betting that hierarchical search (already running the paper-level BM25
@@ -1962,14 +2163,23 @@ def _run_search(body: SearchBody, x_api_key=None,
     if dense_error and not lexical:
         raise dense_error
 
-    if body.min_score is not None:
-        floor = body.min_score
-    elif body.layer:
-        floor = MIN_RELEVANCE_BY_LAYER.get(body.layer, MIN_RELEVANCE_SCORE)
+    if body.layer:
+        default_floor = MIN_RELEVANCE_BY_LAYER.get(body.layer, MIN_RELEVANCE_SCORE)
     else:
         # unfiltered search spans every topic, so use the gentler bar and let
         # ranking sort it out rather than dropping a whole layer's answers
-        floor = min([MIN_RELEVANCE_SCORE] + list(MIN_RELEVANCE_BY_LAYER.values()))
+        default_floor = min([MIN_RELEVANCE_SCORE] + list(MIN_RELEVANCE_BY_LAYER.values()))
+    floor = default_floor
+    min_score_note = None
+    if body.min_score is not None:
+        floor = min(body.min_score, default_floor + MIN_SCORE_MAX_RAISE)
+        if body.min_score > floor + 1e-9:
+            min_score_note = {
+                "requested": body.min_score, "applied": round(floor, 3),
+                "note": ("min_score above the calibrated band would silently drop on-topic hits "
+                         "(cosine here runs 0.72-0.77 for web3, 0.82-0.92 for LLM text), so it was "
+                         "capped at the layer floor + 0.03. Results scoring under the requested "
+                         "value carry below_min_score=true; judge by rank, not by min_score.")}
 
     # HIER_FUSION="rrf" only: an article ranked <=3 by exact title/abstract
     # match is its own sufficient evidence and must clear the floor check
@@ -2111,7 +2321,15 @@ def _run_search(body: SearchBody, x_api_key=None,
     # back into the middle of it.
     if not any("fusion_score" in result for result in results) and not hier_extra:
         results.sort(key=lambda r: -r["rank_score"])
+    if _top:
+        results = _inject_exact(results, query, constraints, limit, dense_timeout)
+    if min_score_note:
+        for r in results:
+            if r.get("score") is not None and r["score"] < body.min_score:
+                r["below_min_score"] = True
     payload = {"results": results, "count": len(results), "usage": USAGE_NOTICE}
+    if min_score_note:
+        payload["min_score_note"] = min_score_note
     if hier_global_skipped:
         payload["global_channel"] = "skipped"
     if lexical_channel is not None:
@@ -2210,7 +2428,7 @@ SPEC_PRIORITY = {"algorithm": 0, "equation": 1, "code": 2, "prose": 3, "table": 
 SPEC_MAX_CHARS = 12000
 
 
-@app.get("/v1/paper/{arxiv_id}/spec")
+@app.get("/v1/paper/{arxiv_id:path}/spec")
 def paper_spec(
     arxiv_id: str,
     target_elements: Optional[str] = None,
@@ -4343,7 +4561,7 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
         hits = _scored_results_for_audit(
             _run_search(b, x_api_key, dense_timeout=audit_qdrant_timeout,
                         embed_wait_timeout=audit_embed_wait,
-                        embed_http_timeout=audit_embed_http))
+                        embed_http_timeout=audit_embed_http, _top=False))
         best = {}
         for h in hits:
             pid = h["arxiv_id"]
@@ -5046,9 +5264,31 @@ def _rank_papers(query, layer, year_from, year_to, pool_size):
         pool.append(rows[pid])
         if len(pool) >= pool_size:
             break
+    pool = _put_named_first(pool, query, year_from, year_to, pool_size)
     for n, row in enumerate(pool, start=1):
         row["relevance_rank"] = n
     return pool, dense_error
+
+
+def _put_named_first(pool, query, year_from, year_to, pool_size):
+    """Papers the query names by id or title go first, whatever layer they are in."""
+    named = _exact_matches(query)
+    if not named:
+        return pool
+    rows = _paper_rows([d for d, _ in named])
+    front = []
+    for doc_id, via in named:
+        row = rows.get(doc_id)
+        if row is None:
+            continue
+        if year_from is not None and (row.get("year") or 0) < year_from:
+            continue
+        if year_to is not None and (row.get("year") or 9999) > year_to:
+            continue
+        row = dict(row)
+        row["found_via"] = via
+        front.append(row)
+    return _place_named(front, pool)[:pool_size]
 
 
 class PapersBody(BaseModel):
@@ -5087,6 +5327,10 @@ def find_papers(body: PapersBody, x_api_key: Optional[str] = Header(default=None
         card["relevance_rank"] = row.get("relevance_rank")
         if "cited_by_pool" in row:
             card["cited_by_pool"] = row["cited_by_pool"]
+        if "cited_by_corpus" in row:
+            card["cited_by_corpus"] = row["cited_by_corpus"]
+        if row.get("found_via"):
+            card["found_via"] = row["found_via"]
         papers.append(card)
     out = {"papers": papers, "count": len(papers), "sort": body.sort,
            "pool": len(pool), "scope": _query_scope(body.query), "usage": USAGE_NOTICE}
@@ -5100,6 +5344,11 @@ def find_papers(body: PapersBody, x_api_key: Optional[str] = Header(default=None
         out["note_sort"] = (f"papers most cited by the {EXPLORE_RESORT_POOL} most relevant ones "
                             "(cited_by_pool); relevance_rank is null for those found only "
                             "through citations")
+        if any("cited_by_pool" not in p and "cited_by_corpus" in p for p in papers):
+            out["note_sort"] += ("; rows without cited_by_pool follow, ordered by how many papers "
+                                 "in the whole corpus cite them (cited_by_corpus), then by "
+                                 "citation_count, then by relevance: EIPs, whitepapers and code "
+                                 "docs carry no citation data, so for them this is relevance order")
     return out
 
 
@@ -5138,7 +5387,27 @@ def _foundational(pool, body):
         row.setdefault("relevance_rank", None)
         row["cited_by_pool"] = n
         merged[head] = row
-    return sorted(merged.values(), key=lambda r: (-r["cited_by_pool"], -(r.get("citation_count") or 0)))
+    ranked = sorted(merged.values(), key=lambda r: (-r["cited_by_pool"], -(r.get("citation_count") or 0)))
+    named = [r for r in pool if r.get("found_via")]
+    named_heads = {canonical_id(r["arxiv_id"]) for r in named}
+    ranked = named + [r for r in ranked if canonical_id(r["arxiv_id"]) not in named_heads]
+    # the pool itself is never dropped: papers nobody in the pool cites (and
+    # documents with no citation data at all) follow, ordered by the citations
+    # they receive from anywhere in the corpus, so the answer is never empty
+    seen = {canonical_id(r["arxiv_id"]) for r in ranked}
+    tail = [r for r in pool if canonical_id(r["arxiv_id"]) not in seen]
+    if tail:
+        tail_ids = [r["arxiv_id"] for r in tail]
+        try:
+            indegree = dict(_ro_conn(STATE_DB_PATH).execute(
+                f"SELECT dst, COUNT(*) FROM citations WHERE dst IN ({','.join('?' * len(tail_ids))}) "
+                "GROUP BY dst", tail_ids).fetchall())
+        except sqlite3.Error:
+            indegree = {}
+        tail = [dict(r, cited_by_corpus=indegree.get(r["arxiv_id"], 0)) for r in tail]
+        tail.sort(key=lambda r: (-r["cited_by_corpus"], -(r.get("citation_count") or 0),
+                                 r.get("relevance_rank") or 0))
+    return ranked + tail
 
 
 OUTLINE_FIELDS = ["section_title", "section_type", "element_type", "chunk_index"]
