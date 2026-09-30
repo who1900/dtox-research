@@ -70,8 +70,6 @@ WHITEPAPERS = [
      "https://www.usenix.org/system/files/conference/usenixsecurity18/sec18-kalodner.pdf"),
     ("plasma", "Plasma: Scalable Autonomous Smart Contracts", 2017,
      "https://plasma.io/plasma.pdf"),
-    ("monero-bulletproofs", "Bulletproofs: Short Proofs for Confidential Transactions and More", 2017,
-     "https://eprint.iacr.org/2017/1066.pdf"),
     ("cosmos", "Cosmos: A Network of Distributed Ledgers", 2016,
      "https://raw.githubusercontent.com/cosmos/cosmos/master/WHITEPAPER.md"),
     # DeFi first sources (added to fill the web3 layer; ids follow wp:<slug>)

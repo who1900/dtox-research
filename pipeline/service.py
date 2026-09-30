@@ -349,6 +349,10 @@ ALLOWED_LAYERS = {"llm-slm", "ai-agents", "web3", "builder-tech"}
 # these papers ride the existing abstract-only path.
 # ---------------------------------------------------------------------------
 IACR_OAI_URL = "https://eprint.iacr.org/oai"
+# IACR's robots.txt forbids crawling the PDFs, and on 2026-09-30 every request
+# from this host, OAI included, was redirected to a block notice. Off means no
+# request goes to eprint.iacr.org at all; the abstracts already held stay.
+IACR_ENABLED = os.getenv("IACR_ENABLED", "1") == "1"
 # ACL Anthology. Measured before building this: 89 424 papers from 2015 on,
 # 50 102 of them absent from the index, abstracts present on 100% of records and
 # PDFs served without a challenge. Unlike arXiv it is peer-reviewed proceedings,
@@ -1719,6 +1723,10 @@ def harvest_step(conn):
             # parked instead, and _open_current_iacr_month reopens each one on
             # the day it becomes real.
             if query_key.split("@", 1)[1] > time.strftime("%Y-%m", time.gmtime()):
+                set_cursor(conn, query_key, 0, 1)
+                continue
+            if not IACR_ENABLED:
+                # IACR blocks this host (2026-09); asking again only deepens it
                 set_cursor(conn, query_key, 0, 1)
                 continue
             # One OAI request covers a whole month, so there is no offset to
