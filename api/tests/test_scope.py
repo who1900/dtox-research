@@ -91,7 +91,7 @@ class ScopeInEndpointsTest(unittest.TestCase):
         body = main.SearchBody(query="AlphaFold")
         cached = {"results": [{"arxiv_id": "x"}], "count": 1, "usage": "u"}
         key = ("AlphaFold", None, None, None, (), (), True, None, None, None, 8, True,
-               main.AUTO_RELAX)
+               main.AUTO_RELAX, False)
         main.search_cache.set(key, cached)
         with patch.object(main, "auth_and_limit"), \
              patch.object(main, "_scope_dense_probe", return_value=None):

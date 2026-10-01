@@ -53,6 +53,8 @@ builder-tech. Treat it as a library you explore in steps, not a single search:
 - What else is like this paper, without shared references: similar_papers.
 - A specific fact, mechanism, number or definition: search_research_paper,
   narrowed with section_type, element_type, terms or year_from.
+- A bounded evidence-reading packet: get_research_bundle (strict by default),
+  with source provenance and abstract-only fallbacks kept explicit.
 - Two approaches side by side: compare_methods.
 - Where a field is moving: research_trends (use about= for one subject), then
   find_papers sort="recent" and the limitations sections of what it returns.
@@ -71,6 +73,8 @@ How to ask:
   high min_score only removes good hits (it is capped, and the answer says so).
 - Leave layer unset unless you are sure: ai-agents and llm-slm overlap (agent
   papers are often tagged llm-slm), so layer there is a soft preference.
+  search_research_paper(strict=True) keeps the requested filters exact and
+  disables automatic relaxation; its existing default remains strict=False.
 
 Cite every claim with the paper id and url you got it from. An empty result
 over a large corpus_coverage is evidence; over a small one it is an empty
@@ -135,6 +139,7 @@ def search_research_paper(
     year_to: Optional[int] = None,
     dedupe: bool = True,
     limit: int = 8,
+    strict: bool = False,
 ) -> dict:
     """Semantic search over a curated full-text database of high-quality
     AI/LLM and Web3 research papers (arxiv), indexed by section (abstract,
@@ -153,7 +158,8 @@ def search_research_paper(
             search across all layers, and omit it when unsure. "ai-agents"
             and "llm-slm" are soft: each also searches the other, since
             agent classics are often tagged llm-slm only. "web3" and
-            "builder-tech" are strict.
+            "builder-tech" are strict. With strict=True the requested layer
+            is an exact filter, including "ai-agents" and "llm-slm".
         section_type: Optional filter restricting results to a specific
             paper section. One of: "method", "experiments" (results and
             benchmarks), "limitations", "analysis", "introduction",
@@ -170,8 +176,9 @@ def search_research_paper(
             spaces and plurals do not matter: "Chain of Thoughts" finds
             "chain-of-thought"). A term outside it (an EIP/ERC number, "pda",
             "pbs") cannot match anything: it is listed under
-            "terms_resolution.unknown" and the search runs without it, so put
-            such identifiers in query instead.
+            "terms_resolution.unknown". By default the search runs without
+            unknown terms; strict=True does not silently drop them. Put such
+            identifiers in query instead.
         min_score: Leave unset. The default floor is calibrated per layer
             (0.79 for LLM text, 0.70 for web3) because cosine scores run high
             on this index. A value above the floor is capped at floor + 0.03
@@ -187,20 +194,26 @@ def search_research_paper(
         dedupe: One hit per paper (default). Set False when you want several
             chunks of the same paper, e.g. to read a method across sections.
         limit: Max number of results to return (1-50, default 8).
+        strict: Keep requested filters exact and disable automatic relaxation.
+            Default False preserves the existing soft-layer / auto-relax
+            behaviour; results may report dropped filters under "relaxed".
 
     Returns:
         dict with "results": a list of matched chunks, each containing title,
         url, section_type, section_title, text (excerpt), score, venue,
-        citation_count, "fulltext" (false for IACR records, which are indexed
-        by abstract only, so section and element filters cannot reach inside
-        them) and "niche_score" (how strongly the paper belongs to its layer;
+        citation_count, "fulltext" and "niche_score" (how strongly the paper
+        belongs to its layer;
         1 means a single passing mention, which is how a graph-database paper
         once became top evidence for a blockchain claim). "licenses" maps
         each source label seen in the results to its license and reuse
-        terms. Also "count",
+        terms. Some records are abstract-only fallbacks, including IACR
+        records without recovered open-access full text. Check actual evidence
+        provenance before treating a passage as full text; a source-family
+        "fulltext" label alone is not proof of body availability. Also "count",
         "filters_applied", and on an empty result "why_empty" naming the
-        filter to relax. "relaxed" appears when fewer than 3 results matched
-        terms / section_type / element_type / year: the search was re-run
+        filter to relax. In default non-strict mode, "relaxed" may appear when
+        too few results matched terms / section_type / element_type / year:
+        the search was re-run
         without those filters, {"dropped": [...], "exact_matches": n,
         "note"}. Results with matches_filters=false are NOT exact matches
         (they lack the term / section / element / year you asked for): say so
@@ -218,7 +231,9 @@ def search_research_paper(
         the query, so judge relevance from the titles; in_scope=null means few
         close papers (a thin shelf or an uncovered subject), so check before relying.
     """
-    body = {"query": query, "limit": limit, "compact": True}
+    body = {"query": query, "limit": limit, "compact": True, "strict": strict}
+    if strict:
+        body["auto_relax"] = False
     if layer:
         body["layer"] = layer
     if section_type:
@@ -243,6 +258,48 @@ def search_research_paper(
     except requests.RequestException as e:
         return {"error": f"could not reach research API: {e}"}
 
+    err = _handle_error(resp)
+    if err:
+        return err
+    return resp.json()
+
+
+@mcp.tool()
+def get_research_bundle(
+    query: str,
+    layer: Optional[str] = None,
+    limit: int = 3,
+    max_chars: int = 12000,
+    strict: bool = True,
+) -> dict:
+    """Get a bounded, read-only evidence packet for a research question.
+
+    Search and reading context are assembled by the internal API. This tool
+    does not record verdicts, modify the registry, or submit chain transactions.
+    Read source provenance and abstract-only fallback markers before citing
+    evidence; candidates are not automatically confirmed prior art.
+
+    Args:
+        query: Short research question, paper name or identifier.
+        layer: Optional topical layer; omit when unsure.
+        limit: Number of papers to include (default 3).
+        max_chars: Evidence text budget in characters (default 12000).
+        strict: Exact requested filters, without automatic relaxation
+            (default True, unlike search_research_paper).
+
+    Returns:
+        The API's research bundle with evidence and provenance, or the same
+        structured error dictionary as the other public read tools.
+    """
+    body = {"query": query, "limit": limit, "max_chars": max_chars,
+            "strict": strict}
+    if layer:
+        body["layer"] = layer
+    try:
+        resp = requests.post(f"{RESEARCH_API_BASE}/v1/research/bundle",
+                             headers=_headers(), json=body, timeout=30)
+    except requests.RequestException as e:
+        return {"error": f"could not reach research API: {e}"}
     err = _handle_error(resp)
     if err:
         return err
@@ -631,6 +688,10 @@ def record_signed_verdict(
     attestor itself cannot be reached the whole call fails and nothing is
     written.
 
+    A verified wallet signature authenticates its signer, not independent
+    reasoning. Agreement across wallets alone stays read_once (pending);
+    confirmed_prior_art / ruled_out require known trusted model diversity.
+
     Args:
         claim: The exact claim text you called get_verdict_message with.
         judgments: One entry per paper, each
@@ -696,17 +757,17 @@ def record_claim_judgment(claim: str, judgments: List[dict],
             are what lets the bands be fitted to accepted verdicts later
             instead of to a percentile picked by hand.
         layer: The layer the claim was audited in, if you used one.
-        judged_by_model: Who did the reading, e.g. "claude-opus-5" or a human's
-            name. Agreement only counts as settled when it comes from readers
-            that can actually differ: two runs of one model repeating each
-            other is correlation, not confirmation, and is reported as
-            agreed_same_model instead.
+        judged_by_model: Optional self-declared attribution for the reading.
+            This string alone is not trusted quorum provenance. Settlement
+            requires known server-established model diversity; repeated
+            readings by one known model are agreed_same_model, and wallet-only
+            agreement without trusted model attribution is read_once (pending).
 
     Returns:
         dict with the stored count, the claim_id the verdicts were filed
         against, and per paper its status ("read_once", "agreed_same_model",
         "confirmed_prior_art", "ruled_out", "contested") with the number of
-        independent readers.
+        recorded reader identities (not automatically independent readers).
     """
     if not REGISTRY_WRITES_ENABLED:
         return {

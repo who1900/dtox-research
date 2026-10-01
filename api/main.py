@@ -23,10 +23,14 @@ try:
     from .search_core import fts_query, fts_query_any, merge_layer_hits, merge_layer_hits_calibrated, reciprocal_rank_fusion
     from .boilerplate import is_boilerplate_chunk
     from .exact_match import TitleIndex, extract_ids
+    from .evidence import hydrate_results, provenance
+    from .research_bundle import ResearchBundleBody, build_bundle, BUNDLE_CHUNK_LIMIT, BUNDLE_SECONDS, BoundedRetriever
 except ImportError:
     from search_core import fts_query, fts_query_any, merge_layer_hits, merge_layer_hits_calibrated, reciprocal_rank_fusion
     from boilerplate import is_boilerplate_chunk
     from exact_match import TitleIndex, extract_ids
+    from evidence import hydrate_results, provenance
+    from research_bundle import ResearchBundleBody, build_bundle, BUNDLE_CHUNK_LIMIT, BUNDLE_SECONDS, BoundedRetriever
 
 # Preamble/author-block/checklist/reference chunks must not stand in for their
 # paper in search results. 0 restores the old behavior.
@@ -929,6 +933,8 @@ def _graph_channel(pool_ids, known_ids, chunk_ids, vector, must, timeout, counts
             counts = _ro_conn(STATE_DB_PATH).execute(sql, ids).fetchall()
         except sqlite3.Error:
             _ro_conn_drop(STATE_DB_PATH)
+            if counts_out is not None:
+                counts_out["_error"] = True
             return [], {}
         heads = {}
         for pid, n in counts:
@@ -955,6 +961,8 @@ def _graph_channel(pool_ids, known_ids, chunk_ids, vector, must, timeout, counts
         return [a for a in ranked if a in chunk_ids or a in chunks], chunks
     except Exception as exc:
         log.warning(f"HIER_GRAPH: channel failed, continuing without it: {exc}")
+        if counts_out is not None:
+            counts_out["_error"] = True
         return [], {}
 
 
@@ -989,6 +997,7 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
     global_future = global_pool.submit(
         two_phase_dense_search, vector, qfilter, dense_limit, limit, dense_timeout,
         layers=layers)
+    fallback_reason = "coarse_fallback"
     try:
         papers = _coarse_paper_search(vector, body.layer, body.year_from, body.year_to,
                                       HIER_PAPERS, dense_timeout, query=query)
@@ -997,6 +1006,7 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
             papers, lexical_ids = _lexical_paper_shortlist(papers, query, body.layer,
                                                             body.year_from, body.year_to)
         if not papers:
+            fallback_reason = "no_coarse_candidates"
             raise RuntimeError("papers_coarse returned no candidates")
         arxiv_ids = [p["arxiv_id"] for p in papers]
         stage_b_hits = _hier_stage_b_hits(vector, must, arxiv_ids, HIER_CHUNKS, dense_timeout)
@@ -1015,6 +1025,7 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
             final_score = HIER_MIX * p["paper_score"] + (1 - HIER_MIX) * (chunk.get("score") or 0)
             merged.append((final_score, p["paper_score"], chunk))
         if not merged:
+            fallback_reason = "no_qualifying_chunks"
             raise RuntimeError("no stage-B chunk evidence for any shortlisted paper")
         merged.sort(key=lambda t: -t[0])
         hits = [chunk for _, _, chunk in merged]
@@ -1026,15 +1037,19 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
             hits, _, leftover_pool, dense_partial = global_future.result(timeout=dense_timeout)
         finally:
             global_pool.shutdown(wait=False)
+        if fallback_reason == "coarse_fallback":
+            dense_partial = list(dense_partial) + [fallback_reason]
         return hits, leftover_pool, dense_partial, None
 
     known_ids = {chunk["payload"]["arxiv_id"] for chunk in hits}
     global_channel = None
     c_hits = []
+    c_partial = []
     try:
-        c_hits, _, _, _c_partial = global_future.result(timeout=HIER_GLOBAL_GRACE)
+        c_hits, _, _, c_partial = global_future.result(timeout=HIER_GLOBAL_GRACE)
     except (FuturesTimeoutError, HTTPException):
         global_channel = "skipped"
+        c_partial = ["global"]
     finally:
         global_pool.shutdown(wait=False)
 
@@ -1048,7 +1063,7 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
             if aid and aid not in known_ids:
                 extra["global_extra"].append(h)
                 known_ids.add(aid)
-        return hits, [], [], extra
+        return hits, [], c_partial, extra
 
     # HIER_FUSION == "rrf": weighted RRF over three paper-level rankings
     # instead of the mix blend + tail splice above.
@@ -1080,6 +1095,8 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
         graph_counts = {}
         l_graph, graph_chunk = _graph_channel(pre, set(pre), have, vector, must, dense_timeout,
                                               counts_out=graph_counts)
+        if graph_counts.pop("_error", False):
+            c_partial = list(c_partial) + ["graph"]
         graph_pool = min(len(pre), HIER_GRAPH_POOL)
         if l_graph:
             fused = reciprocal_rank_fusion(
@@ -1125,8 +1142,9 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
         "found_via": found_via,
         "graph_quota": graph_quota,
         "quota_chunks": {aid: chunk_by_id[aid] for aid in graph_quota},
+        "graph_channel": "skipped" if "graph" in c_partial else None,
     }
-    return hits, [], [], extra
+    return hits, [], c_partial, extra
 
 
 def qdrant_search_layers(vector, base_filter, limit, timeout=SEARCH_QDRANT_TIMEOUT):
@@ -1161,19 +1179,26 @@ def qdrant_search_layers(vector, base_filter, limit, timeout=SEARCH_QDRANT_TIMEO
     return merge_layer_hits(result_sets, limit), sorted(failed)
 
 
-def qdrant_scroll_by_arxiv(arxiv_id: str, limit=1000, page=200, payload_fields=None):
+def qdrant_scroll_by_arxiv(arxiv_id: str, limit=1000, page=200, payload_fields=None, timeout=30,
+                          deadline=None):
     """All chunks of one paper. `payload_fields` narrows the payload to those
     keys (the outline needs no text); default is the whole payload."""
     qfilter = {"must": [{"key": "arxiv_id", "match": {"value": arxiv_id}}]}
     points = []
     offset = None
+    scroll_deadline = min(deadline, time.monotonic() + timeout) if deadline is not None else None
     while True:
+        request_timeout = timeout
+        if scroll_deadline is not None:
+            request_timeout = min(timeout, scroll_deadline - time.monotonic())
+            if request_timeout <= 0:
+                raise TimeoutError("paper retrieval time budget exhausted")
         body = {"filter": qfilter, "limit": min(limit, page), "with_vector": False,
                 "with_payload": {"include": payload_fields} if payload_fields else True}
         if offset:
             body["offset"] = offset
         try:
-            resp = requests.post(f"{QDRANT_URL}/collections/{COLLECTION}/points/scroll", json=body, timeout=30)
+            resp = requests.post(f"{QDRANT_URL}/collections/{COLLECTION}/points/scroll", json=body, timeout=request_timeout)
             resp.raise_for_status()
         except requests.RequestException as e:
             raise HTTPException(status_code=502, detail=f"qdrant error: {e}")
@@ -1214,11 +1239,12 @@ TABLE_MIN_DENSITY = 0.08
 
 
 SOURCE_LABELS = {
+    "acl": "ACL Anthology",
     "iacr": "IACR ePrint",
     "eip": "Ethereum EIP",
     "simd": "Solana SIMD",
     "wp": "Industry whitepaper",
-    "oa": "OpenAlex open-access work",
+    "oa": "OpenAlex work",
     "pmlr": "Proceedings of Machine Learning Research",
     "hal": "HAL Open Science",
     "gh": "GitHub technical documentation",
@@ -1244,6 +1270,8 @@ def _source_url_for_id(pid, has_payload):
     """
     if pid.startswith("iacr:"):
         return f"https://eprint.iacr.org/{pid.split(':', 1)[1]}"
+    if pid.startswith("acl:"):
+        return f"https://aclanthology.org/{pid.split(':', 1)[1]}/"
     if pid.startswith("eip:"):
         return f"https://eips.ethereum.org/EIPS/eip-{pid.split(':', 1)[1]}"
     if pid.startswith("simd:"):
@@ -1266,8 +1294,8 @@ def source_url(paper_id, payload=None):
     """Canonical public URL for a document, by source."""
     pid = str(paper_id or "")
     # a whitepaper carries its own origin: it was fetched from a project site
-    if payload and payload.get("url"):
-        return payload["url"]
+    if payload and (payload.get("source_url") or payload.get("url")):
+        return payload.get("source_url") or payload["url"]
     return _source_url_for_id(pid, payload is not None)
 
 
@@ -1279,6 +1307,21 @@ def source_url(paper_id, payload=None):
 # licence; for arXiv and the industry whitepapers the terms belong to each
 # individual document, and pretending otherwise would be worse than saying so.
 LICENSE_INFO = {
+    "acl": {
+        "spdx": None,
+        "terms": "ACL Anthology: copyright and licence are paper-specific; check the linked paper.",
+        "redistribution": "quote briefly with attribution; check the paper licence",
+    },
+    "hal": {
+        "spdx": None,
+        "terms": "HAL repository: licence is document-specific; check the linked deposit.",
+        "redistribution": "quote briefly with attribution; check the deposit licence",
+    },
+    "gh": {
+        "spdx": None,
+        "terms": "GitHub documentation: reuse depends on the repository licence.",
+        "redistribution": "check the repository licence; public access does not grant reuse rights",
+    },
     "eip": {
         "spdx": "CC0-1.0",
         "terms": "Public domain dedication (Ethereum EIPs repository).",
@@ -1291,8 +1334,8 @@ LICENSE_INFO = {
     },
     "iacr": {
         "spdx": None,
-        "terms": "IACR ePrint: authors retain copyright. Only title and "
-                 "abstract are stored here; full texts are not mirrored.",
+        "terms": "IACR ePrint: authors retain copyright; acquisition may include "
+                 "an abstract or PDF text. Check the linked paper for reuse terms.",
         "redistribution": "quote briefly with attribution",
     },
     "arxiv": {
@@ -1310,7 +1353,7 @@ LICENSE_INFO = {
     },
     "oa": {
         "spdx": None,
-        "terms": "Open-access copy discovered through OpenAlex. Licence is set per work; check the linked source before reuse.",
+        "terms": "Work discovered through OpenAlex; acquisition may be abstract-only. Licence is set per work; check the linked source before reuse.",
         "redistribution": "quote fragments with attribution; check the source licence",
     },
     "pmlr": {
@@ -1433,7 +1476,8 @@ def _result_from_hit(hit):
         "layers": payload.get("layers"),
         "venue": payload.get("venue"),
         "citation_count": payload.get("citation_count"),
-        "fulltext": source_of(paper_id) in FULLTEXT_SOURCES,
+        "fulltext": None,
+        "evidence": provenance(paper_id, payload, scope="indexed_chunk"),
         "arxiv_url": source_url(paper_id, payload),
     }
 
@@ -1517,7 +1561,9 @@ def _lexical_fallback_results(query, paper_ids, limit):
             "layers": layers,
             "venue": venue,
             "citation_count": citations,
-            "fulltext": source_of(paper_id) in FULLTEXT_SOURCES,
+            "fulltext": None,
+            "evidence": provenance(paper_id, {"text": row[0], "section_type": row[2],
+                                              "element_type": row[3]}, scope="indexed_chunk"),
             "arxiv_url": source_url(paper_id, payload),
             "found_via": "lexical fallback",
             "channels": ["lexical"],
@@ -1529,10 +1575,10 @@ def _lexical_fallback_results(query, paper_ids, limit):
 def _scored_results_for_audit(payload):
     scored = [hit for hit in payload.get("results", [])
               if isinstance(hit.get("score"), (int, float))]
-    if payload.get("partial") and not scored:
+    if payload.get("partial"):
         raise HTTPException(
             status_code=503,
-            detail="dense retrieval unavailable; refusing to audit from lexical-only matches")
+            detail="retrieval incomplete; refusing to infer absence from a partial search")
     return scored
 
 
@@ -1549,6 +1595,7 @@ MIN_RELEVANCE_BY_LAYER = {"web3": 0.70}
 
 class SearchBody(BaseModel):
     query: str
+    strict: bool = False
     layer: Optional[str] = None
     section_type: Optional[str] = None
     # structural facets: element_type isolates equations/algorithms/tables/code,
@@ -1999,11 +2046,14 @@ def _run_search(body: SearchBody, x_api_key=None,
     limit = min(max(body.limit, 1), 50)
 
     terms, unknown_terms = _resolve_terms(body.terms)
-    relax_on = AUTO_RELAX if body.auto_relax is None else bool(body.auto_relax)
+    if body.strict and unknown_terms:
+        raise HTTPException(status_code=400, detail={"unknown_terms": unknown_terms,
+                                                    "note": "strict search cannot drop unknown terms"})
+    relax_on = not body.strict and (AUTO_RELAX if body.auto_relax is None else bool(body.auto_relax))
     tm = {"t0": time.monotonic()} if SEARCH_TIMING else None
     cache_key = (query, body.layer, body.section_type, body.element_type,
                  tuple(sorted(terms)), tuple(unknown_terms), body.dedupe, body.min_score,
-                 body.year_from, body.year_to, limit, body.hybrid, relax_on)
+                 body.year_from, body.year_to, limit, body.hybrid, relax_on, body.strict)
     if not _top:
         cache_key += ("inner",)
     cached = search_cache.get(cache_key)
@@ -2027,9 +2077,9 @@ def _run_search(body: SearchBody, x_api_key=None,
             rng["lte"] = body.year_to
         must.append({"key": "year", "range": rng})
     qfilter = {"must": must} if must else None
-    constraints = [m for m in must if m["key"] != "layers"]
+    constraints = must if body.strict else [m for m in must if m["key"] != "layers"]
 
-    partner = _soft_partner(body.layer, query) if _top else None
+    partner = _soft_partner(body.layer, query) if _top and not body.strict else None
     if partner:
         sibling_body = body.model_copy(update={"layer": partner, "diagnose": False,
                                                "auto_relax": False, "limit": limit})
@@ -2050,8 +2100,12 @@ def _run_search(body: SearchBody, x_api_key=None,
                 "note": (f"{body.layer} is a soft filter: papers tagged {partner} are merged in, "
                          "because canonical work on agents is often tagged llm-slm only")}
             payload.pop("why_empty", None)
+        if other is None or other.get("partial"):
+            payload["partial"] = True
+            payload["retrieval_warning"] = "soft partner retrieval incomplete"
         payload["results"] = _inject_exact(payload["results"], query, constraints, limit, dense_timeout)
         payload["count"] = len(payload["results"])
+        payload["results"] = _hydrate_evidence(payload["results"])
         if payload.get("title_lookup") and payload["count"]:
             named = _lookup_note(query, payload["results"])
             if named is None:
@@ -2172,7 +2226,7 @@ def _run_search(body: SearchBody, x_api_key=None,
     floor = default_floor
     min_score_note = None
     if body.min_score is not None:
-        floor = min(body.min_score, default_floor + MIN_SCORE_MAX_RAISE)
+        floor = body.min_score if body.strict else min(body.min_score, default_floor + MIN_SCORE_MAX_RAISE)
         if body.min_score > floor + 1e-9:
             min_score_note = {
                 "requested": body.min_score, "applied": round(floor, 3),
@@ -2185,7 +2239,7 @@ def _run_search(body: SearchBody, x_api_key=None,
     # match is its own sufficient evidence and must clear the floor check
     # below even when its best chunk scores under it. Empty (thus a no-op)
     # for every other path, including HIER_FUSION="mix".
-    lex_exempt_ids = (hier_extra or {}).get("lex_exempt") or set()
+    lex_exempt_ids = set() if body.strict else ((hier_extra or {}).get("lex_exempt") or set())
 
     def _filter_and_dedupe(candidate_hits):
         picked = []
@@ -2218,6 +2272,7 @@ def _run_search(body: SearchBody, x_api_key=None,
             extra_hits = _hydrate_hits(leftover_pool, dense_timeout)
         except HTTPException:
             extra_hits = []
+            dense_partial = list(dense_partial) + ["payload_hydration"]
         if extra_hits:
             results = _filter_and_dedupe(hits + extra_hits)
 
@@ -2278,7 +2333,7 @@ def _run_search(body: SearchBody, x_api_key=None,
                 h["found_via"] = "lexical match"
                 h["channels"] = ["lexical"]
         scored_ids = {item["arxiv_id"] for item in scored}
-        raw = ([] if (terms or chunk_lexical_skipped_intentionally) else
+        raw = ([] if (body.strict or terms or chunk_lexical_skipped_intentionally) else
               _lexical_fallback_results(
                   query, [pid for pid in extra_ids if pid not in scored_ids], limit))
         dense_order = [r["arxiv_id"] for r in results]
@@ -2323,6 +2378,13 @@ def _run_search(body: SearchBody, x_api_key=None,
         results.sort(key=lambda r: -r["rank_score"])
     if _top:
         results = _inject_exact(results, query, constraints, limit, dense_timeout)
+    if body.strict:
+        results = [r for r in results if isinstance(r.get("score"), (int, float))
+                   and (r["score"] >= floor or (body.min_score is None
+                                                and r.get("found_via") == "exact id"))]
+        for result in results:
+            if result.get("found_via") == "exact id":
+                result["relevance_kind"] = "identifier"
     if min_score_note:
         for r in results:
             if r.get("score") is not None and r["score"] < body.min_score:
@@ -2332,6 +2394,8 @@ def _run_search(body: SearchBody, x_api_key=None,
         payload["min_score_note"] = min_score_note
     if hier_global_skipped:
         payload["global_channel"] = "skipped"
+    if (hier_extra or {}).get("graph_channel") == "skipped":
+        payload["graph_channel"] = "skipped"
     if lexical_channel is not None:
         payload["lexical_channel"] = lexical_channel
     elif lexical_skipped:
@@ -2348,6 +2412,9 @@ def _run_search(body: SearchBody, x_api_key=None,
         payload["retrieval_warning"] = (
             "dense retrieval exceeded its latency budget in layers: "
             + ", ".join(dense_partial))
+    if lexical_skipped or paper_lexical_skipped:
+        payload["partial"] = True
+        payload.setdefault("retrieval_warning", "lexical retrieval incomplete")
     lookup = _lookup_note(query, results)
     if lookup:
         payload["title_lookup"] = lookup
@@ -2378,7 +2445,7 @@ def _run_search(body: SearchBody, x_api_key=None,
                 tm["pre_relax"] = time.monotonic()
             _auto_relax(body, payload, results, active, terms, limit, x_api_key)
             results = payload["results"]
-    if not results and applied and body.diagnose and not dense_error:
+    if not results and applied and body.diagnose and not body.strict and not payload.get("partial"):
         # after a relax attempt every relaxable filter is already known not to
         # be the culprit; only layer / min_score are left to blame
         names = [n for n in applied if not (tried_relax and n in
@@ -2415,7 +2482,8 @@ def _run_search(body: SearchBody, x_api_key=None,
     # a hier search that silently fell back to the old path (coarse stage
     # hiccup under load) is a degraded answer: caching it pinned the worse
     # ranking for the whole TTL
-    if not dense_error and not dense_partial and (hier_used or not HIER_SEARCH):
+    payload["results"] = _hydrate_evidence(payload["results"])
+    if not payload.get("partial") and (hier_used or not HIER_SEARCH):
         search_cache.set(cache_key, payload)
     return payload
 
@@ -2462,6 +2530,8 @@ def paper_spec(
         return st in SPEC_SECTION_TYPES or any(kw in title for kw in SPEC_TITLE_KEYWORDS)
 
     payloads = [pt["payload"] for pt in points]
+    rows = _evidence_rows([arxiv_id])
+    passport = _paper_passport(arxiv_id, payloads[0], rows)
     elements = [p for p in payloads if (p.get("element_type") or "").lower() in wanted]
     if include_prose:
         elements += [p for p in payloads
@@ -2472,6 +2542,7 @@ def paper_spec(
         # note the absence and carry on instead of breaking on a 404
         return {
             "arxiv_id": arxiv_id,
+            **passport,
             "title": (payloads[0].get("title") if payloads else None),
             "repos": [],
             "sections": [],
@@ -2479,7 +2550,7 @@ def paper_spec(
             "available": 0,
             "chars": 0,
             "truncated": False,
-            "note": "paper present but contains no algorithm/equation/code/table elements"
+            "note": "no algorithm/equation/code/table elements found in retrieved indexed chunks"
                     " (try include_prose=true for its method prose)",
         }
 
@@ -2502,6 +2573,7 @@ def paper_spec(
             "section_type": p.get("section_type"),
             "section_title": p.get("section_title"),
             "text": text,
+            "evidence": provenance(arxiv_id, p, rows.get(arxiv_id), passport["url"], scope="indexed_chunk"),
         })
 
     repos = []
@@ -2512,9 +2584,7 @@ def paper_spec(
 
     return {
         "arxiv_id": arxiv_id,
-        "source": SOURCE_LABELS[source_of(arxiv_id)],
-        "url": source_url(arxiv_id, elements[0] if elements else None),
-        "license": license_of(arxiv_id),
+        **passport,
         "title": title,
         "repos": repos,
         "sections": sections,
@@ -2543,6 +2613,7 @@ def compare(
 
     if not a or not b:
         raise HTTPException(status_code=400, detail="a and b query params required")
+    rows = _evidence_rows([a, b])
 
     # our taxonomy calls the results section "experiments"; asking for
     # "results" here is what previously made this endpoint return nothing
@@ -2553,6 +2624,7 @@ def compare(
         if not points:
             raise HTTPException(status_code=404, detail=f"paper not found: {arxiv_id}")
         payloads = [pt["payload"] for pt in points]
+        passport = _paper_passport(arxiv_id, payloads[0], rows)
         filtered = [p for p in payloads
                     if (p.get("section_type") or "").lower() in wanted_sections]
         empty_tables = 0
@@ -2586,6 +2658,8 @@ def compare(
                         "section_title": p.get("section_title"),
                         "text": text[:max_chars],
                         "clipped": True,
+                        "evidence": dict(provenance(arxiv_id, p, rows.get(arxiv_id), passport["url"],
+                                                    scope="indexed_chunk"), returned_chars=max_chars),
                     })
                     used = max_chars
                 break
@@ -2595,13 +2669,12 @@ def compare(
                 "section_type": p.get("section_type"),
                 "section_title": p.get("section_title"),
                 "text": text,
+                "evidence": provenance(arxiv_id, p, rows.get(arxiv_id), passport["url"], scope="indexed_chunk"),
             })
         return {
             "arxiv_id": arxiv_id,
             "skipped_tables_without_numbers": empty_tables,
-            "source": SOURCE_LABELS[source_of(arxiv_id)],
-            "url": source_url(arxiv_id, payloads[0] if payloads else None),
-            "license": license_of(arxiv_id),
+            **passport,
             "title": title,
             "results_chunks": chunks,
             "available": len(filtered),
@@ -3066,11 +3139,6 @@ def _evidence_band(hit, requested_layer=None, claim_words=None):
     if not _corroborated(hit, claim_words):
         return "adjacent"
     return band
-
-
-# IACR mirrors nothing but titles and abstracts, so a section or element filter
-# silently cannot apply there. The caller has to be told which it is looking at.
-FULLTEXT_SOURCES = {"arxiv", "eip", "simd", "wp", "oa"}
 
 
 def _paper_facts(paper_ids):
@@ -3555,7 +3623,8 @@ def _score_specific_papers(query, paper_ids, layer=None, vector=None, timeout=45
             "layers": pay.get("layers"),
             "venue": pay.get("venue"),
             "citation_count": pay.get("citation_count"),
-            "fulltext": source_of(pid) in FULLTEXT_SOURCES,
+            "fulltext": None,
+            "evidence": provenance(pid, pay, scope="indexed_chunk"),
         })
     return results
 
@@ -3709,7 +3778,10 @@ def _canonical_claim(conn, claim):
     norm = _norm_claim(claim)
     row = conn.execute("SELECT claim_id FROM claim_nodes WHERE claim_norm=?", (norm,)).fetchone()
     if row:
-        return row["claim_id"], False
+        return _follow_claim_links(conn, row["claim_id"]), False
+    linked = _follow_claim_links(conn, norm)
+    if linked != norm:
+        return linked, False
     try:
         vector = embed_query(claim)
     except HTTPException:
@@ -3822,43 +3894,69 @@ def _reader_identity(api_key, info, claimed_model):
     because it is useful, but it is marked unverified and never counts towards
     a quorum on its own."""
     verified = (info or {}).get("reader") or (info or {}).get("name")
-    claimed = (claimed_model or "").strip()[:80]
     if verified:
         identity = f"key:{verified}"
     else:
         identity = f"key:{_reader_id(api_key)}"
-    return identity, (claimed or JUDGMENT_MODEL_UNKNOWN)
+    configured = (info or {}).get("reader_model") or (info or {}).get("model")
+    model = configured.strip()[:80] if isinstance(configured, str) else ""
+    if model and model.casefold() != JUDGMENT_MODEL_UNKNOWN and not model.lower().startswith(("key:", "wallet:")):
+        return identity, f"trusted-model:{model}"
+    return identity, JUDGMENT_MODEL_UNKNOWN
+
+
+def _trusted_stored_model(value):
+    if isinstance(value, str) and value.startswith("trusted-model:"):
+        model = value[len("trusted-model:"):].strip()
+        if model and model.casefold() != JUDGMENT_MODEL_UNKNOWN and not model.lower().startswith(("key:", "wallet:")):
+            return model
+    return JUDGMENT_MODEL_UNKNOWN
 
 
 def _judgment_status(counts, readers=None, models=None):
-    """A settled verdict needs agreement from readers that can actually differ.
+    if __package__:
+        from .registry_policy import judgment_status
+    else:
+        from registry_policy import judgment_status
+    if isinstance(models, str):
+        models = [models]
+    models = [m for m in (models or []) if isinstance(m, str)
+              and not m.strip().lower().startswith(("key:", "wallet:"))]
+    return judgment_status(counts, readers=readers, models=models, quorum=CONFIRMATION_QUORUM)
 
-    "Independent readers agree" meant two API keys. If both are the same model,
-    the second reading repeats the first one's mistakes with the same
-    confidence, which is correlation dressed up as confirmation. Agreement
-    within one model is reported as agreed_same_model, one step below settled.
 
-    A wallet-signed verdict (judged_by = "wallet:<pubkey>") is a verified
-    identity in its own right -- the signature is checked by attestor and the
-    verdict is anchored on-chain, so it does not need a self-declared model
-    name to be trusted. Two or more distinct wallets are independent readers
-    on their own, regardless of what models (if any) they report."""
-    asserts = counts.get("asserts", 0)
-    denies = counts.get("does_not_assert", 0)
-    # only identities the server established itself count towards diversity;
-    # an unattributed reading cannot be the second opinion that settles a claim
-    known = {m for m in (models or []) if m and m != JUDGMENT_MODEL_UNKNOWN}
-    wallets = {r for r in (readers or []) if isinstance(r, str) and r.startswith("wallet:")}
-    diverse = models is None or len(known) > 1 or len(wallets) >= CONFIRMATION_QUORUM
-    if asserts >= CONFIRMATION_QUORUM and denies == 0:
-        return "confirmed_prior_art" if diverse else "agreed_same_model"
-    if denies >= CONFIRMATION_QUORUM and asserts == 0:
-        return "ruled_out" if diverse else "agreed_same_model"
-    if asserts and denies:
-        return "contested"
-    if asserts or denies or counts.get("partial", 0):
-        return "read_once"
-    return "unread"
+def _judgments_read_conn():
+    try:
+        conn = sqlite3.connect(f"file:{JUDGMENTS_DB_PATH}?mode=ro", uri=True, timeout=15)
+    except sqlite3.Error:
+        return None
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _read_claim_id(conn, claim):
+    norm = _norm_claim(claim)
+    row = conn.execute("SELECT claim_id FROM claim_nodes WHERE claim_norm=?", (norm,)).fetchone()
+    return _follow_claim_links(conn, row["claim_id"] if row else norm)
+
+
+def _follow_claim_links(conn, claim_id):
+    seen = set()
+    for _ in range(64):
+        if claim_id in seen:
+            return min(seen)
+        seen.add(claim_id)
+        try:
+            row = conn.execute("SELECT to_claim FROM claim_links WHERE from_claim=? "
+                               "ORDER BY linked_at DESC, to_claim LIMIT 1", (claim_id,)).fetchone()
+        except sqlite3.OperationalError as error:
+            if "no such table" in str(error):
+                return claim_id
+            raise
+        if row is None:
+            return claim_id
+        claim_id = row["to_claim"]
+    return claim_id
 
 
 def _citation_neighbourhood(today_ids, judged_ids):
@@ -3967,13 +4065,17 @@ def _registry_for_claim(claim):
     today's phrasing retrieves it: D2O was found, judged as asserting the
     claim, and then buried in weaker_matches the next time the same question
     was asked in different words."""
-    conn = _judgments_conn()
+    conn = _judgments_read_conn()
+    if conn is None:
+        return _norm_claim(claim), {}
     try:
-        claim_id, _ = _canonical_claim(conn, claim)
+        claim_id = _read_claim_id(conn, claim)
         rows = conn.execute(
             "SELECT paper_id, verdict, reason, judged_by, judged_by_model "
             "FROM claim_judgments WHERE claim_id=? OR claim_norm=?",
             (claim_id, _norm_claim(claim))).fetchall()
+    except sqlite3.Error:
+        return _norm_claim(claim), {}
     finally:
         conn.close()
     out = {}
@@ -3984,21 +4086,28 @@ def _registry_for_claim(claim):
                                                "readers": set(), "models": set(),
                                                "from_claim": from_node})
             e["counts"][r["verdict"]] = e["counts"].get(r["verdict"], 0) + 1
-            e["readers"].add(r["judged_by"])
-            e["models"].add(r["judged_by_model"] or JUDGMENT_MODEL_UNKNOWN)
+            if r["verdict"] in {"asserts", "does_not_assert"}:
+                e["readers"].add(r["judged_by"])
+                model = _trusted_stored_model(r["judged_by_model"])
+                if model != JUDGMENT_MODEL_UNKNOWN:
+                    e["models"].add(model)
             if r["reason"]:
                 e["reasons"].append(_clip(r["reason"], 300))
 
     absorb(rows)
-    conn = _judgments_conn()
+    conn = _judgments_read_conn()
     try:
-        for cand, cand_rows in _neighbour_records(conn, claim):
+        neighbours = _neighbour_records(conn, claim) if conn is not None else []
+        for cand, cand_rows in neighbours:
             absorb([r for r in cand_rows if r["paper_id"] not in out],
                    from_node={"claim_id": cand["claim_id"],
                               "claim_text": cand["claim_text"],
                               "cosine": cand["cosine"]})
+    except sqlite3.Error:
+        pass
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
     for pid, e in out.items():
         models, readers = e.pop("models"), e.pop("readers")
@@ -4018,9 +4127,11 @@ def _prior_readings(claim, paper_ids):
     question asked in another."""
     if not paper_ids:
         return {}
-    conn = _judgments_conn()
+    conn = _judgments_read_conn()
+    if conn is None:
+        return {}
     try:
-        claim_id, _ = _canonical_claim(conn, claim)
+        claim_id = _read_claim_id(conn, claim)
         placeholders = ",".join("?" * len(paper_ids))
         rows = conn.execute(
             f"SELECT paper_id, verdict, reason, judged_by, judged_by_model, judged_at, "
@@ -4029,6 +4140,8 @@ def _prior_readings(claim, paper_ids):
             f"AND paper_id IN ({placeholders})",
             [claim_id, _norm_claim(claim)] + list(paper_ids),
         ).fetchall()
+    except sqlite3.Error:
+        return {}
     finally:
         conn.close()
     out = {}
@@ -4037,8 +4150,11 @@ def _prior_readings(claim, paper_ids):
                                {"counts": {}, "reasons": [], "readers_set": set(),
                                 "models": set(), "onchain": []})
         entry["counts"][r["verdict"]] = entry["counts"].get(r["verdict"], 0) + 1
-        entry["readers_set"].add(r["judged_by"])
-        entry["models"].add(r["judged_by_model"] or JUDGMENT_MODEL_UNKNOWN)
+        if r["verdict"] in {"asserts", "does_not_assert"}:
+            entry["readers_set"].add(r["judged_by"])
+            model = _trusted_stored_model(r["judged_by_model"])
+            if model != JUDGMENT_MODEL_UNKNOWN:
+                entry["models"].add(model)
         if r["reason"]:
             entry["reasons"].append(_clip(r["reason"], 400))
         # a wallet-signed verdict carries a live SAS attestation: surface it so
@@ -4104,7 +4220,7 @@ def adjudicate(body: AdjudicateBody, x_api_key: Optional[str] = Header(default=N
     conn = _judgments_conn()
     try:
         claim_id, is_new = _canonical_claim(conn, claim)
-        identity, claimed_model = _reader_identity(api_key, _info, body.judged_by_model)
+        identity, trusted_model = _reader_identity(api_key, _info, body.judged_by_model)
         for j in body.judgments:
             conn.execute(
                 "INSERT INTO claim_judgments "
@@ -4116,7 +4232,7 @@ def adjudicate(body: AdjudicateBody, x_api_key: Optional[str] = Header(default=N
                 "score=excluded.score, band=excluded.band, niche_score=excluded.niche_score, "
                 "claim_id=excluded.claim_id, judged_by_model=excluded.judged_by_model",
                 (_norm_claim(claim), claim, claim_id, j.id, j.verdict, (j.reason or "")[:600],
-                 reader, identity, now,
+                 reader, trusted_model, now,
                  j.score, j.band, body.layer, j.section_type, j.niche_score),
             )
         conn.commit()
@@ -4640,12 +4756,15 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
         # them: the narrow phrasing that finds little is exactly the one a
         # cautious caller writes
         claim_id, registry = _registry_for_claim(claim)
-        _link_conn = _judgments_conn()
+        _link_conn = _judgments_read_conn()
         try:
             same_question = [dict(c, via="wording")
-                             for c in _similar_claim_nodes(_link_conn, claim)]
+                             for c in _similar_claim_nodes(_link_conn, claim)] if _link_conn else []
+        except sqlite3.Error:
+            same_question = []
         finally:
-            _link_conn.close()
+            if _link_conn is not None:
+                _link_conn.close()
         found, queries_used = _search_union(claim, phrasings)
         # papers today's wording failed to retrieve are fetched by id, so a
         # verdict resting on the record is backed by a citable item rather than
@@ -4703,12 +4822,16 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
 
         # the second proposal channel: nodes already judged against the papers
         # this search returned, regardless of how either claim was worded
-        _ov_conn = _judgments_conn()
+        _ov_conn = _judgments_read_conn()
         try:
             overlap_nodes = _nodes_sharing_evidence(
-                _ov_conn, [h["arxiv_id"] for h in found[:12]], claim_id)
+                _ov_conn, [h["arxiv_id"] for h in found[:12]], claim_id) if _ov_conn else []
+        except sqlite3.Error:
+            overlap_nodes = []
         finally:
-            _ov_conn.close()
+            if _ov_conn is not None:
+                _ov_conn.close()
+        found = _hydrate_evidence(found)
         seen_nodes = {c["claim_id"] for c in same_question}
         same_question = same_question + [c for c in overlap_nodes
                                          if c["claim_id"] not in seen_nodes]
@@ -5064,7 +5187,10 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
             "supporting_math": [{
                 "element_type": f.get("element_type"),
                 "section_title": f.get("section_title"),
-                "latex": (f.get("text") or "")[:900],
+                "text": (f.get("text") or "")[:900],
+                "latex": ((f.get("text") or "")[:900]
+                          if (f.get("evidence") or {}).get("exact_latex") else None),
+                "evidence": f.get("evidence"),
             } for f in formulas],
         })
 
@@ -5183,7 +5309,7 @@ FOUNDATIONAL_MIN_CITERS = 3
 EXPLORE_ABSTRACT_CHARS = 420
 SECTION_MAX_CHARS = 8000
 NEIGHBOUR_LIMIT = 25
-PAPER_COLUMNS = "arxiv_id, title, year, venue, citation_count, influential, layers, abstract"
+PAPER_COLUMNS = "arxiv_id, title, year, venue, citation_count, influential, layers, abstract, fulltext_source, source_url"
 
 
 def _paper_rows(paper_ids):
@@ -5201,7 +5327,13 @@ def _paper_rows(paper_ids):
         except sqlite3.OperationalError:
             _ro_conn_drop(STATE_DB_PATH)
             try:
-                rows = _ro_conn(STATE_DB_PATH).execute(sql, part).fetchall()
+                conn = _ro_conn(STATE_DB_PATH)
+                columns = {r[1] for r in conn.execute("PRAGMA table_info(papers)").fetchall()}
+                compatible = ", ".join(c if c.strip() in columns else f"NULL AS {c.strip()}"
+                                       for c in PAPER_COLUMNS.split(","))
+                sql = (f"SELECT {compatible} FROM papers WHERE status='done' "
+                       f"AND arxiv_id IN ({','.join('?' * len(part))})")
+                rows = conn.execute(sql, part).fetchall()
             except sqlite3.Error:
                 rows = []
         except sqlite3.Error:
@@ -5210,8 +5342,53 @@ def _paper_rows(paper_ids):
             out[r[0]] = {"arxiv_id": r[0], "title": r[1], "year": r[2], "venue": r[3],
                          "citation_count": r[4], "influential_citations": r[5],
                          "layers": [l for l in (r[6] or "").split(",") if l],
-                         "abstract": r[7]}
+                         "abstract": r[7],
+                         "fulltext_source": r[8] if len(r) > 8 else None,
+                         "source_url": r[9] if len(r) > 9 else None}
     return out
+
+
+def _hydrate_evidence(results, rows=None):
+    if rows is None:
+        rows = _evidence_rows([r.get("arxiv_id") or r.get("id") for r in results])
+    return hydrate_results(results, rows, source_url, license_of,
+                           lambda pid: SOURCE_LABELS[source_of(pid)])
+
+
+def _evidence_rows(ids):
+    try:
+        return _paper_rows(ids)
+    except Exception as error:
+        log.warning("evidence metadata unavailable: %s", type(error).__name__)
+        return {}
+
+
+def _paper_passport(pid, fragment, rows):
+    item = _hydrate_evidence([dict(fragment, arxiv_id=pid, url=source_url(pid, fragment))], rows)[0]
+    return {key: item[key] for key in ("source", "url", "license", "fulltext", "completeness", "evidence")}
+
+
+@app.post("/v1/research/bundle")
+def research_bundle(body: ResearchBundleBody, x_api_key: Optional[str] = Header(default=None)):
+    auth_and_limit(x_api_key)
+    deadline = time.monotonic() + BUNDLE_SECONDS
+    search_result = _run_search(SearchBody(query=body.query, layer=body.layer, limit=body.limit,
+                                          strict=body.strict, diagnose=False), x_api_key)
+    selected, seen = [], set()
+    for hit in search_result.get("results", []):
+        pid = hit.get("arxiv_id")
+        if pid and pid not in seen:
+            seen.add(pid)
+            selected.append(hit)
+        if len(selected) >= body.limit:
+            break
+    if any("evidence" not in hit for hit in selected):
+        selected = _hydrate_evidence(selected)
+    retrieve = BoundedRetriever(
+        lambda pid, timeout: qdrant_scroll_by_arxiv(pid, limit=BUNDLE_CHUNK_LIMIT,
+                                                   page=BUNDLE_CHUNK_LIMIT, timeout=timeout, deadline=deadline),
+        deadline, time.monotonic)
+    return build_bundle(body, search_result, selected, retrieve)
 
 
 def _paper_card(row, abstract_chars=EXPLORE_ABSTRACT_CHARS):
@@ -5223,8 +5400,9 @@ def _paper_card(row, abstract_chars=EXPLORE_ABSTRACT_CHARS):
     card = {"id": pid, "title": row.get("title"), "year": row.get("year"),
             "venue": row.get("venue"), "citation_count": row.get("citation_count"),
             "layers": row.get("layers"), "source": SOURCE_LABELS[source_of(pid)],
-            "url": source_url(pid), "fulltext": source_of(pid) in FULLTEXT_SOURCES,
+            "url": source_url(pid, row), "fulltext": None,
             "abstract": abstract}
+    card = _hydrate_evidence([card], {pid: row})[0]
     others = [m for m in _twins()["members"].get(canonical_id(pid), []) if m != pid]
     if others:
         card["twins"] = others
@@ -5662,10 +5840,15 @@ def paper_section(paper_id: str, title: Optional[str] = None, section_type: Opti
     text = "\n\n".join(p.get("text") or "" for p in chosen)
     piece = text[offset:offset + max_chars]
     end = offset + len(piece)
+    fragment = {"section_title": title, "section_type": section_type, "text": piece}
+    passport = _paper_passport(paper_id, fragment, _evidence_rows([paper_id]))
+    passport["evidence"]["fragment_scope"] = "returned_section_page"
+    passport["evidence"]["offset"] = offset
     return {"id": paper_id, "title": chosen[0].get("title"),
+            **passport,
             "section_title": title, "section_type": section_type,
             "text": piece, "offset": offset, "next_offset": end if end < len(text) else None,
-            "total_chars": len(text), "url": source_url(paper_id), "usage": USAGE_NOTICE}
+            "total_chars": len(text), "usage": USAGE_NOTICE}
 
 
 @app.get("/v1/paper/{paper_id:path}")

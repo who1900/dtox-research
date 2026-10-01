@@ -118,7 +118,7 @@ class SignedVerdictsTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 503)
         self.assertEqual(self._rows(claim), [])
 
-    def test_two_distinct_wallets_confirm_the_verdict(self):
+    def test_two_distinct_wallets_leave_the_verdict_pending(self):
         claim = "the protocol tolerates byzantine faults under partial synchrony"
         attest_a = _attestor_response(200, {"attestation": "PdaA", "signature": "TxA"})
         attest_b = _attestor_response(200, {"attestation": "PdaB", "signature": "TxB"})
@@ -143,10 +143,61 @@ class SignedVerdictsTests(unittest.TestCase):
             result = main.adjudicate_signed(body_b, x_api_key="anything")
 
         status = result["papers"]["2402.00001"]["status"]
-        self.assertEqual(status, "confirmed_prior_art")
+        self.assertEqual(status, "read_once")
+        self.assertNotIn(status, {"confirmed_prior_art", "ruled_out", "agreed_same_model"})
+        self.assertEqual(result["papers"]["2402.00001"]["readers"], 2)
+        self.assertEqual(result["papers"]["2402.00001"]["counts"], {"asserts": 2})
+        self.assertEqual({r["judged_by_model"] for r in self._rows(claim)}, {"unspecified"})
         onchain = result["papers"]["2402.00001"]["onchain"]
         reviewers = {o["reviewer"] for o in onchain}
         self.assertEqual(reviewers, {"WalletA", "WalletB"})
+
+    def test_many_wallets_cannot_confirm_or_rule_out_without_model_diversity(self):
+        for verdict in ("asserts", "does_not_assert"):
+            with self.subTest(verdict=verdict):
+                claim = f"wallet-only agreement for verdict {verdict} remains pending"
+                body = main.AdjudicateSignedBody(
+                    claim=claim,
+                    judgments=[main.SignedJudgmentItem(
+                        id="2402.00003", verdict=verdict, reviewer=f"Wallet{i}",
+                        signature=f"Sig{i}", issued_at="2026-09-26T03:00:00Z",
+                    ) for i in range(5)],
+                )
+                responses = [_attestor_response(200, {
+                    "attestation": f"Pda{i}", "signature": f"Tx{i}",
+                }) for i in range(5)]
+                with patch.object(main.requests, "post", side_effect=responses) as post:
+                    result = main.adjudicate_signed(body, x_api_key="anything")
+
+                paper = result["papers"]["2402.00003"]
+                self.assertEqual(post.call_count, 5)
+                self.assertTrue(all(item["status"] == 200 for item in result["results"]))
+                self.assertGreater(paper["readers"], result["quorum"])
+                self.assertEqual(paper["counts"], {verdict: 5})
+                self.assertEqual(paper["status"], "read_once")
+                self.assertNotIn(paper["status"], {"confirmed_prior_art", "ruled_out",
+                                                 "agreed_same_model"})
+                self.assertEqual(len(paper["onchain"]), 5)
+                rows = self._rows(claim)
+                self.assertEqual(len({r["judged_by"] for r in rows}), 5)
+                self.assertEqual({r["judged_by_model"] for r in rows}, {"unspecified"})
+
+    def test_conflicting_signed_wallets_remain_contested(self):
+        claim = "signed wallet identities cannot resolve contradictory readings"
+        body = main.AdjudicateSignedBody(
+            claim=claim,
+            judgments=[main.SignedJudgmentItem(
+                id="2402.00004", verdict=verdict, reviewer=f"Wallet{i}",
+                signature=f"Sig{i}", issued_at="2026-09-26T03:00:00Z",
+            ) for i, verdict in enumerate(("asserts", "does_not_assert"))],
+        )
+        attest = _attestor_response(200, {"attestation": "PdaConflict", "signature": "TxConflict"})
+        with patch.object(main.requests, "post", return_value=attest):
+            result = main.adjudicate_signed(body, x_api_key="anything")
+        paper = result["papers"]["2402.00004"]
+        self.assertEqual(paper["status"], "contested")
+        self.assertEqual(paper["counts"], {"asserts": 1, "does_not_assert": 1})
+        self.assertEqual(paper["readers"], 2)
 
     def test_same_wallet_twice_does_not_confirm_on_its_own(self):
         claim = "a claim only one wallet ever reviews"
@@ -176,6 +227,32 @@ class SignedVerdictsTests(unittest.TestCase):
         self.assertEqual(status, "read_once")
         rows = self._rows(claim)
         self.assertEqual(len(rows), 1)  # upsert, not a second row
+
+    def test_unverified_legacy_model_names_cannot_settle_read_paths(self):
+        for verdict in ("asserts", "does_not_assert"):
+            with self.subTest(verdict=verdict):
+                claim = f"legacy self-declared model diversity for {verdict} is untrusted"
+                conn = main._judgments_conn()
+                try:
+                    claim_id, _ = main._canonical_claim(conn, claim)
+                    for reader, model in (("key:LegacyA", "self-declared-model-a"),
+                                          ("key:LegacyB", "self-declared-model-b")):
+                        conn.execute(
+                            "INSERT INTO claim_judgments "
+                            "(claim_norm, claim_text, claim_id, paper_id, verdict, "
+                            "judged_by, judged_by_model, judged_at) VALUES (?,?,?,?,?,?,?,?)",
+                            (main._norm_claim(claim), claim, claim_id, "2402.00005",
+                             verdict, reader, model, "2026-09-26T03:00:00Z"),
+                        )
+                    conn.commit()
+                finally:
+                    conn.close()
+                readings = main._prior_readings(claim, ["2402.00005"])
+                _, registry = main._registry_for_claim(claim)
+                for name, records in (("prior_readings", readings), ("registry", registry)):
+                    with self.subTest(read_path=name):
+                        self.assertEqual(records["2402.00005"]["status"], "read_once")
+                        self.assertEqual(records["2402.00005"]["counts"], {verdict: 2})
 
 
 if __name__ == "__main__":

@@ -47,6 +47,7 @@ BASE_DIR = Path(os.getenv("DTOX_DATA_DIR", Path(__file__).resolve().parent))
 DB_PATH = BASE_DIR / "state.db"
 LOCK_FILE = BASE_DIR / "service.lock"
 LOG_FILE = BASE_DIR / "pipeline.log"
+STAGE_HEARTBEAT_FILE = BASE_DIR / "stage_heartbeats.json"
 LATEX_CACHE_DIR = BASE_DIR / "latex_cache"
 EXTRACTOR_VERSION = 3
 
@@ -3201,15 +3202,73 @@ _heartbeats = {}
 _heartbeats_lock = threading.Lock()
 
 
-def stage_heartbeat(name):
+def stage_heartbeat(name, event="ready", processed=None):
+    now = time.time()
     with _heartbeats_lock:
-        _heartbeats[name] = time.time()
+        record = _heartbeats.setdefault(name, {})
+        record.update(heartbeat_at=now, event=event)
+        if event == "start":
+            record.update(phase="busy", started_at=now)
+        elif event == "end":
+            record.update(phase="idle" if not processed else "waiting",
+                          ended_at=now, last_success_at=now, processed=processed)
+        elif event == "error":
+            record.update(phase="backoff", ended_at=now)
+        else:
+            record["phase"] = "starting"
 
 
 def newest_heartbeat():
     """Most recent sign of life across stages; an idle stage still ticks."""
     with _heartbeats_lock:
-        return max(_heartbeats.values()) if _heartbeats else time.time()
+        return max(r["heartbeat_at"] for r in _heartbeats.values()) if _heartbeats else time.time()
+
+
+def process_start_ticks():
+    try:
+        fields = Path("/proc/self/stat").read_text(encoding="ascii").rsplit(")", 1)[1].split()
+        return int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def heartbeat_snapshot():
+    with _heartbeats_lock:
+        snapshot = {"version": 1, "pid": os.getpid(), "written_at": time.time(),
+                    "stages": {name: dict(record) for name, record in _heartbeats.items()}}
+    started = process_start_ticks()
+    if started is not None:
+        snapshot["process_start_ticks"] = started
+    return snapshot
+
+
+def persist_stage_heartbeats():
+    snapshot = heartbeat_snapshot()
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix=".stage-heartbeats-",
+                                         dir=BASE_DIR, delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(snapshot, stream, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, STAGE_HEARTBEAT_FILE)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def stalled_stages(now=None):
+    now = time.time() if now is None else now
+    with _heartbeats_lock:
+        stalled = {}
+        for name, record in _heartbeats.items():
+            busy = record.get("phase") == "busy"
+            since = record["started_at"] if busy else record["heartbeat_at"]
+            if now - since > WATCHDOG_STALL_SECONDS:
+                stalled[name] = "stuck call" if busy else "stale heartbeat"
+        return stalled
 
 
 def _stage_loop(name, fn, wants_session):
@@ -3218,8 +3277,9 @@ def _stage_loop(name, fn, wants_session):
     log.info(f"stage {name}: started")
     while True:
         try:
+            stage_heartbeat(name, "start")
             processed = fn(conn, session) if wants_session else fn(conn)
-            stage_heartbeat(name)
+            stage_heartbeat(name, "end", processed)
             if processed:
                 log.info(f"stage {name}: {processed}")
                 time.sleep(STAGE_BUSY_SLEEP)
@@ -3227,7 +3287,7 @@ def _stage_loop(name, fn, wants_session):
                 time.sleep(STAGE_IDLE_SLEEP)
         except Exception:
             log.exception(f"stage {name} failed, retrying shortly")
-            stage_heartbeat(name)
+            stage_heartbeat(name, "error")
             time.sleep(STAGE_ERROR_SLEEP)
 
 
@@ -3236,10 +3296,16 @@ def _reporter_loop():
     while True:
         time.sleep(REPORT_INTERVAL)
         try:
+            stage_heartbeat("reporter", "start")
             log.info(f"counts={status_counts(conn)}")
-            stage_heartbeat("reporter")
+            stage_heartbeat("reporter", "end", 0)
         except Exception:
+            stage_heartbeat("reporter", "error")
             log.exception("reporter failed")
+        try:
+            persist_stage_heartbeats()
+        except OSError as exc:
+            log.warning("stage heartbeat snapshot unavailable: %s", type(exc).__name__)
 
 
 def recheck_step(conn, session):
@@ -3815,7 +3881,12 @@ def run_stages_parallel():
                              name=f"stage-{name}", daemon=True)
         t.start()
         threads.append(t)
+    stage_heartbeat("reporter")
     threading.Thread(target=_reporter_loop, name="reporter", daemon=True).start()
+    try:
+        persist_stage_heartbeats()
+    except OSError as exc:
+        log.warning("initial stage heartbeat snapshot unavailable: %s", type(exc).__name__)
     log.info(f"running {len(threads)} stages in parallel")
     while True:
         time.sleep(60)
@@ -3847,11 +3918,11 @@ def start_watchdog():
     def _watch():
         while True:
             time.sleep(WATCHDOG_POLL_SECONDS)
-            stalled = time.time() - newest_heartbeat()
-            if stalled > WATCHDOG_STALL_SECONDS:
+            stalled = stalled_stages()
+            if stalled:
                 log.error(
-                    "watchdog: no progress for %.0f min, exiting so systemd restarts",
-                    stalled / 60,
+                    "watchdog: stage unhealthy for >45 min: %s; exiting so systemd restarts",
+                    stalled,
                 )
                 logging.shutdown()
                 os._exit(1)

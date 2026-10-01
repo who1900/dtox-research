@@ -29,6 +29,7 @@ class LexicalTimeoutTests(unittest.TestCase):
             return ["1234.5678"]
 
         body = main.SearchBody(query="unit-test slow lexical", limit=3)
+        main.search_cache.data.clear()
         with (patch.object(main, "LEXICAL_QUERY_TIMEOUT", 0.01),
               patch.object(main, "_bm25_candidates", side_effect=slow_bm25),
               patch.object(main, "embed_query", return_value=[0.1, 0.2]),
@@ -43,7 +44,8 @@ class LexicalTimeoutTests(unittest.TestCase):
         # answered near the (tiny) lexical timeout, not after the 0.2s sleep
         self.assertLess(elapsed, 0.2)
         self.assertEqual(result.get("lexical_channel"), "skipped")
-        self.assertNotIn("partial", result)
+        self.assertTrue(result["partial"])
+        self.assertEqual(len(main.search_cache.data), 0)
         self.assertEqual(result["results"][0]["arxiv_id"], "1234.5678")
 
     def test_fast_lexical_thread_is_not_marked_skipped(self):

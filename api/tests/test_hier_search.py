@@ -161,7 +161,8 @@ class HierSearchTests(unittest.TestCase):
         result = self._run(_body(), fake)
 
         self.assertEqual(result.get("global_channel"), "skipped")
-        self.assertNotIn("partial", result)
+        self.assertTrue(result["partial"])
+        self.assertEqual(len(main.search_cache.data), 0)
         self.assertEqual([r["arxiv_id"] for r in result["results"]], ["p1"])
 
     def test_global_channel_adds_up_to_three_extra_papers_in_tail(self):

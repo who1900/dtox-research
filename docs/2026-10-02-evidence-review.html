@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <title>DTOX - Evidence QA · 2026-10-02 deployed snapshot</title>
+  <style>
+    :root { color-scheme: light; background: #fafaf3; color: #1a1a1a; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 16px/1.65 Inter, Arial, sans-serif; }
+    main { max-width: 1060px; margin: auto; padding: 72px 36px 56px; }
+    h1, h2, h3 { line-height: 1.15; letter-spacing: -.035em; }
+    h1 { max-width: 800px; font-size: clamp(36px, 6vw, 66px); margin: 20px 0 28px; }
+    h2 { font-size: 28px; margin: 0 0 24px; }
+    h3 { font-size: 20px; margin: 0 0 12px; }
+    p { max-width: 82ch; margin: 12px 0; }
+    section { margin-top: 64px; }
+    .meta, code, pre, th { font-family: "Roboto Mono", Consolas, monospace; }
+    .meta { font-size: 12px; letter-spacing: .035em; }
+    .state { display: inline-block; padding: 6px 12px; background: #eee9db; }
+    .note { background: #eeeee5; padding: 24px; margin: 28px 0; }
+    .finding { padding: 28px; background: #f1f1e9; margin: 20px 0; }
+    .finding p:last-child { margin-bottom: 0; }
+    a { color: inherit; text-underline-offset: 4px; overflow-wrap: anywhere; }
+    a:focus-visible { outline: 3px solid #1a1a1a; outline-offset: 4px; }
+    code { font-size: .86em; overflow-wrap: anywhere; }
+    pre { padding: 20px; background: #eeeee5; font-size: 12px; overflow: auto; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; text-align: left; }
+    caption { text-align: left; margin-bottom: 16px; }
+    th, td { vertical-align: top; padding: 16px; }
+    th { background: #e9e9de; font-size: 12px; font-weight: normal; }
+    tbody tr:nth-child(even) { background: #f0f0e7; }
+    ul, ol { padding-left: 24px; }
+    li { margin: 10px 0; }
+    footer { margin-top: 64px; color: #55554e; }
+    @media (max-width: 600px) {
+      main { padding: 36px 20px; }
+      section { margin-top: 44px; }
+      .finding, .note { padding: 20px; }
+    }
+    @media print {
+      main { max-width: none; padding: 0; }
+      .finding { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <p class="meta">DTOX / TECHNICAL QA / 2026-10-02 / CONFIRMED SNAPSHOT</p>
+    <h1>Evidence integrity.<br>Checks, not promises.</h1>
+    <p class="state meta">API + MCP DEPLOYED · OPS VERIFIED SMOKE · FROZEN SNAPSHOT</p>
+    <p>Research retrieval for agents. This review separates acquired evidence from abstract
+      fallbacks, relaxed filters, incomplete retrieval and untrusted agreement.</p>
+    <div class="note">
+      <p><strong>Evidence boundary.</strong> Aggregate test totals, deployment status and public
+        smoke results below were verified by the lead agent during deployment. Final ops
+        smoke was verified from live <code>--report</code>; this is not a soak/load or stability sign-off.</p>
+      <p><strong>Mainnet: unchanged / not assessed.</strong> No chain assessment or readiness
+        claim is made. No soak/load test was run, and p95 latency is not established.</p>
+    </div>
+  </header>
+
+  <section aria-labelledby="findings">
+    <h2 id="findings">Guard review</h2>
+    <article class="finding">
+      <p class="meta">01 / CORRECTNESS / GUARD VERIFIED + PUBLIC LABEL SMOKE</p>
+      <h3>Full text follows acquisition, not an ID prefix</h3>
+      <p>An arXiv/OpenAlex prefix does not prove body availability; an IACR record can have
+        recovered open-access text. The fix is <code>completeness(fulltext_source)</code>
+        and <code>provenance(...)</code> derived from actual acquisition metadata.</p>
+      <p>Abstract-only acquisition yields <code>fulltext=false</code>; missing metadata yields
+        <code>fulltext=null</code>. A fetched PDF does not prove complete parsing:
+        <code>parse_completeness="unknown"</code>. PDF/Markdown is not promised as exact LaTeX.</p>
+      <p>Public VDF smoke returned four hits: two IACR records were abstract-only / false;
+        the other PDF-backed records were true. Fragment hashes distinguish indexed text
+        from returned snippets, but do not establish the truth of a claim.</p>
+    </article>
+    <article class="finding">
+      <p class="meta">02 / CORRECTNESS / GUARD VERIFIED + PUBLIC SCHEMA CONFIRMED</p>
+      <h3>Strict is explicit; ordinary search defaults are unchanged</h3>
+      <p>The public schema advertises search <code>strict=False</code> and bundle
+        <code>strict=True</code>. Strict search forwards <code>auto_relax=False</code>;
+        the API disables soft-layer expansion, filter relaxation and diagnostic broadening.
+        Unknown terms are rejected before retrieval.</p>
+      <p>Regression coverage includes exact-layer named lookup, no unscored lexical fallback,
+        and separate strict/non-strict cache keys. Ordinary search may broaden a request:
+        read <code>relaxed</code> and <code>matches_filters</code> instead of presenting
+        neighbouring results as exact matches.</p>
+    </article>
+    <article class="finding">
+      <p class="meta">03 / SECURITY / CRITICAL FALSE-SETTLEMENT GUARD VERIFIED</p>
+      <h3>Wallet/key identities are not independent models</h3>
+      <p>The pure helper excludes <code>key:</code>, <code>wallet:</code> and
+        <code>unspecified</code> from model diversity. Wallet-only agreement remains
+        <code>read_once</code> (pending); opposing decisive verdicts are <code>contested</code>.</p>
+      <p>Legacy arbitrary <code>judged_by_model</code> strings previously caused false
+        confirmation or exclusion. The read-path fix accepts only server-established
+        <code>trusted-model:</code> attribution for decisive readings. New attribution comes
+        from <code>info.reader_model</code>/<code>info.model</code>, never client claims or key names.</p>
+      <p>Without verified model metadata, trusted settlement is unavailable and
+        <code>models=[]</code> keeps agreement pending. Partial judgments cannot add model
+        diversity. The public tool inventory contains no unsigned registry-write tools;
+        the existing signed-verdict path authenticates signers, not independent reasoning.</p>
+      <p>A lead-verified count-only SQL check found <strong>zero legacy
+        <code>trusted-model:</code>-prefixed records</strong>, without reading or exposing names.
+        This does not turn legacy attribution into trusted agreement.</p>
+    </article>
+    <article class="finding">
+      <p class="meta">04 / ERROR HANDLING / GUARD VERIFIED · LOAD DISTRIBUTION UNKNOWN</p>
+      <h3>Partial retrieval is not evidence of absence</h3>
+      <p><code>partial</code> survives mix/RRF and coarse fallback.
+        <code>_scored_results_for_audit(...)</code> refuses partial retrieval with HTTP 503,
+        even when a returned relevance score is high. Incomplete search is not a negative verdict.</p>
+      <p>Timeout/fallback guards are regression-tested. This does not establish a production
+        latency distribution: no soak/load test was run, and p95 is not established.</p>
+    </article>
+    <article class="finding">
+      <p class="meta">05 / READ SURFACE / DEPLOYED + PUBLIC SMOKE CONFIRMED</p>
+      <h3>A bounded research bundle, without verdict writes</h3>
+      <p><code>get_research_bundle(query, layer=None, limit=3, max_chars=12000, strict=True)</code>
+        makes one POST to <code>/v1/research/bundle</code> with a 30-second internal request
+        timeout and the shared read-tool HTTP/network error format. It does not write
+        verdicts, create registry links or submit chain transactions.</p>
+      <p>Public EIP-4337 smoke with <code>limit=1</code> and <code>max_chars=6000</code>
+        returned <strong>10 code fragments, 3866 characters, in 1.17 seconds</strong>,
+        with <code>partial=false</code>. This is one observed response, not p95 or an SLA.</p>
+      <p>Additional public fast-validation smoke completed in <strong>11.56 seconds</strong>
+        with <code>error=null</code>, as a pure-read operation. It reported external ERC-4337
+        candidate context, <strong>two unread candidates</strong> and <strong>no automatic
+        confirmation</strong>. This is distinct from the 1.17-second bundle observation.</p>
+    </article>
+  </section>
+
+  <section aria-labelledby="checks">
+    <h2 id="checks">Current aggregate checks</h2>
+    <div class="table-wrap">
+      <table>
+        <caption>Lead-verified totals after the ops PID-check fix, 2026-10-02. Earlier totals are superseded.</caption>
+        <thead><tr><th scope="col">Suite</th><th scope="col">Result</th><th scope="col">Evidence boundary</th></tr></thead>
+        <tbody>
+          <tr><td>API full suite</td><td>498 total · 497 passed · 1 skipped</td><td>Aggregate regression result; not a soak/load test or CI result.</td></tr>
+          <tr><td><a href="../mcp/tests/test_contract.py">MCP contract</a></td><td>11 passed</td><td>AST/mock unit checks; public schema smoke is recorded separately.</td></tr>
+          <tr><td><a href="../eval/tests/test_bench.py">Eval</a></td><td>40 passed</td><td>Evaluation-unit coverage; not proof of improved retrieval quality.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <pre>python -B -m unittest discover -s api/tests -p 'test_*.py'
+python -B -m unittest discover -s mcp/tests -p 'test_*.py'
+python -B -m unittest discover -s eval/tests -p 'test_*.py'</pre>
+    <p>Live API and MCP are deployed. The public inventory has <strong>13 tools</strong>;
+      search strict defaults to false, bundle strict defaults to true, and unsigned
+      registry writes are absent from the public tool list.</p>
+    <p>No CI run or success is claimed here.</p>
+  </section>
+
+  <section aria-labelledby="ranks">
+    <h2 id="ranks">Stage-6 search: unchanged ranks</h2>
+    <div class="table-wrap">
+      <table>
+        <caption>Lead-verified before/after checks. No ranked-quality gain is claimed.</caption>
+        <thead><tr><th scope="col">Case</th><th scope="col">Before</th><th scope="col">After</th></tr></thead>
+        <tbody>
+          <tr><td>Canonical EIP-4337</td><td>1</td><td>1</td></tr>
+          <tr><td>EIP-7702</td><td>1</td><td>1</td></tr>
+          <tr><td>Nonce</td><td>3</td><td>3</td></tr>
+          <tr><td>VDF</td><td>4</td><td>4</td></tr>
+          <tr><td>EIP-4844</td><td>9</td><td>9</td></tr>
+          <tr><td>Oracle / Chainlink v2</td><td>Missing from top 10</td><td>Missing from top 10</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The changes improve evidence labels, strict-filter guarantees and failure honesty.
+      These rank checks do not demonstrate improved retrieval ordering or establish why
+      the oracle case remains absent. No numerical quality score is assigned.</p>
+  </section>
+
+  <section aria-labelledby="handoff">
+    <h2 id="handoff">Operations: verified smoke, explicit unknowns</h2>
+    <p>The Qdrant guard is deployed and working with <code>oom_score_adj=-900</code>,
+      maintained by systemd every minute, without a Qdrant restart. The pipeline is alive
+      with <strong>14 stages</strong>. The heartbeat-wrapper PID-check fix is complete.</p>
+    <p>The lead-verified live <code>--report</code> passed API health, embed health, Qdrant
+      and the 13-tool MCP check. The validated snapshot was about <strong>one minute old</strong>;
+      <strong>14 stages plus the reporter</strong> had current <code>starting</code> /
+      <code>idle</code> / <code>busy</code> states, with no failures. Reported disk:
+      <strong>41 GB</strong>; backup age: <strong>19 hours</strong>.</p>
+    <div class="note">
+      <p><strong>Final ops status: verified smoke.</strong> The remaining unknowns are
+        deliberately not promoted to success claims:</p>
+      <ul>
+        <li>p95 sample count: <strong>1 (&lt;20)</strong>. p95 is not established.</li>
+        <li>No journal was available to distinguish first completions from reprocessing.</li>
+        <li>Queue observation: <strong>14</strong>; the initial progress baseline is unknown.</li>
+      </ul>
+      <p>No overnight soak, load test, growth-rate estimate or long-term-stability claim.
+        Mainnet remains unchanged / not assessed.</p>
+    </div>
+  </section>
+  <footer>
+    <p class="meta">OFFLINE HTML · NO JAVASCRIPT · NO EXTERNAL ASSETS · NO EXTERNAL TELEMETRY</p>
+    <p>Review method: risk → fix → evidence. No quality grades, telemetry or on-chain review.
+      Fonts are local with system fallbacks. Links point to checkout files; opening this
+      report requires no network connection. Earlier focused totals are historical, not current results.
+      Frozen as the lead-verified 2026-10-02 snapshot; not continuous monitoring.</p>
+  </footer>
+</main>
+</body>
+</html>
