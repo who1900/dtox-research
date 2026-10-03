@@ -633,9 +633,10 @@ def get_verdict_message(
     """Prepare the exact message to sign for a verifiable, on-chain verdict.
 
     Step one of filing a wallet-backed verdict; no chain transaction is
-    submitted by this preparation call. The API may resolve or register a
-    local claim node during preparation. It returns
-    the canonical UTF-8 string this claim/paper/verdict combination hashes
+    submitted by this preparation call. The API resolves the claim against
+    existing nodes and explicit links, falling back to normalized claim text;
+    it does not embed or create/register a claim node. It returns the canonical
+    UTF-8 string this claim/paper/verdict combination hashes
     to. Sign it with the ed25519 secret key of a Solana wallet you control --
     the same primitive any Solana wallet already uses -- then pass the
     base58 signature and your base58 public key to record_signed_verdict.
@@ -646,9 +647,10 @@ def get_verdict_message(
     attested on-chain data without trusting dtox at all.
 
     Args:
-        claim: The claim, in your own words. Wordings that mean the same
-            thing resolve to one claim_id, returned here and required by
-            record_signed_verdict.
+        claim: The claim, in your own words. Identity is the normalized exact
+            claim text unless an explicit existing claim link resolves it to
+            another node. This preview does not register a new node. The
+            returned claim_id is required by record_signed_verdict.
         paper_id: The paper you are ruling on, e.g. "2401.12345".
         verdict: "asserts", "does_not_assert" or "partial".
         evidence_sha256: Optional hex sha256 of the evidence text backing

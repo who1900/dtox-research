@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>dtox research: release readiness</title>
+  <style>
+    :root { color-scheme: light; --paper: #fafaf3; --ink: #1a1a1a; --muted: #64645d; --wash: #efefe7; --amber: #775b1c; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.65 Inter, system-ui, sans-serif; }
+    main { max-width: 850px; margin: 0 auto; padding: 56px 28px 88px; }
+    h1, h2 { line-height: 1.2; letter-spacing: -.035em; }
+    h1 { font-size: clamp(2rem, 5vw, 3.4rem); margin: 0 0 1rem; }
+    h2 { margin: 2.5rem 0 .8rem; font-size: 1.5rem; }
+    p, ul { max-width: 74ch; }
+    a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: .2em; }
+    code, .meta { font-family: "Roboto Mono", ui-monospace, monospace; }
+    .meta { color: var(--muted); font-size: .82rem; }
+    .callout { background: var(--wash); padding: 1rem 1.25rem; }
+    .pending { color: var(--amber); font-weight: 650; }
+    li { margin: .5rem 0; }
+    table { border-collapse: collapse; width: 100%; max-width: 74ch; }
+    th, td { text-align: left; vertical-align: top; padding: .65rem .8rem .65rem 0; }
+    th { background: var(--wash); }
+  </style>
+</head>
+<body>
+<main>
+  <p class="meta">2026-10-03 · CURRENT CHECKOUT 322FF3A</p>
+  <h1>dtox research: release readiness</h1>
+  <p class="meta">Live, deployment and chain observations are main-attributed; exact timestamps are shown where supplied. This is evidence, not a production certificate.</p>
+  <p class="callout"><strong>Final verdict: NO-GO for production.</strong> The bounded public read beta passed and main live check 2 is complete. Two known production prerequisites remain: resolve RAM headroom and verify full restore. The one authorized Solana devnet payment/write passed independent public RPC readback. Paid mainnet remains NO-GO and EVM payments remain unverified. This is not production release approval.</p>
+
+  <h2>Verified public read smoke</h2>
+  <p>The live public MCP returned 13 public tools. The observations below are individual calls made today, not a latency distribution, benchmark or SLO.</p>
+  <table>
+    <thead><tr><th>Read path</th><th>Observed result</th><th>Time</th></tr></thead>
+    <tbody>
+      <tr><td><code>find_papers</code>, MEV paper <code>2101.05511</code></td><td>Known hit returned</td><td>13.59 s</td></tr>
+      <tr><td><code>get_paper</code></td><td>Paper read returned</td><td>0.70 s</td></tr>
+      <tr><td><code>read_paper_section</code>, ERC-4337 limitations</td><td>1,205 characters returned</td><td>0.29 s</td></tr>
+      <tr><td>Math spec for <code>2101.05511</code></td><td>7 sections returned</td><td>0.11 s</td></tr>
+      <tr><td>Strict bounded EIP-4337 bundle, <code>max_chars=2000</code></td><td><code>generated=false</code>, <code>search_partial=false</code>, <code>partial=true</code>, <code>warnings=[]</code></td><td>0.75 s</td></tr>
+      <tr><td><code>search_research_paper</code> for <code>durable_nonce</code></td><td>3 hits returned</td><td>0.83 s</td></tr>
+    </tbody>
+  </table>
+  <p>The bundle fields are reported exactly as returned: <code>partial=true</code> alongside <code>search_partial=false</code>. A known hit demonstrates this query path only. The 13.59-second observation is not an SLO.</p>
+
+  <h2>Main live check 2</h2>
+  <p>Additional live reads completed today:</p>
+  <ul>
+    <li><code>similar_papers</code>: 3 papers returned in 0.65 s.</li>
+    <li><code>compare_methods</code>: HTTP 200 with keys <code>a</code> and <code>b</code> in 0.32 s. No table-count claim is made.</li>
+    <li><code>get_verdict_message</code>: returned in 0.24 s.</li>
+    <li>Trends query for zero-knowledge proofs: 173 canonical results, <code>status=bounded_sample</code>, <code>lower_bound=true</code>, in 8.14 s.</li>
+    <li>ERC-4337 EntryPoint validation: 1 <code>strong_candidate</code> in 10.78 s. It was <strong>not</strong> confirmed prior art.</li>
+  </ul>
+  <p>Registry counts were unchanged before and after the read checks: 53 nodes, 15 judgments and 2 links. All 13 public tools are covered: 12 read/preview tools passed and the signed-write path passed through the authorized devnet E2E below.</p>
+
+  <h2>Counts and scope</h2>
+  <p><code>count_papers(layer="web3")</code> reported 16,404 canonical papers in 0.69 s. Raw <code>done</code> rows for Web3 may differ from this canonical count; the two measures are not interchangeable. No raw-done total, corpus-growth rate or new-ingestion claim is made here.</p>
+
+  <h2>Authorized devnet payment and signed record</h2>
+  <p>At 2026-10-03T09:55:43.992Z, one payment and one signed test record succeeded through the public <a href="https://read.whoim.space/x402/mcp">x402 MCP endpoint</a>. SDK result: <code>isError=false</code>, <code>receipt.success=true</code>. Independent public Solana RPC readback passed: full genesis hash <code>EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG</code> matched devnet; SAS account owner matched; claim, evidence, paper, verdict, reviewer and <code>issued_at</code> fields matched; decoded on-chain reviewer signature passed Ed25519 verification. Both transactions finalized with <code>err=null</code>. Payment slot <code>506956512</code>; attestation slot <code>506956519</code>, seven slots later.</p>
+  <ul>
+    <li>Payment transaction: <a href="https://explorer.solana.com/tx/31iL5AZXhVpBFVDF2Je42C3uZAirzk2Hg9LpLtLBXd3mw5w8inWYwbvgoYVCW3t4zxMrbTVZVsHcoxsukf8adu8J?cluster=devnet">devnet explorer</a>.</li>
+    <li>Attestation transaction: <a href="https://explorer.solana.com/tx/4wwnu49FV5gSshoXyfBteZZhEod5wcNSuQsyBx5e148ESpupQyPQQ47Upzip1tLgjoVQ1AaEyahtpXRK8qysJ3x3?cluster=devnet">devnet explorer</a>; PDA <code>G1BBNygRmArfr4Ut7s3D84SBBwsgSQPRxv6uy6dnFH6b</code>.</li>
+    <li>Reviewer: <code>HCTag5BBmexuDNsY6QAE9kkiNev3Xe7bgZQ4eAmE2jfc</code>. Registry result: <code>read_once</code>, one reader, one <code>does_not_assert</code> reading, not quorum.</li>
+    <li>The <code>4zMMC9...</code> devnet mint balance delta was buyer <code>-10000</code> and recipient <code>+10000</code>, exactly <code>0.01</code> devnet USDC. Post-write DB verification found one unique PDA row matching the exact claim, reviewer and verdict; <code>judged_by_model=unspecified</code> is not trusted. Read-only global counts moved from 53/15/2 before the single write to 54 nodes/16 judgments/2 links after it. No extra payment or write was made.</li>
+  </ul>
+
+  <h2>Build and operational evidence</h2>
+  <ul>
+    <li>Current CI for checkout <code>322ff3a</code>: success.</li>
+    <li>Public beta: bounded read smoke passed for the calls listed above.</li>
+    <li>Post-deploy verification: HTTP 200 for all 13 public tools; preview description corrected and no longer promises automatic claim aliasing. Only the MCP tool description was deployed; service active. No API restart, index, RAM, price, or network changes were made.</li>
+    <li>Latest RAM observation, reported 2026-10-03 at 09:48 UTC: 9.88 GiB of 10 GiB (98.8%), about 0.12 GiB available by this reading. This is a point-in-time observation, not a guaranteed peak.</li>
+    <li>Latest Qdrant status: green; optimizer OK. Wrapper PID 321193 and restart_count 1 are unchanged. Actual Qdrant process PID 321228 has <code>oom_score_adj=-900</code>; wrapper PID 321193 has <code>oom_score_adj=0</code>, as expected. No OOM guard defect is indicated.</li>
+    <li>No RAM increase, rebuild or restart was performed. These operational changes require a separate decision.</li>
+    <li>Full Qdrant restore has not been verified.</li>
+  </ul>
+
+  <h2>Recovery evidence and limits</h2>
+  <ul>
+    <li>Newest judgments/state are from October 3 at 01:30 UTC.</li>
+    <li>A real registry backup was restored into an isolated in-memory database. It passed integrity checks with 53 nodes, 15 judgments and 2 links. This small registry restore is not a full Qdrant restore and was not a production restore.</li>
+    <li>The state backup is 2.42 GB. Its required-table check ran <code>quick_check</code>, hit the 25-second cap and ended incomplete and not verified. This is not evidence of corruption. The bounded check is finished; no full scan is planned.</li>
+    <li>The latest FTS backup is from September 27, on a weekly cadence.</li>
+    <li>The full-text Qdrant snapshot is from September 27, 32.49 GB, with a recorded checksum.</li>
+    <li>No coarse-index snapshot exists; that index is rebuildable.</li>
+  </ul>
+  <p>Full restore remains a readiness gate. The isolated registry result does not establish recovery of the full-text Qdrant collection or application state.</p>
+
+  <h2>Remaining production gates and test limits</h2>
+  <ul>
+    <li>Minimum current public devnet payment/write: independent RPC readback PASS as detailed above. Registry status remains one-reader <code>read_once</code>, not quorum.</li>
+    <li>Additional invalid-signature review probe was outside the one-payment/test-record authorization and was not made. Rely on offline invalid-signature tests; no extra live signed call is claimed.</li>
+    <li>Full production remains NO-GO: RAM headroom and full restore are unresolved; the state-backup required-table check ended incomplete at its 25-second cap and no full scan is planned.</li>
+    <li>Paid mainnet remains NO-GO and EVM payment support remains unverified. These observations do not establish sustained capacity, an SLO, or production restore readiness.</li>
+  </ul>
+</main>
+</body>
+</html>

@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>dtox research: hackathon submission package</title>
+  <style>
+    :root { color-scheme: light; --paper: #fafaf3; --ink: #1a1a1a; --muted: #64645d; --wash: #efefe7; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.65 Inter, system-ui, sans-serif; }
+    main { max-width: 850px; margin: 0 auto; padding: 56px 28px 88px; }
+    h1, h2, h3 { line-height: 1.2; letter-spacing: -.035em; }
+    h1 { font-size: clamp(2rem, 5vw, 3.4rem); margin: 0 0 1rem; }
+    h2 { margin: 3rem 0 1rem; font-size: 1.65rem; }
+    h3 { margin: 2rem 0 .6rem; font-size: 1.15rem; }
+    p, ul { max-width: 74ch; }
+    a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: .2em; }
+    code, pre, .meta { font-family: "Roboto Mono", ui-monospace, monospace; }
+    .meta { color: var(--muted); font-size: .82rem; }
+    .callout { background: var(--wash); padding: 1rem 1.25rem; }
+    pre { background: var(--wash); overflow-x: auto; padding: 1rem 1.25rem; font-size: .88rem; }
+    li { margin: .45rem 0; }
+  </style>
+</head>
+<body>
+<main>
+  <p class="meta">PREPARED 2026-10-03 · REPOSITORY HEAD 322FF3A</p>
+  <h1>dtox research: hackathon submission package</h1>
+  <p class="callout">Copy-ready product text is below. Crypto World's Fair is a multichain event. Official schedule and video requirements were verified for this update. Live, deployment and chain facts in this package are main-attributed, with exact timestamps included where supplied; this is not a production certificate. Do not upload or submit without owner review and explicit authorization.</p>
+
+  <h2>Submission fields</h2>
+  <p><strong>Event:</strong> Crypto World's Fair, a multichain contest<br><strong>Project:</strong> dtox research<br><strong>Category:</strong> Developer Infrastructure<br><strong>Tagline:</strong> Web3 research infrastructure for execution agents.</p>
+
+  <h3>Project description</h3>
+  <p>Execution agents need more than a list of papers before their builders choose a transaction path or account architecture. dtox is a Web3-first research service that lets agents find and read protocol specifications, technical papers and whitepapers through MCP. It returns source-linked evidence with acquisition and extraction provenance, including equations, algorithms, code, tables and authors' stated limitations when those materials are available. A bounded research bundle assembles a reading packet under a character budget; it is evidence for a human or agent to inspect, not an automatic security review or novelty verdict.</p>
+  <p>For example, dtox can retrieve the MEV auction model in <em>Quantifying Blockchain Extractable Value: How dark is the forest?</em> alongside the ERC-4337 specification's discussion of EntryPoint risk concentration and protections against account hijacking or fee draining. The paper's expected-utility expression is <code>E[u_i^PA | alpha] = (1-alpha) Pr^PA(O,S_i) R_i(O) - b_i^PA(O,S_i)</code>. The source object identifies this as original LaTeX; the ERC-4337 passage is specification text, not dtox-generated advice. The two sources support cross-ecosystem research, not a claim that their assumptions are equivalent.</p>
+  <p>The public read beta is free and needs no key or signup. Separately, agents can sign readings with a wallet and anchor them through Solana Attestation Service. A signature makes attribution checkable; it does not establish that a claim is correct or that reviewers reasoned independently. Payment, wallet evidence and scientific agreement are distinct capabilities. dtox is built for Web3 developer teams and agent frameworks. Optional usage credits and team integrations are proposed business models, not proven demand or live exclusive tiers.</p>
+
+  <h3>Demo: free public MCP</h3>
+  <p>Endpoint: <a href="https://read.whoim.space/mcp">read.whoim.space/mcp</a><br>Product: <a href="https://read.whoim.space/research/">research site</a><br>Repository: <a href="https://github.com/who1900/dtox-research">who1900/dtox-research</a>, AGPL-3.0.</p>
+  <p>Connect a client:</p>
+  <pre><code>claude mcp add --transport http dtox https://read.whoim.space/mcp
+codex mcp add dtox --url https://read.whoim.space/mcp</code></pre>
+  <p>For another MCP client, use <code>{"type":"http","url":"https://read.whoim.space/mcp"}</code>. These commands configure the local client. The demo uses free read tools only; no wallet or payment is needed.</p>
+  <p>Try the source-backed Web3 path with these MCP calls:</p>
+  <pre><code>find_papers(query="Quantifying Blockchain Extractable Value", layer="web3", limit=3)
+get_code_or_math_spec(arxiv_id="2101.05511", target_elements="equation,algorithm", max_chars=5500)
+read_paper_section(paper_id="eip:4337", section_type="limitations", max_chars=3500)</code></pre>
+  <p>In the recorded response dated 2026-10-02, discovery ranked arXiv <code>2101.05511</code> first. The spec call returned seven objects (one algorithm and six equations), 2,211 characters, and <code>truncated=false</code>; show the BEV auction model, not the transaction-replay algorithm. The ERC-4337 call returned 1,205 characters of CC0 Markdown specification text. These are specific recorded responses, not a guarantee of identical future retrieval.</p>
+  <p>The bounded bundle tool is <code>get_research_bundle(query="EIP-4337", layer="web3", limit=1, max_chars=2000, strict=true)</code>. In the recorded 2026-10-02 smoke it returned actual specification text with <code>generated=false</code>, <code>search_partial=false</code>, and no warnings. <code>partial=true</code> was expected because the character budget clipped the returned prose/code; equations, algorithms and tables were absent from those chunks. A bounded sample is not exhaustive coverage. Inspect each result's provenance and abstract-only fallback markers before citing it. Candidates are not confirmed prior art.</p>
+
+  <h3>Wallet readings: traceable historical evidence</h3>
+  <p>These are historical Solana devnet records from 2026-09-29, not fresh demo writes, independent votes or proof of scientific agreement. Both reviewer wallets were team-controlled and addressed different claims.</p>
+  <ul>
+    <li>Wallet A, GRPO critic-free group-relative baseline claim, paper <code>2402.03300</code>, reading <code>asserts</code>: <a href="https://explorer.solana.com/address/729nUikYt2SUJaq1Brx2YwXvgLT5J1eVp9sfo31ncswu?cluster=devnet">SAS devnet attestation</a>.</li>
+    <li>Wallet B, DeepSeek-R1-Zero without preliminary SFT claim, paper <code>2501.12948</code>, reading <code>asserts</code>: <a href="https://explorer.solana.com/address/6pC4NS96euD9G7jPtjvXbVs1ffaWAjKdJMkX799Mq6eL?cluster=devnet">SAS devnet attestation</a>. This was a historical paid x402 call.</li>
+    <li><a href="https://explorer.solana.com/tx/5DWkk85AFVHSTCqeSEbq8SpxEAtfkSRgQZLPJy9ZyCnTvZczsyD86yKELGWf5xYrDrF5wTvt3txUL19NFLYmrBvG?cluster=devnet">Historical Solana devnet x402 settlement transaction</a>.</li>
+  </ul>
+  <p>Under current policy, a decisive registry status requires agreement at the configured quorum and at least two distinct trusted model identities established by the server. Wallet-only agreement remains pending; wallet count, client-declared model names and signatures alone do not prove independent reasoning. An attestation proves signer/message attribution, not scientific correctness or consensus.</p>
+
+  <h3>Fresh devnet release smoke: 2026-10-03</h3>
+  <p>One authorized payment and one signed test record were submitted to the public <a href="https://read.whoim.space/x402/mcp">x402 MCP endpoint</a> at <code>2026-10-03T09:55:43.992Z</code>. The MCP/SDK response returned <code>isError=false</code> and <code>receipt.success=true</code>. An independent public Solana RPC readback then passed: the full genesis hash matched devnet, the SAS account owner matched, the on-chain claim/evidence/paper/verdict/reviewer/issued_at fields matched, and the decoded on-chain reviewer signature passed Ed25519 verification. Both transactions finalized with <code>err=null</code>; payment finalized at slot <code>506956512</code>, attestation at <code>506956519</code>, seven slots after payment. This verifies the minimum live devnet payment-and-write path, not production or mainnet readiness.</p>
+  <ul>
+    <li>Payment transaction: <a href="https://explorer.solana.com/tx/31iL5AZXhVpBFVDF2Je42C3uZAirzk2Hg9LpLtLBXd3mw5w8inWYwbvgoYVCW3t4zxMrbTVZVsHcoxsukf8adu8J?cluster=devnet">Solana devnet explorer</a>.</li>
+    <li>Attestation transaction: <a href="https://explorer.solana.com/tx/4wwnu49FV5gSshoXyfBteZZhEod5wcNSuQsyBx5e148ESpupQyPQQ47Upzip1tLgjoVQ1AaEyahtpXRK8qysJ3x3?cluster=devnet">Solana devnet explorer</a>.</li>
+    <li>Attestation PDA: <code>G1BBNygRmArfr4Ut7s3D84SBBwsgSQPRxv6uy6dnFH6b</code>; reviewer: <code>HCTag5BBmexuDNsY6QAE9kkiNev3Xe7bgZQ4eAmE2jfc</code>.</li>
+    <li>Verified genesis hash: <code>EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG</code>.</li>
+    <li>The <code>4zMMC9...</code> devnet mint balance delta was buyer <code>-10000</code> and recipient <code>+10000</code>, exactly <code>0.01 USDC</code>.</li>
+  </ul>
+  <p>The exact claim was “Release smoke 2026-10-03: ERC-4337 prevents every possible denial-of-service attack,” paper <code>eip:4337</code>, verdict <code>does_not_assert</code>. Evidence SHA-256: <code>335696d9c582a3285a719928621789cf8ce38438f51d39b8905ed124b0d0978a</code>; claim SHA-256: <code>f22e64c9c301e383abeb45419ae4b2d36708d4d42f38f65c1b24585b0289eab4</code>. Registry status was <code>read_once</code>, one reader, one <code>does_not_assert</code> reading, not quorum. The script used the exact devnet mint and recipient, cap <code>10000</code> atomic units, and no automatic retry. The transfer was <code>10000</code> atomic units, exactly <code>0.01</code> devnet USDC. No additional payment or write was made. The payment verifies the one tested devnet flow only; it does not create scientific quorum. Post-write DB verification found one unique PDA row matching the exact claim, reviewer and verdict; <code>judged_by_model=unspecified</code> is not a trusted model. Read-only global counts changed from 53 nodes/15 judgments/2 links before the paid write to 54/16/2 after that single write.</p>
+
+  <h3>Videos and event fields</h3>
+  <ul>
+    <li>Presentation, 2:40 (160.104667 seconds): <a href="../presentation/video-2026-10-02/presentation-preview.mp4">local MP4</a>, <a href="../presentation/video-2026-10-02/presentation.srt">SRT</a>.</li>
+    <li>Product demo, 2:49 (168.896333 seconds): <a href="../presentation/video-2026-10-02/demo-preview.mp4">local MP4</a>, <a href="../presentation/video-2026-10-02/demo.srt">SRT</a>.</li>
+  </ul>
+  <p>Both MP4s are editorial videos built from historical recorded MCP responses. They are not continuous footage of a live MCP client session. Technical and visual checks are reported complete; owner review of pronunciation and subtitle timing, public upload, and approval to submit remain pending. No public video link is available in this package. The FAQ requires two separate English-language videos: a presentation of 2 to 3 minutes and a product demo of no more than 3 minutes.</p>
+  <p><strong>Verified event schedule:</strong> September 14, 2026 at 6:00 a.m. PT through October 12, 2026 at 11:59 p.m. PT. The deadline is October 13, 2026 at 11:59 a.m. in Asia/Qyzylorda. Official sources: <a href="https://colosseum.com/worldsfair">Crypto World's Fair</a>, <a href="https://colosseum.com/hackathon">hackathon FAQ</a>, <a href="https://colosseum.com/legal/Crypto%20World%27s%20Fair%20Hackathon%20Rules.pdf">official rules</a>.<br><strong>Prior work:</strong> development before September 14 is allowed, but must be disclosed; judging is for work done during the contest period. dtox development began July 31, 2026. Owner to confirm the disclosure and any funding details.<br><strong>Contact, team names/roles, location, founder-market fit, registration and eligibility:</strong> owner to supply and confirm.<br><strong>Upload and submission authority:</strong> pending explicit owner approval. Nothing here implies permission to upload, register, or submit.</p>
+
+  <h2>Readiness and claim boundaries</h2>
+  <ul>
+    <li><strong>Read beta:</strong> the public <code>/mcp</code> research read path is free; the October 3 audit reports the API, MCP, pipeline, extractor, backup, monitor, gateway and site active after scoped deployment. Two CI checks are reported green. These facts do not establish an SLO, full production release approval, or whole-corpus completeness.</li>
+    <li><strong>Retrieval context:</strong> current source includes a scoped example for the BEV paper and ERC-4337. The paper's full LaTeX and the specification's Markdown have different provenance and format. Abstract-only fallback remains possible per record. No corpus-growth or adoption metric is asserted here.</li>
+    <li><strong>Solana devnet:</strong> one current authorized payment and signed record passed independent public RPC readback, with transaction links above. Registry status is <code>read_once</code>, not quorum. Do not claim scientific confirmation.</li>
+    <li><strong>EVM:</strong> Base Sepolia, Ethereum Sepolia and Arbitrum Sepolia are planned/configured support, not demonstrated paid end-to-end flows. Ethereum Sepolia has a documented SDK asset-mapping gate. No EVM settlement is claimed.</li>
+    <li><strong>Mainnet:</strong> paid mainnet remains NO-GO. No mainnet readiness, scientific consensus, restore SLO, or external formal review is claimed. EVM payment support is unverified.</li>
+    <li><strong>Model/index configuration:</strong> small Oracle is off; bge-base is unchanged. No claim of a new indexing run or corpus expansion.</li>
+  </ul>
+
+  <h2>Separate checklists</h2>
+  <h3>Hackathon submission</h3>
+  <ul>
+    <li>☐ Owner verifies current official event rules, deadline, account registration and eligibility.</li>
+    <li>☐ Owner confirms team/contact/founder fields and prior-work/funding disclosure.</li>
+    <li>☐ Owner reviews narration and SRT timing, then decides whether these local MP4s are approved.</li>
+    <li>☐ Owner supplies public URLs after separately authorized upload; confirm video requirements against current official rules.</li>
+    <li>☐ Owner explicitly approves the final form and submission.</li>
+  </ul>
+  <h3>Full production readiness (not required to make this package copy-ready)</h3>
+  <ul>
+    <li>☐ Separately review resource headroom and authorize any operational maintenance; small Oracle is currently off.</li>
+    <li>☐ Keep full production readiness blocked on RAM headroom and a verified full restore; the bounded state-backup check ended incomplete.</li>
+    <li>☐ Resolve and verify EVM asset/facilitator configuration before claiming EVM payments.</li>
+    <li>☐ Complete owner-approved recovery/restore and broader release-readiness checks.</li>
+    <li>☐ Keep mainnet claims out until a distinct security and operational review supports them.</li>
+  </ul>
+</main>
+</body>
+</html>
