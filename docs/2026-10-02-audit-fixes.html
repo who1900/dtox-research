@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'">
+<title>DTOX Research | Scoped audit closeout | 2026-10-03</title>
+<style>
+:root{--base:#fafaf3;--ink:#1a1a1a;--wash:#efefe8;--space:24px}
+*{box-sizing:border-box;border-radius:0}body{margin:0;background:var(--base);color:var(--ink);font:16px/1.6 Inter,Arial,sans-serif}
+main{max-width:1152px;margin:auto;padding:32px var(--space)}h1{font-size:clamp(28px,4vw,40px);line-height:1.15;letter-spacing:-.04em;margin:16px 0}
+h2{font-size:22px;letter-spacing:-.025em;margin:0 0 16px}p,li{max-width:75ch}section{margin:32px 0}.meta,code,th{font-family:"Roboto Mono",Consolas,monospace}
+.meta{font-size:12px}.status{background:var(--ink);color:var(--base);padding:24px}.status p{margin:0 0 8px}.status p:last-child{margin:0}
+a{color:inherit;text-underline-offset:4px;display:inline-block;padding:8px 0;min-height:40px}a:focus-visible,.table-wrap:focus-visible{outline:2px solid var(--ink);outline-offset:4px}
+.table-wrap{overflow-x:auto}table{width:100%;min-width:680px;border-collapse:collapse;table-layout:fixed;font-size:14px}th,td{text-align:left;vertical-align:top;padding:12px;overflow-wrap:anywhere}
+th{background:var(--ink);color:var(--base)}tbody tr:nth-child(odd){background:var(--wash)}code{font-size:.9em;overflow-wrap:anywhere}ul{padding-left:20px}li{margin:8px 0}
+@media(min-width:768px){main{padding:40px 32px}}@media print{main{padding:0}.table-wrap{overflow:visible}table{min-width:0}thead{display:table-header-group}tr{break-inside:avoid}}
+</style>
+</head>
+<body><main>
+<header><p class="meta">DTOX RESEARCH / SCOPED CLOSEOUT / UPDATED 2026-10-03</p><h1>Deployed fixes. Explicit limits.</h1>
+<p>Main-reported scoped results, not independent checks by this document author or a completeness/production-readiness approval.</p>
+<nav aria-label="Related reports"><a href="2026-10-02-audit-fixes.md">Full Markdown closeout</a> | <a href="2026-10-02-independent-audit.md">Original audit</a></nav></header>
+<section class="status" aria-label="Deployment status">
+<p>DEPLOYED OCTOBER 3: API, MCP, pipeline, extractor, backup, monitor, gateway and site after backups. Main confirmed production/local source or compiled-build parity; all six services active; four new completion/sync tables exist.</p>
+<p>Gateway final: 35/35 PASS including docs, no skip, 1.746 s; tsc and git diff checks PASS. No environment, price or network-setting changes, live payment or chain write reported.</p>
+<p>OPEN: RAM pressure, legacy FTS bootstrap, real paid/testnet E2E, Ethereum asset gate and restore SLO/RTO/RPO. HNSW plan ready, NOT executed; no resource-cap changes. Not whole-audit closure.</p>
+</section>
+<p class="meta">Abbreviated parity references: API 468b2103b4ab...; MCP 90c0bd2325dc...; server.js 800bc2608c6e...; payments.js 9a64a15f31a1...; tools.js f3adc5497499...; upstream.js e77e763ab1af...; site d98d2366eb15... . Not full release identifiers or an index snapshot.</p>
+<section><h2>Scoped tests, not an aggregate</h2><p>Local/server runs and SDK variants overlap. Do not sum these into a unique test count.</p>
+<div class="table-wrap" tabindex="0" role="region" aria-label="Scoped test results"><table><thead><tr><th scope="col">Environment / suite</th><th scope="col">Reported result</th><th scope="col">Boundary</th></tr></thead><tbody>
+<tr><td>Local API</td><td>532 total: 531 PASS, 1 skip; 8.631 s</td><td>Skip is not a pass.</td></tr>
+<tr><td>Local pipeline</td><td>56 total: 55 PASS, 1 skip</td><td>Overlaps server pipeline.</td></tr>
+<tr><td>Server pipeline</td><td>All 56 PASS, no skip; 5.026 s</td><td>Not 56 additional unique tests.</td></tr>
+<tr><td>Server ops</td><td>11 PASS; 0.163 s</td><td>No restore timing proof.</td></tr>
+<tr><td>MCP, local SDK 2.2</td><td>23 PASS</td><td>Same scoped suite as server variant.</td></tr>
+<tr><td>MCP, server SDK 1.28.1</td><td>23 PASS</td><td>Not payment/chain E2E.</td></tr>
+<tr><td>Evaluation</td><td>40 PASS</td><td>Not global recall coverage.</td></tr>
+<tr><td>Attestor</td><td>47 PASS; tsc PASS</td><td>No fresh chain-write claim.</td></tr>
+<tr><td>Gateway</td><td>Final: 35/35 PASS including docs, no skip; 1.746 s; tsc / git diff checks PASS</td><td>Supersedes 29-test report; deployed, no paid E2E.</td></tr>
+</tbody></table></div></section>
+<section><h2>Actual live checks reported by main</h2>
+<p><code>get_paper("9999.99999")</code>: <code>isError=true</code>, status 404. Public MCP trends <code>zero knowledge / web3</code>: 39 papers, <code>bounded_sample</code>, years 2023-2026.</p>
+<p>Exact GRPO query: <code>GRPO removes the separate value critic model</code>. Verdict <code>prior_art_reported_on_similar_claim</code>; paper <code>2402.03300</code>, readers 2, models []. Current canonical read 0 / settled 0; similar total 1 requires claim verification. <code>verification_required=true</code>; scope <code>thin_retrieval_with_registry_evidence</code>. F04 live behavior confirmed; the older claim remains unlinked.</p>
+<p>Earlier staging trends: 39 canonical papers, dense 200 / lexical 40 caps reached, 38 matching metadata; 14.712 s cold. Staging nonce probe: 3 IDs, 4.309 s. These are not production latency, an SLO or a distribution. No query retuning.</p>
+<p>Production gateway health: <code>status=ok</code>, <code>payment_mode=live</code>, Solana devnet only. Unpaid <code>record_signed</code> request with dummy invalid signature and no <code>_meta</code> payment payload: <code>isError=true</code>, error <code>Payment required</code>, <code>accepted.extra.paymentFlow=upfront</code>. Challenge only: no upstream write called, no charge. Not paid/testnet E2E, atomicity or downstream signature-verifier proof.</p>
+</section>
+<section><h2>One repaired paper; legacy work remains</h2>
+<p><code>eip:7702</code> DONE, extractor_version 4 confirmed by live SQL and actual <code>get_paper</code>. Cached fulltext v3 -&gt; v4 repair only; old chunks copied and prior done history recorded. This is reprocessing, not first ingestion.</p>
+<p>Six nested Security headings now have <code>section_type=limitations</code>: Implementation of secure delegate contracts; Front running initialization; Storage management; Setting code as <code>tx.origin</code>; Sponsored transaction relayers; Transaction propagation.</p>
+<p>Final bounded SQL observation reported by main: raw done 180176 (pre-repair target sample: 180174); first_completed 2 / reprocessed 1 / unknown 0 unchanged; six services active. Counters are observed since the new deployed baseline, not a historical rate or throughput forecast.</p>
+<p>Latest <code>paper_index_sync</code> queue count: 102. Earlier sample: 14 durable pending entries, mostly unmapped legacy FTS; classification not re-established for all 102. Durable retries do not block embedding or Qdrant/coarse completion. No queue-rate claim. Sidecatalog bootstrap pending; no per-paper full scan of roughly 10 million chunks. No whole backfill or extraction-completeness claim.</p>
+</section>
+<section><h2>Observed Oracle resources</h2>
+<p>October 3: Qdrant green / optimizer OK; 10,743,556 points, 14 segments. Memory 9.683 / 10 GiB (96.83%); host available 1439 MiB, swap 0. Free storage 129,152,708,608 B (120.29 GiB).</p>
+<p>Oracle is primary vector storage; Contabo storage/metadata is separate. Oracle disk headroom does not resolve Contabo capacity. Resource/completion observations are separate samples, not an immutable snapshot. HNSW plan NOT executed; execution requires explicit human approval.</p>
+</section>
+<section><h2>F01-F19 closeout</h2>
+<div class="table-wrap" tabindex="0" role="region" aria-label="Finding statuses"><table><thead><tr><th scope="col">Finding</th><th scope="col">Current status</th><th scope="col">Remaining boundary</th></tr></thead><tbody>
+<tr data-finding="F01"><td>F01 Recovery</td><td>Pipeline rollback/recovery and progress tracking deployed; scoped tests PASS.</td><td>Historical slow-growth cause not established.</td></tr>
+<tr data-finding="F02"><td>F02 Literal extraction</td><td>Literal protection/ordered containers deployed; tests PASS.</td><td>Legacy code listings not backfilled.</td></tr>
+<tr data-finding="F03"><td>F03 Headroom</td><td>Resource observation recorded; risk remains.</td><td>HNSW plan ready, NOT executed; no cap changes.</td></tr>
+<tr data-finding="F04"><td>F04 Registry consistency</td><td>Deployed; actual GRPO response confirms scope/counters/verification.</td><td>Wallet-only votes are not scientific quorum.</td></tr>
+<tr data-finding="F05"><td>F05 Coverage</td><td>Canonical twins/chunk-cap semantics deployed; API tests PASS.</td><td>Bounded count, not exhaustive census; layers overlap.</td></tr>
+<tr data-finding="F06"><td>F06 Trends</td><td>Dense/lexical layer-aware code deployed; live 39-paper bounded sample.</td><td>Empty selection does not prove absent literature.</td></tr>
+<tr data-finding="F07"><td>F07 Taxonomy/order</td><td>Deployed; EIP-7702 DONE v4, six nested limitations headings confirmed.</td><td>Only one paper repaired; no whole legacy backfill.</td></tr>
+<tr data-finding="F08"><td>F08 HAL refresh</td><td>Source isolation/bounded reopening deployed; tests PASS.</td><td>Historic omissions unmeasured, not backfilled.</td></tr>
+<tr data-finding="F09"><td>F09 Reconciliation</td><td>Durable revision-aware queue deployed; tests PASS.</td><td>Latest queue count 102; earlier 14-entry sample mostly legacy. No queue-rate claim; completion not blocked.</td></tr>
+<tr data-finding="F10"><td>F10 FTS replay</td><td>Atomic paper replacement/deduplication/sidecatalog deployed.</td><td>Legacy bootstrap pending; no full-scan fallback.</td></tr>
+<tr data-finding="F11"><td>F11 Signing side effects</td><td>Deployed; no preview/failed-signature embed or node growth; prepared vector outside writer transaction.</td><td>Explicit links/monotonic ordering preserved; no fresh chain-write test.</td></tr>
+<tr data-finding="F12"><td>F12 MCP errors</td><td>Deployed; actual live isError=true / 404; SDK variants PASS.</td><td>Does not prove paid settlement correctness.</td></tr>
+<tr data-finding="F13"><td>F13 Settlement gate</td><td>Upfront SDK gate deployed/offline-tested; 35/35 and tsc PASS; unpaid challenge confirms upfront flow without charge/upstream write.</td><td>Real paid/testnet E2E unverified; no atomicity proof. SDK 2.24.0 lacks Sepolia default asset mapping; no guessed asset.</td></tr>
+<tr data-finding="F14"><td>F14 Bundle parity</td><td>Real proxy target, budget/limit/strict handling and unsupported-filter rejection deployed/tested.</td><td>No exclusive paid-value, paid E2E or willingness-to-pay claim.</td></tr>
+<tr data-finding="F15"><td>F15 Public claims</td><td>Gateway/site deployed after backups; source/build parity confirmed; scoped contract/docs checks PASS.</td><td>No wallet-only quorum, exclusive paid value or revenue/paid-readiness claims.</td></tr>
+<tr data-finding="F16"><td>F16 Self-host runtime</td><td>Runtime path overrides deployed/tested; README self-host instructions corrected; no dotenv loader.</td><td>Clean self-host smoke unverified; no reproducible-deployment proof.</td></tr>
+<tr data-finding="F17"><td>F17 Timestamp</td><td>Observed timestamp contract deployed/tested.</td><td>Not immutable snapshot/reproducibility guarantee.</td></tr>
+<tr data-finding="F18"><td>F18 Backups</td><td>Backup/monitor schema/integrity/mtime fixes deployed; ops PASS.</td><td>Fresh restore, recovery coverage, RTO/RPO unverified.</td></tr>
+<tr data-finding="F19"><td>F19 Wording</td><td>Explicit memory/bounded recall deployed; scoped regressions PASS.</td><td>Seeds/manual links matter; no universal invariance.</td></tr>
+</tbody></table></div></section>
+<footer><p class="meta">ALL REPORTED DEPLOYMENTS CONFIRMED / UNPAID CHALLENGE ONLY / NO PAID E2E / NO WHOLE-AUDIT CLOSURE</p><p>Only closeout documents changed here. No network/server checks, app-code edits, commit or resource changes. Specified tests are not full regression proof; legacy corpus repair and restore SLO remain unverified.</p></footer>
+</main></body></html>

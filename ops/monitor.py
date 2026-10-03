@@ -337,6 +337,15 @@ def check_stage_heartbeats():
             continue
         phase = record.get("phase")
         timestamp = record.get("started_at") if phase == "busy" else record.get("heartbeat_at")
+        error_since = record.get("error_since_at")
+        if error_since is not None:
+            if (type(error_since) not in (int, float) or not math.isfinite(error_since)
+                    or error_since > now + 60):
+                checks[key] = (False, "invalid error interval")
+                continue
+            if now - error_since > STAGE_STUCK_SECONDS:
+                checks[key] = (False, "repeated errors without a successful cycle")
+                continue
         if (phase not in ("busy", "idle", "waiting", "backoff", "starting")
                 or type(timestamp) not in (int, float) or not math.isfinite(timestamp)
                 or timestamp > now + 60):
@@ -360,14 +369,36 @@ def check_pipeline():
             queue = conn.execute(
                 "SELECT COUNT(*) FROM papers WHERE status IN "
                 "('discovered', 'quality_checked', 'fulltext_fetched', 'chunked')").fetchone()[0]
+            checks = completion_checks(conn)
     except sqlite3.Error as e:
         return {"pipeline:progress": (False, f"state db unreadable: {e}")}, None
-    return {"pipeline:new_completed": (None, "unknown: no first-completion journalinserttime"),
-            "pipeline:reprocessing": (None, "unknown: updated_at cannot separate first completion/reprocessing")}, (done, queue, latest)
+    return checks, (done, queue, latest)
+
+
+def completion_checks(conn):
+    try:
+        row = conn.execute("SELECT started_at,first_completed,reprocessed,unknown FROM completion_totals "
+                           "WHERE singleton=1").fetchone()
+        pending = conn.execute("SELECT COUNT(*) FROM paper_index_sync").fetchone()[0]
+        if row is None:
+            raise ValueError("no journal baseline")
+        started, first, repeated, unknown = row
+        if (type(started) not in (int, float) or not math.isfinite(started) or started > time.time()
+                or any(type(value) is not int or value < 0 for value in (first, repeated, unknown))):
+            raise ValueError("invalid journal counters")
+    except (sqlite3.Error, ValueError):
+        return {"pipeline:new_completed": (None, "unknown: no valid first-completion history"),
+                "pipeline:reprocessing": (None, "unknown: no valid reprocessing history")}
+    coverage = f"observed since {started:.0f}; no historical backfill; rate unknown"
+    return {"pipeline:new_completed": (True, f"{first} observed first completions; {coverage}"),
+            "pipeline:reprocessing": (True, f"{repeated} observed reprocessing completions; {coverage}"),
+            "pipeline:completion_unknown": (None if unknown else True, f"{unknown} completions with unknown prior history"),
+            "pipeline:index_sync": (None if pending else True, f"{pending} papers pending index reconciliation")}
 
 
 def check_backups():
-    newest = sorted(BACKUP_DIR.glob("judgments-*.db"), reverse=True)
+    newest = sorted(BACKUP_DIR.glob("judgments-*.db"),
+                    key=lambda path: (path.stat().st_mtime_ns, path.name), reverse=True)
     if not newest:
         return {"backup:judgments": (False, "no backup of the registry")}
     age_h = (time.time() - newest[0].stat().st_mtime) / 3600
@@ -439,9 +470,13 @@ def digest_text():
             "SELECT COUNT(*) FROM papers WHERE status='done' AND layers LIKE ?",
             (f"%{l}%",)).fetchone()[0] for l in ("llm-slm", "ai-agents", "web3")}
         edges = conn.execute("SELECT COUNT(*) FROM citations").fetchone()[0]
+        observed = completion_checks(conn)
         conn.close()
         lines.append(f"dtox daily: {counts.get('done', 0)} papers; {day} done rows updated in 24h")
-        lines.append("  new_completed=unknown; reprocessing=unknown (no first-completion journalinserttime)")
+        lines.append("  " + observed["pipeline:new_completed"][1])
+        lines.append("  " + observed["pipeline:reprocessing"][1])
+        if "pipeline:completion_unknown" in observed:
+            lines.append("  " + observed["pipeline:completion_unknown"][1])
         lines.append(f"  layers: llm {layers['llm-slm']}, agents {layers['ai-agents']}, "
                      f"web3 {layers['web3']}")
         lines.append(f"  queue {counts.get('chunked', 0)}, deferred "

@@ -412,7 +412,7 @@
   <div class="wrap">
     <p class="section-label">What it returns</p>
     <h2>Method sections, not paraphrases</h2>
-    <p class="why">Papers are fetched as LaTeX sources and split by structure: equations in raw LaTeX, algorithms, tables and the paragraph where the authors admit what did not work are first-class chunks, not prose a model has to re-derive. Twelve MCP tools cover exploring by paper (<code>find_papers</code>, <code>get_paper</code>, <code>read_paper_section</code>, <code>count_papers</code>, <code>similar_papers</code>), by passage (<code>search_research_paper</code>, <code>get_code_or_math_spec</code>, <code>compare_methods</code>, <code>research_trends</code>), and by claim (<code>validate_project</code>, <code>get_verdict_message</code>, <code>record_signed_verdict</code>).</p>
+    <p class="why">Where available, source text is split by structure: equations in raw LaTeX, algorithms, tables and prose are first-class chunks. Body availability is per record; some records retain only abstracts. Thirteen public MCP tools cover exploring by paper (<code>find_papers</code>, <code>get_paper</code>, <code>read_paper_section</code>, <code>count_papers</code>, <code>similar_papers</code>), by passage (<code>search_research_paper</code>, <code>get_code_or_math_spec</code>, <code>compare_methods</code>, <code>research_trends</code>), by bounded reading packet (<code>get_research_bundle</code>), and by claim (<code>validate_project</code>, <code>get_verdict_message</code>, <code>record_signed_verdict</code>).</p>
 
     <div class="grid3">
       <div>
@@ -425,7 +425,7 @@
       </div>
       <div>
         <h3>Citation graph</h3>
-        <p class="card-desc">One hop through the bibliography of the best hits. Does not depend on wording, which is the failure mode the other channels share. Copies of one paper from different sources are merged into one result.</p>
+        <p class="card-desc">One hop through citation edges from retrieved seeds. The graph traversal is seed-dependent: changing query wording can change the retrieved seeds and therefore the graph results. Citation links add a recall channel, not wording invariance. Copies of one paper from different sources are merged into one result.</p>
       </div>
     </div>
   </div>
@@ -442,30 +442,31 @@
         -&gt;  record_signed_verdict
         -&gt;  Solana Attestation Service attestation (devnet)</pre>
 
-    <p class="why">A retrieval score measures wording, never whether a paper makes a claim. Anonymous MCP callers share one server identity, and a shared identity cannot judge claims against itself. So the only public write path is a wallet-signed verdict: an agent signs its verdict with an ed25519 keypair it controls, and the reviewer's signature is embedded inside the on-chain attestation itself, verifiable by anyone without trusting dtox. A claim is only <strong>confirmed_prior_art</strong> when independent wallets agree.</p>
+    <p class="why">A retrieval score measures wording, never whether a paper makes a claim. The public write path is wallet-signed: an agent signs its verdict with an ed25519 keypair it controls. A signature proves signer identity, not independent reasoning. Distinct wallets alone do not establish scientific quorum or <strong>confirmed_prior_art</strong>; wallet-only agreement remains pending. Scientific settlement requires decisive agreement across known trusted model identities established by the server. Recorded claims and explicit links can reuse readings, but arbitrary paraphrases are not guaranteed to resolve to the same claim.</p>
 
     <div class="example">
-      <p class="tag">Live example, devnet</p>
-      <p>Claim: <em>GRPO removes the separate value critic model...</em>. Paper arXiv 2402.03300. Verdict: asserts, signed by reviewer wallet A. The registry reports this claim as confirmed_prior_art.</p>
+      <p class="tag">Historical team demo, devnet</p>
+      <p>Claim: <em>GRPO removes the separate value critic model...</em>. Paper arXiv 2402.03300. Demo verdict: asserts, signed by team wallet A. This attestation demonstrates signer identity; it does not establish independent scientific confirmation or current registry status.</p>
       <a class="explorer" href="https://explorer.solana.com/address/729nUikYt2SUJaq1Brx2YwXvgLT5J1eVp9sfo31ncswu?cluster=devnet" target="_blank" rel="noopener">explorer.solana.com/address/729nUikYt2SUJaq1Brx2YwXvgLT5J1eVp9sfo31ncswu</a>
     </div>
 
     <div class="example">
-      <p class="tag">Live example, devnet</p>
-      <p>Claim: <em>DeepSeek-R1-Zero is trained with large-scale reinforcement learning without supervised fine-tuning...</em>. Paper arXiv 2501.12948. Verdict: asserts, signed by a different reviewer wallet (B) and written through a paid x402 call.</p>
+      <p class="tag">Historical team demo, devnet</p>
+      <p>Claim: <em>DeepSeek-R1-Zero is trained with large-scale reinforcement learning without supervised fine-tuning...</em>. Paper arXiv 2501.12948. Demo verdict: asserts, signed by team wallet B and reported through a paid x402 call. This historical example is not validation of the current payment lifecycle.</p>
       <a class="explorer" href="https://explorer.solana.com/address/6pC4NS96euD9G7jPtjvXbVs1ffaWAjKdJMkX799Mq6eL?cluster=devnet" target="_blank" rel="noopener">explorer.solana.com/address/6pC4NS96euD9G7jPtjvXbVs1ffaWAjKdJMkX799Mq6eL</a>
     </div>
 
-    <p class="why" style="margin-top: 20px;">Both reviewer wallets are demo wallets run by the team, so these two attestations show the mechanism, not independent consensus. Writing through the free endpoint costs nothing; the paid x402 path adds a cost per write but does not remove sybil risk.</p>
+    <p class="why" style="margin-top: 20px;">Both reviewer wallets are run by the team, so these attestations show the mechanism, not independent consensus. The free MCP endpoint has no gateway USDC charge. In the updated gateway code, the paid signed write charges per batch attempt, not per accepted item. Payment does not remove sybil risk or establish scientific quorum.</p>
   </div>
 </section>
 
 <section id="pricing">
   <div class="wrap">
-    <p class="section-label">Pay per result with x402</p>
+    <p class="section-label">Payment transport with x402</p>
     <h2>A paid MCP surface, USDC on Solana devnet</h2>
     <span class="badge">devnet only at this stage</span>
-    <p class="why">Endpoint: <code>https://read.whoim.space/x402/mcp</code>. The buyer's wallet needs devnet USDC and no SOL: the facilitator pays the transaction fee. Prices are per call, independent of each other.</p>
+    <p class="why">Observed public payment endpoint: <code>https://read.whoim.space/x402/mcp</code>, Solana devnet only. EVM configuration is not proof of live multichain settlement. Prices are independently configured per call. The updated code settles paid signed writes upfront before the write handler; failures after settlement retain a receipt with no automatic refund. Paid reads use authorization and settle only after a successful handler. These changes have offline mocked SDK tests, not a newly deployed paid E2E verification.</p>
+    <p class="why">Paid <code>get_evidence_bundle</code> calls the same <code>get_research_bundle</code> as the free read endpoint, with bounded <code>limit</code>, <code>max_chars</code> and <code>strict</code> arguments. Unsupported filters are rejected. Payment transport does not imply exclusive evidence or scientific validation.</p>
 
     <table class="pricing">
       <thead>
@@ -496,7 +497,7 @@
       <div class="stat"><span class="num" data-stat="citation_edges">n/a</span><span class="label">citation edges</span></div>
       <div class="stat"><span class="num" data-stat="web3_documents">n/a</span><span class="label">web3 documents</span></div>
     </div>
-    <p class="as-of">as of <span data-stat="as_of">n/a</span></p>
+    <p class="as-of">observed as of <span data-stat="as_of">n/a</span>; observation time, not a corpus snapshot</p>
   </div>
 </section>
 
@@ -508,7 +509,8 @@
       <li>Four layers only: web3 (primary), AI agents, LLMs and small language models, and builder technology. An idea outside that scope is refused, not force-fit.</li>
       <li>No patents. There are none in the corpus, and the service says that rather than letting absence read as novelty.</li>
       <li>No guarantee that any given paper is present, inside the indexed layers or otherwise.</li>
-      <li>IACR records are abstract-only and carry <code>fulltext: false</code>.</li>
+      <li>Full-text availability is per record, including IACR. Inspect evidence provenance and abstract-only fallback markers.</li>
+      <li>Empty results reflect index coverage and retrieval limits, never establish novelty; inspect evidence and scope.</li>
       <li>Verdicts and attestations are devnet only.</li>
     </ul>
   </div>

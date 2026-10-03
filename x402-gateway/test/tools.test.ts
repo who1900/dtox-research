@@ -11,6 +11,9 @@ function fakeServer() {
   const server = {
     tool: (name: string, _description: string, _schema: unknown, handler: Handler) => {
       tools.set(name, handler);
+    },
+    registerTool: (name: string, _config: unknown, handler: Handler) => {
+      tools.set(name, handler);
     }
   } as unknown as McpServer;
   return { server, tools };
@@ -19,6 +22,7 @@ function fakeServer() {
 function fakeApi(overrides: Record<string, (args: Record<string, unknown>) => Promise<unknown>> = {}) {
   const base = {
     search: async () => ({ papers: [] }),
+    bundle: async () => ({ evidence: [] }),
     spec: async () => ({}),
     compare: async () => ({}),
     trends: async () => ({}),

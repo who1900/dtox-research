@@ -60,24 +60,40 @@ def copy_sqlite(src, dst):
 
 
 def verify(dst, tables):
-    conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True, timeout=60)
     try:
-        ok = conn.execute("PRAGMA integrity_check").fetchone()[0]
-        if ok != "ok":
-            return False, {"integrity": ok}
+        conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True, timeout=60)
+    except sqlite3.Error as exc:
+        return False, {"integrity": str(exc)}
+    try:
+        integrity = [row[0] for row in conn.execute("PRAGMA integrity_check")]
+        if integrity != ["ok"]:
+            return False, {"integrity": integrity}
         counts = {}
         for t in tables:
+            schema = conn.execute("SELECT type FROM sqlite_master WHERE name=?", (t,)).fetchone()
+            if schema is None or schema[0] != "table":
+                return False, {"schema": f"required table missing: {t}"}
             try:
-                counts[t] = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-            except sqlite3.Error:
-                counts[t] = None
+                quoted = t.replace('"', '""')
+                counts[t] = conn.execute(f'SELECT COUNT(*) FROM "{quoted}"').fetchone()[0]
+            except sqlite3.Error as exc:
+                return False, {"schema": f"required table unreadable: {t}", "error": str(exc)}
+        if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            return False, {"integrity": "foreign key violation"}
         return True, counts
+    except sqlite3.Error as exc:
+        return False, {"integrity": str(exc)}
     finally:
         conn.close()
 
 
+def backup_files(prefix):
+    return sorted(DEST.glob(f"{prefix}-*.db"),
+                  key=lambda path: (path.stat().st_mtime_ns, path.name), reverse=True)
+
+
 def prune(prefix, keep):
-    files = sorted(DEST.glob(f"{prefix}-*.db"), reverse=True)
+    files = backup_files(prefix)
     for old in files[keep:]:
         old.unlink()
     return len(files[keep:])
@@ -115,7 +131,7 @@ def main():
     if args.verify:
         bad = 0
         for name, cfg in STORES.items():
-            newest = sorted(DEST.glob(f"{name}-*.db"), reverse=True)
+            newest = backup_files(name)
             if not newest:
                 # a weekly store with no copy yet is not a failure, it is a
                 # schedule that has not come round; a daily one missing is

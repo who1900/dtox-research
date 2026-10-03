@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { createPaymentWrapper } from "@x402/mcp";
 import { z } from "zod";
 import type { createResearchUpstream } from "./upstream.js";
+import { UpstreamToolError } from "./upstream.js";
 import type { GatewayConfig } from "./config.js";
 
 type Api = ReturnType<typeof createResearchUpstream>;
@@ -15,7 +16,8 @@ function result(value: unknown): ToolResult {
 function failed(error: unknown): ToolResult {
   return {
     isError: true,
-    content: [{ type: "text", text: JSON.stringify({ error: error instanceof Error ? error.message : "unknown error" }) }]
+    content: [{ type: "text", text: JSON.stringify(error instanceof UpstreamToolError
+      ? error.payload : { error: error instanceof Error ? error.message : "unknown error" }) }]
   };
 }
 
@@ -80,7 +82,14 @@ export function registerTools(
         validate_project: config.prices.audit,
         record_signed_verdict: config.prices.verdict
       },
-      note: "Prices are quoted before execution. The only write this gateway exposes is record_signed_verdict, gated both by payment and by the caller's own wallet signature over the verdict text -- it never proxies the shared-API-key claim-registry mutation tools."
+      payment_policy: {
+        reads: "authorization: settle after a successful handler",
+        record_signed_verdict: "upfront: per-attempt fee settles before the write handler, not per accepted item",
+        handler_failure: "after upfront settlement, isError includes x402/payment-response receipt; no automatic refund",
+        retry: "signed writes are never automatically retried after timeout; inspect receipts and attestation state before retrying",
+        quorum: "payment and distinct wallets do not establish scientific quorum"
+      },
+      note: "Live mode gates the signed write by payment and wallet signature. Disabled/shadow modes do not charge. The gateway does not expose unsigned shared-API-key registry mutation tools."
     })
   );
 
@@ -94,18 +103,18 @@ export function registerTools(
     handler(async ({ query, layer }) => api.search({ query, layer, limit: 3, dedupe: true }))
   );
 
-  server.tool(
+  server.registerTool(
     "get_evidence_bundle",
-    `Structured full-text evidence with sources and provenance. Price: ${config.prices.evidence} USDC.`,
-    {
+    { description: `A bounded research bundle with sources and provenance, also available on the free read endpoint. Price: ${config.prices.evidence} USDC. Unsupported filters are rejected.`,
+      inputSchema: z.object({
       query: z.string().min(3).max(500),
-      layer: z.enum(["llm-slm", "ai-agents", "web3"]).optional(),
-      section_type: z.string().max(40).optional(),
-      element_type: z.enum(["algorithm", "equation", "table", "code", "prose"]).optional(),
-      year_from: z.number().int().min(1990).max(2100).optional(),
-      limit: z.number().int().min(1).max(15).default(8)
+      layer: z.enum(["llm-slm", "ai-agents", "web3", "builder-tech"]).optional(),
+      limit: z.number().int().min(1).max(15).default(3),
+      max_chars: z.number().int().min(500).max(30000).default(12000),
+      strict: z.boolean().default(true)
+      }).strict()
     },
-    paidOrShadow(config, wrappers.evidence, config.prices.evidence, async (args) => api.search({ ...args, dedupe: true }))
+    paidOrShadow(config, wrappers.evidence, config.prices.evidence, async (args) => api.bundle(args))
   );
 
   server.tool(
@@ -174,7 +183,7 @@ export function registerTools(
 
   server.tool(
     "get_verdict_message",
-    "Free: the exact canonical message to sign for a wallet-backed, on-chain claim verdict. Writes nothing.",
+    "Free: prepare the exact canonical message to sign for a wallet-backed verdict. No chain write; local claim handling is governed by the upstream API.",
     {
       claim: z.string().min(3).max(1000),
       paper_id: z.string().min(3).max(100),
@@ -186,7 +195,7 @@ export function registerTools(
 
   server.tool(
     "record_signed_verdict",
-    `File a claim verdict signed by your own Solana wallet as a Solana Attestation Service attestation on devnet. Payment is a sybil mitigation: every write costs money. Price: ${config.prices.verdict} USDC. Never mutates dtox's shared claim registry directly -- only wallet-signed, individually attested verdicts.`,
+    `Attempt a wallet-signed Solana devnet verdict. In live mode, ${config.prices.verdict} USDC settles upfront before the write handler, per batch attempt, not per accepted item. Handler failure retains a payment receipt; no automatic refund. Partial batches retain every per-item status. Payment is not scientific quorum.`,
     {
       claim: z.string().min(3).max(1000),
       judgments: z.array(z.object({

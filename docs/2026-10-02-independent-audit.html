@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>DTOX Research: независимый аудит, 2026-10-02</title>
+<style>
+:root{--base:#fafaf3;--ink:#1a1a1a;--surface:#eeeee5;--muted:#55564d;--priority:#963a05;--space:24px}
+*{box-sizing:border-box;border-radius:0}
+html{scroll-behavior:auto}
+body{margin:0;background:var(--base);color:var(--ink);font:17px/1.6 Inter,"Segoe UI",Arial,sans-serif}
+a{color:inherit;text-underline-offset:5px;text-decoration-thickness:1px}
+a:focus-visible{outline:3px solid var(--ink);outline-offset:5px}
+.skip{position:absolute;left:24px;top:-100px;padding:12px;background:var(--base)}
+.skip:focus{top:12px}
+.wrap{max-width:1200px;margin:auto;padding:0 40px}
+.mono,.meta,.label,.proof,dt{font-family:"Roboto Mono","Cascadia Mono",Consolas,monospace}
+.meta,.label{font-size:12px;letter-spacing:.06em;line-height:1.7}
+.meta{color:var(--muted)}
+header{padding:40px 0 72px}
+.top{display:flex;justify-content:space-between;gap:24px;align-items:center;flex-wrap:wrap}
+nav{display:flex;flex-wrap:wrap;gap:8px 24px}
+nav a{display:inline-flex;align-items:center;min-height:40px;font-size:14px}
+h1,h2,h3{line-height:1.12;letter-spacing:-.035em;margin:0;font-weight:650}
+h1{font-size:clamp(40px,6vw,72px);max-width:1000px;margin:64px 0 32px}
+h2{font-size:36px;margin:12px 0 24px}
+h3{font-size:23px;margin:12px 0 16px}
+p{margin:0 0 16px;max-width:75ch}
+.lead{font-size:21px;line-height:1.5;max-width:72ch}
+.scores{display:flex;flex-wrap:wrap;gap:24px 48px;margin-top:32px}
+.scores p{font-size:14px;margin:0}
+.scores strong{display:block;font-size:28px;letter-spacing:-.04em}
+section{padding:56px 0}
+.band{background:var(--surface)}
+.section-head{max-width:75ch;margin-bottom:32px}
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:24px}
+.finding{padding:28px;background:var(--base)}
+.priority{color:var(--priority);font-family:"Roboto Mono",Consolas,monospace;font-size:13px;font-weight:700}
+.finding p{font-size:15px;margin-bottom:16px}
+.proof{font-size:12px;color:var(--muted);overflow-wrap:anywhere}
+.facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:0 0 32px}
+.fact{padding:24px;background:var(--surface)}
+dt{font-size:12px;line-height:1.6;color:var(--muted);margin-bottom:8px}
+dd{margin:0;font-size:17px;line-height:1.55}
+.limits{display:grid;grid-template-columns:1fr 1fr;gap:40px}
+ul,ol{margin:16px 0 0;padding-left:24px}
+li{padding:0 0 12px;max-width:85ch}
+.plan li::marker{font-family:"Roboto Mono",Consolas,monospace;font-weight:700}
+.note{font-size:14px;color:var(--muted)}
+footer{padding:40px 0;background:var(--ink);color:var(--base)}
+footer a{display:inline-flex;min-height:40px;align-items:center}
+footer a:focus-visible{outline-color:var(--base)}
+@media(max-width:900px){.grid{grid-template-columns:1fr 1fr}.wrap{padding:0 24px}}
+@media(max-width:600px){.grid,.facts,.limits{grid-template-columns:1fr}h1{margin-top:40px}h2{font-size:30px}.finding{padding:24px}section{padding:40px 0}.wrap{padding:0 20px}}
+@media print{body{font-size:11pt}.wrap{padding:0}header,section{padding:20px 0}.skip,nav{display:none}h1{font-size:32pt;margin:24px 0}.finding,.fact{break-inside:avoid}footer{background:var(--base);color:var(--ink)}}
+</style>
+</head>
+<body>
+<a class="skip" href="#findings">К содержанию отчета</a>
+<header class="wrap">
+<div class="top">
+<div class="meta">DTOX RESEARCH / НЕЗАВИСИМЫЙ АУДИТ<br>2026-10-02 / EXECUTIVE SUMMARY</div>
+<nav aria-label="Разделы"><a href="#findings">Риски</a><a href="#measured">Факты</a><a href="#unverified">Границы</a><a href="#plan">Порядок работ</a></nav>
+</div>
+<h1>Сильная рабочая beta.<br>Не production-ready.</h1>
+<p class="lead">Полезность поиска реальна: первоисточники, формулы, алгоритмы и проверяемая provenance. Но paid mainnet release пока закрыт: целостность источников, recovery и платежный жизненный цикл требуют доказательств.</p>
+<p>Потенциал hackathon submission высокий. Демонстрация read-only beta и допуск к платному production являются разными решениями.</p>
+<div class="scores"><p><strong>8/10</strong>Идея</p><p><strong>~6,5/10</strong>Текущая read-only beta</p><p><strong>Без оценки</strong>Paid production без E2E</p></div>
+<p class="note" style="margin-top:24px">Оценки субъективны, не benchmark. Это аудиторский вывод, не изменения системы.</p>
+</header>
+<main>
+<section id="findings" class="band">
+<div class="wrap">
+<div class="section-head"><div class="label">01 / FINDINGS</div><h2>Шесть важных рисков</h2><p>Приоритет отражает последствия. Воспроизведенный дефект не равен произошедшему production-инциденту.</p></div>
+<div class="grid">
+<article class="finding"><span class="priority">P1 / F01</span><h3>Pipeline не откатывает транзакцию</h3>
+<p>После exception connection остается без rollback. Изолированный SQLite fixture удержал writer lock; живой heartbeat может скрывать отсутствие прогресса.</p>
+<p>Текущий production lock не доказан: в недавнем tail его нет.</p><div class="proof">pipeline/service.py:1346, 3262, 3288</div></article>
+<article class="finding"><span class="priority">P1 / F02</span><h3>Точный код может измениться</h3>
+<p>Валидный verbatim подтвердил удаление <code>% 2;</code> из <code>int rem = value % 2;</code>. Это потеря семантики, а не форматирования.</p>
+<p>Частота повреждений в корпусе неизвестна.</p><div class="proof">pipeline/extractor.py:169, 455</div></article>
+<article class="finding"><span class="priority">P1 / F03</span><h3>Почти нет запаса ресурсов</h3>
+<p>Qdrant около 98,8% лимита. Contabo уже ниже disk threshold. Свободное место Oracle не решает дефицит другого хоста.</p>
+<p>OOM не наблюдался; причина latency не установлена. Blind raise 10 GiB на хосте 12 GB недопустим.</p><div class="proof">Live cgroup/disk; ops/monitor.py:419</div></article>
+<article class="finding"><span class="priority">P2 / F04-F07, F12, F19</span><h3>Отчет не всегда согласован</h3>
+<p>GRPO registry evidence соседствует с нулевыми headline/scope и false verification_required. Twins и chunk cap искажают coverage; ZK trends дает ложную пустоту, EIP-7702 теряет Security taxonomy.</p>
+<p>MCP JSON error может иметь isError=false. Граф зависит от seeds; ручные claim links не доказывают тождество любых перефразировок.</p><div class="proof">api/main.py:2724, 3403, 4808, 5085, 5135</div></article>
+<article class="finding"><span class="priority">P2 / F08-F11, F16-F18</span><h3>Обновление и recovery не доказаны</h3>
+<p>HAL не переоткрывает done cursors; state/coarse/FTS могут расходиться, replay не идемпотентен. Подготовка verdict создает локальные claim nodes вопреки writes nothing.</p>
+<p>Backup helper может выбрать не свежую копию и вернуть ok без обязательной таблицы. as_of не фиксирует индекс; turnkey self-host не подтвержден.</p><div class="proof">pipeline/service.py:1515, 2923, 3657; ops/backup.py:74, 118</div></article>
+<article class="finding"><span class="priority">P2 / F13-F15 / PAID GATE</span><h3>Оплата не равна безопасной записи</h3>
+<p>В рассмотренном flow handler идет до settlement: chain write может завершиться до payment failure. Partial/all-invalid results требуют явной billing policy и idempotency E2E.</p>
+<p>Paid bundle сейчас вызывает search. Публичные обещания quorum и числа tools устарели. Списаний или mainnet exploit сегодня не доказано.</p><div class="proof">x402-gateway/src/tools.ts:108; upstream.ts:18; SDK index.mjs:942, 1046</div></article>
+</div>
+</div>
+</section>
+<section id="measured" class="wrap">
+<div class="section-head"><div class="label">02 / MEASURED</div><h2>Что действительно измерено</h2></div>
+<dl class="facts">
+<div class="fact"><dt>КОРПУС</dt><dd>180 114 -> 180 116 raw done: +2 за 10,9 min. Fulltext acquired 91,93%; abstract-only 8,07%. Это acquisition, не гарантия perfect parsing.</dd></div>
+<div class="fact"><dt>ТЕСТЫ И LIVE ПОКРЫТИЕ</dt><dd>619 passed + 1 skipped = 620 total. Оба TypeScript checks pass. Live: 11 разных публичных read-tools, 16 вызовов; еще 3 x402 discovery/challenge requests.</dd></div>
+<div class="fact"><dt>QDRANT И ПАМЯТЬ</dt><dd>Main green, optimizer ok. Fulltext: 10 736 253 points; coarse: 180 113. RAM: 9,877-9,882 / 10 GiB. oom=0, oom_kill=0; max между двумя замерами не рос.</dd></div>
+<div class="fact"><dt>ДВА РАЗНЫХ ДИСКА</dt><dd>Oracle: 120,27 GiB свободно, 38% used. Contabo: 39,14 GiB, 90% used; monitor FAIL при threshold 40 GiB.</dd></div>
+<div class="fact"><dt>СЕРВИСЫ И INGESTION</dt><dd>Основные services active, 14 stages + reporter current. В tail повторяются 429; OpenAlex paused до UTC midnight. Это snapshot, не overnight SLO или rate.</dd></div>
+<div class="fact"><dt>ПОИСК И LATENCY</dt><dd>MEV 2101.05511: исходный алгоритм + 6 equations, 2 211 chars без truncation. MCP наблюдения: 4,114-20,160 s, включая transport. Это не p95 и не causal Qdrant diagnosis.</dd></div>
+<div class="fact"><dt>ОПЛАТА И BACKUPS</dt><dd>Live discovery: только Solana devnet USDC; unpaid challenge $0.01, amount 10000. Daily backups около 14,6 h; fulltext snapshot 2026-09-27 06:03 UTC, около 32,49 GB, weekly schedule.</dd></div>
+<div class="fact"><dt>RELEASE И ИСХОДНИКИ</dt><dd>HEAD/main: <span class="mono">7e22e68</span>. CI success только для этого HEAD; dirty fixes не опубликованы. Совпали hashes шести source files, не всего deploy/dist. main.py: 5906 строк; service.py: 3952.</dd></div>
+</dl>
+<p>Nonce находит реальные Solana docs, verbal feedback дает Reflexion. Но descriptive oracle поиск пропустил Chainlink в top 5; account delegation пропустил EIP-7702, хотя exact ID дал top 1. Общий recall этим не измерен.</p>
+<p class="note">Два API search samples: p50 0,907 s, p95 2,009 s. Это меньше floor 20 и не охватывает find/validate/bundle. First completions и reprocessing не отделены журналом; articles/day не вычисляется.</p>
+</section>
+<section id="unverified" class="band">
+<div class="wrap">
+<div class="section-head"><div class="label">03 / UNVERIFIED</div><h2>Границы доказательств</h2></div>
+<div class="limits">
+<div><h3>Не проверено</h3><ul>
+<li>Overnight SLO, репрезентативные tool p95/p99 и причинная декомпозиция latency.</li>
+<li>Fresh restore, coarse_base recovery, RTO/RPO, corpus-wide parsing и полнота index reconciliation.</li>
+<li>Builder-tech: качество покрытия; license: полнота лицензий и прав использования корпуса и code fragments.</li>
+<li>Paid settlement и chain E2E, mainnet readiness, adoption и unit economics.</li>
+</ul></div>
+<div><h3>Чего нельзя обещать</h3><ul>
+<li>13/13 production tools E2E: signed writes в production не вызывались.</li>
+<li>Автоматическое научное подтверждение: public models=[] остаются pending; wallets не доказывают независимое reasoning.</li>
+<li>Полную независимость вердикта от wording: citation traversal зависит от seeds, а links фиксируют ручное решение.</li>
+<li>Четыре live paid networks, доказанный OOM/SQLite lock или полный security audit. Ограниченный tracked-text scan ничего не нашел, но history не покрыт.</li>
+</ul></div>
+</div>
+<p class="note">Production проверялся read-only, без платежей, транзакций, signed writes и deployed fixes. Unknown не равно fail, но не заменяет доказательство release gate.</p>
+</div>
+</section>
+<section id="plan" class="wrap">
+<div class="section-head"><div class="label">04 / PLAN</div><h2>Порядок исправлений</h2><p>Это план дальнейших работ, не выполненные изменения. Первые исправления не требуют дополнительного LLM или model spend.</p></div>
+<ol class="plan">
+<li><strong>Rollback и watchdog реального прогресса.</strong> Исключение после INSERT не держит writer lock; heartbeat не маскирует бесконечные ошибки.</li>
+<li><strong>Source integrity и taxonomy.</strong> Сохранить literal %, исходный порядок prose/code и наследование Security; адресно оценить поврежденные источники.</li>
+<li><strong>Registry/report/coverage/trends contracts.</strong> Согласовать current/similar/pending, canonical IDs, truncation и protocol errors; проверить wording regressions.</li>
+<li><strong>RAM и disk policy.</strong> Раздельный бюджет хостов, безопасная retention и запас для snapshot/ingestion, без слепого увеличения лимитов.</li>
+<li><strong>Ingestion и reconciliation.</strong> Уважать 429, fair priorities, HAL refresh, source-owned cursors, idempotent FTS; добавить first-completion journal.</li>
+<li><strong>Regression release и честные public docs.</strong> Targeted tests, backup schema/freshness и разрешенный restore; затем опубликованный commit/CI и self-host smoke.</li>
+<li><strong>Unpaid vs settled paid gate.</strong> Разрешенные testnet E2E оплаты, settlement, chain write и failure/retry; billing/value policy, затем отдельное решение о mainnet.</li>
+</ol>
+</section>
+</main>
+<footer><div class="wrap">
+<div class="label">ПОЛНАЯ ТЕХНИЧЕСКАЯ ВЕРСИЯ</div>
+<p><a href="2026-10-02-independent-audit.md">Открыть Markdown: все findings и file:line доказательства</a></p>
+<p class="note" style="color:inherit">Подготовлены только два локальных файла отчета. Код, README и SUBMISSION не менялись; commit, push и deploy не выполнялись.</p>
+</div></footer>
+</body>
+</html>

@@ -17,6 +17,7 @@ from typing import List, Optional, Union
 
 import requests
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 
 RESEARCH_API_BASE = os.getenv("RESEARCH_API_BASE", "http://127.0.0.1:8010")
@@ -76,9 +77,9 @@ How to ask:
   search_research_paper(strict=True) keeps the requested filters exact and
   disables automatic relaxation; its existing default remains strict=False.
 
-Cite every claim with the paper id and url you got it from. An empty result
-over a large corpus_coverage is evidence; over a small one it is an empty
-shelf. The index holds no patents.
+Cite every claim with the paper id and url you got it from. Empty results
+reflect index coverage and retrieval limits, never establish novelty; inspect
+evidence and scope. The index holds no patents.
 """
 
 mcp = FastMCP(
@@ -102,29 +103,59 @@ def _headers():
     return {"X-API-Key": RESEARCH_API_KEY, "Content-Type": "application/json"}
 
 
-def _handle_error(resp: requests.Response) -> Optional[dict]:
-    """Return a structured error dict for non-2xx responses, else None."""
+def _raise_tool_error(error, status=None, **diagnostics):
+    payload = dict(error) if isinstance(error, dict) else {"error": error}
+    payload["status"] = status
+    payload.update(diagnostics)
+    raise ToolError(json.dumps(payload, ensure_ascii=False))
+
+
+def _handle_error(resp: requests.Response) -> None:
+    """Raise an SDK tool error for non-2xx responses, preserving diagnostics."""
+    if 200 <= resp.status_code < 300:
+        return
+    try:
+        data = resp.json()
+    except ValueError:
+        data = {}
+    payload = dict(data) if isinstance(data, dict) else {"detail": data}
+    error = payload.get("error")
     if resp.status_code == 401:
-        return {"error": "internal auth error contacting research API (401)"}
-    if resp.status_code == 404:
-        try:
-            detail = resp.json().get("detail", "not found")
-        except Exception:
-            detail = "not found"
-        # the API detail already says what was not found; prefixing it again
-        # produced "not found: paper not found"
-        return {"error": detail}
-    if resp.status_code == 429:
-        return {"error": "rate limit exceeded on research API, try again shortly"}
-    if resp.status_code == 400:
-        try:
-            detail = resp.json().get("detail", "bad request")
-        except Exception:
-            detail = "bad request"
-        return {"error": f"bad request: {detail}"}
-    if not resp.ok:
-        return {"error": f"research API error (status {resp.status_code})"}
-    return None
+        error = error or "internal auth error contacting research API (401)"
+    elif resp.status_code == 404:
+        error = error or payload.get("detail", "not found")
+    elif resp.status_code == 429:
+        error = error or "rate limit exceeded on research API, try again shortly"
+    elif resp.status_code == 400:
+        error = error or f"bad request: {payload.get('detail', 'bad request')}"
+    else:
+        error = error or f"research API error (status {resp.status_code})"
+    payload["error"] = error
+    headers = {name: value for name, value in resp.headers.items()
+               if name.lower() == "retry-after" or name.lower().startswith(("ratelimit", "x-ratelimit"))}
+    if headers:
+        payload["rate_limit_headers"] = headers
+    if not data and isinstance(resp.text, str) and resp.text:
+        payload["response_text"] = resp.text[:2000]
+    _raise_tool_error(payload, status=resp.status_code)
+
+
+def _api_result(resp, reject_failed_batch=False):
+    _handle_error(resp)
+    try:
+        payload = resp.json()
+    except ValueError:
+        _raise_tool_error("research API returned invalid JSON", status=resp.status_code)
+    if isinstance(payload, dict) and payload.get("error"):
+        _raise_tool_error(payload, status=resp.status_code)
+    if reject_failed_batch and isinstance(payload, dict):
+        results = payload.get("results")
+        if isinstance(results, list) and results and all(
+                isinstance(item, dict) and isinstance(item.get("status"), int)
+                and item["status"] >= 400 for item in results):
+            _raise_tool_error({**payload, "error": "all signed verdict judgments were rejected"},
+                              status=resp.status_code)
+    return payload
 
 
 @mcp.tool()
@@ -256,12 +287,9 @@ def search_research_paper(
             f"{RESEARCH_API_BASE}/v1/search", headers=_headers(), json=body, timeout=15
         )
     except requests.RequestException as e:
-        return {"error": f"could not reach research API: {e}"}
+        _raise_tool_error(f"could not reach research API: {e}", error_type="transport")
 
-    err = _handle_error(resp)
-    if err:
-        return err
-    return resp.json()
+    return _api_result(resp)
 
 
 @mcp.tool()
@@ -289,7 +317,7 @@ def get_research_bundle(
 
     Returns:
         The API's research bundle with evidence and provenance, or the same
-        structured error dictionary as the other public read tools.
+        structured JSON diagnostics in an MCP tool error on failure.
     """
     body = {"query": query, "limit": limit, "max_chars": max_chars,
             "strict": strict}
@@ -299,11 +327,8 @@ def get_research_bundle(
         resp = requests.post(f"{RESEARCH_API_BASE}/v1/research/bundle",
                              headers=_headers(), json=body, timeout=30)
     except requests.RequestException as e:
-        return {"error": f"could not reach research API: {e}"}
-    err = _handle_error(resp)
-    if err:
-        return err
-    return resp.json()
+        _raise_tool_error(f"could not reach research API: {e}", error_type="transport")
+    return _api_result(resp)
 
 
 @mcp.tool()
@@ -364,11 +389,8 @@ def find_papers(
     try:
         resp = requests.post(f"{RESEARCH_API_BASE}/v1/papers", headers=_headers(), json=body, timeout=30)
     except requests.RequestException as e:
-        return {"error": f"could not reach research API: {e}"}
-    err = _handle_error(resp)
-    if err:
-        return err
-    return resp.json()
+        _raise_tool_error(f"could not reach research API: {e}", error_type="transport")
+    return _api_result(resp)
 
 
 @mcp.tool()
@@ -393,11 +415,8 @@ def get_paper(paper_id: str) -> dict:
     try:
         resp = requests.get(f"{RESEARCH_API_BASE}/v1/paper/{_path_id(paper_id)}", headers=_headers(), timeout=30)
     except requests.RequestException as e:
-        return {"error": f"could not reach research API: {e}"}
-    err = _handle_error(resp)
-    if err:
-        return err
-    return resp.json()
+        _raise_tool_error(f"could not reach research API: {e}", error_type="transport")
+    return _api_result(resp)
 
 
 @mcp.tool()
@@ -434,11 +453,8 @@ def read_paper_section(
         resp = requests.get(f"{RESEARCH_API_BASE}/v1/paper/{_path_id(paper_id)}/section", headers=_headers(),
                             params=params, timeout=30)
     except requests.RequestException as e:
-        return {"error": f"could not reach research API: {e}"}
-    err = _handle_error(resp)
-    if err:
-        return err
-    return resp.json()
+        _raise_tool_error(f"could not reach research API: {e}", error_type="transport")
+    return _api_result(resp)
 
 
 @mcp.tool()
@@ -485,11 +501,8 @@ def count_papers(
     try:
         resp = requests.post(f"{RESEARCH_API_BASE}/v1/facets", headers=_headers(), json=body, timeout=30)
     except requests.RequestException as e:
-        return {"error": f"could not reach research API: {e}"}
-    err = _handle_error(resp)
-    if err:
-        return err
-    return resp.json()
+        _raise_tool_error(f"could not reach research API: {e}", error_type="transport")
+    return _api_result(resp)
 
 
 @mcp.tool()
@@ -518,11 +531,8 @@ def similar_papers(paper_id: str, limit: int = 10, layer: Optional[str] = None) 
         resp = requests.get(f"{RESEARCH_API_BASE}/v1/paper/{_path_id(paper_id)}/similar", headers=_headers(),
                             params=params, timeout=30)
     except requests.RequestException as e:
-        return {"error": f"could not reach research API: {e}"}
-    err = _handle_error(resp)
-    if err:
-        return err
-    return resp.json()
+        _raise_tool_error(f"could not reach research API: {e}", error_type="transport")
+    return _api_result(resp)
 
 
 @mcp.tool()
@@ -564,12 +574,9 @@ def get_code_or_math_spec(
             headers=_headers(), params=params, timeout=30,
         )
     except requests.RequestException as e:
-        return {"error": f"could not reach research API: {e}"}
+        _raise_tool_error(f"could not reach research API: {e}", error_type="transport")
 
-    err = _handle_error(resp)
-    if err:
-        return err
-    return resp.json()
+    return _api_result(resp)
 
 
 @mcp.tool()
@@ -611,12 +618,9 @@ def compare_methods(
             timeout=30,
         )
     except requests.RequestException as e:
-        return {"error": f"could not reach research API: {e}"}
+        _raise_tool_error(f"could not reach research API: {e}", error_type="transport")
 
-    err = _handle_error(resp)
-    if err:
-        return err
-    return resp.json()
+    return _api_result(resp)
 
 
 @mcp.tool()
@@ -626,9 +630,11 @@ def get_verdict_message(
     verdict: str,
     evidence_sha256: Optional[str] = None,
 ) -> dict:
-    """Get the exact message to sign for a verifiable, on-chain verdict.
+    """Prepare the exact message to sign for a verifiable, on-chain verdict.
 
-    Step one of filing a wallet-backed verdict; it writes nothing. It returns
+    Step one of filing a wallet-backed verdict; no chain transaction is
+    submitted by this preparation call. The API may resolve or register a
+    local claim node during preparation. It returns
     the canonical UTF-8 string this claim/paper/verdict combination hashes
     to. Sign it with the ed25519 secret key of a Solana wallet you control --
     the same primitive any Solana wallet already uses -- then pass the
@@ -661,11 +667,8 @@ def get_verdict_message(
         resp = requests.post(f"{RESEARCH_API_BASE}/v1/verdict/message", headers=_headers(),
                              json=payload, timeout=15)
     except requests.RequestException as e:
-        return {"error": f"research api unavailable: {e}"}
-    err = _handle_error(resp)
-    if err:
-        return err
-    return resp.json()
+        _raise_tool_error(f"research api unavailable: {e}", error_type="transport")
+    return _api_result(resp)
 
 
 @mcp.tool()
@@ -718,11 +721,8 @@ def record_signed_verdict(
         resp = requests.post(f"{RESEARCH_API_BASE}/v1/adjudicate/signed", headers=_headers(),
                              json=payload, timeout=60)
     except requests.RequestException as e:
-        return {"error": f"research api unavailable: {e}"}
-    err = _handle_error(resp)
-    if err:
-        return err
-    return resp.json()
+        _raise_tool_error(f"research api unavailable: {e}", error_type="transport")
+    return _api_result(resp, reject_failed_batch=True)
 
 
 def record_claim_judgment(claim: str, judgments: List[dict],
@@ -770,10 +770,10 @@ def record_claim_judgment(claim: str, judgments: List[dict],
         recorded reader identities (not automatically independent readers).
     """
     if not REGISTRY_WRITES_ENABLED:
-        return {
+        _raise_tool_error({
             "error": "claim-registry writes are disabled on this public MCP endpoint",
             "next_step": "use an authenticated/private MCP deployment to submit judgments",
-        }
+        }, status=403)
     try:
         payload = {"claim": claim, "judgments": judgments}
         if layer:
@@ -782,10 +782,9 @@ def record_claim_judgment(claim: str, judgments: List[dict],
             payload["judged_by_model"] = judged_by_model
         resp = requests.post(f"{RESEARCH_API_BASE}/v1/adjudicate", headers=_headers(),
                              json=payload, timeout=15)
-        resp.raise_for_status()
-        return resp.json()
+        return _api_result(resp)
     except requests.RequestException as e:
-        return {"error": f"research api unavailable: {e}"}
+        _raise_tool_error(f"research api unavailable: {e}", error_type="transport")
 
 
 def link_claim_nodes(claim: str, same_as_claim_id: str, reason: str = "") -> dict:
@@ -812,18 +811,17 @@ def link_claim_nodes(claim: str, same_as_claim_id: str, reason: str = "") -> dic
         that node carries.
     """
     if not REGISTRY_WRITES_ENABLED:
-        return {
+        _raise_tool_error({
             "error": "claim-registry writes are disabled on this public MCP endpoint",
             "next_step": "use an authenticated/private MCP deployment to link claims",
-        }
+        }, status=403)
     try:
         resp = requests.post(f"{RESEARCH_API_BASE}/v1/claims/link", headers=_headers(),
                              json={"claim": claim, "same_as_claim_id": same_as_claim_id,
                                    "reason": reason}, timeout=15)
-        resp.raise_for_status()
-        return resp.json()
+        return _api_result(resp)
     except requests.RequestException as e:
-        return {"error": f"research api unavailable: {e}"}
+        _raise_tool_error(f"research api unavailable: {e}", error_type="transport")
 
 
 if REGISTRY_WRITES_ENABLED:
@@ -882,12 +880,9 @@ def research_trends(
         resp = requests.get(f"{RESEARCH_API_BASE}/v1/trends", headers=_headers(),
                             params=params, timeout=90)
     except requests.RequestException as e:
-        return {"error": f"could not reach research API: {e}"}
+        _raise_tool_error(f"could not reach research API: {e}", error_type="transport")
 
-    err = _handle_error(resp)
-    if err:
-        return err
-    return resp.json()
+    return _api_result(resp)
 
 
 @mcp.tool()
@@ -983,12 +978,9 @@ def validate_project(
         resp = requests.post(f"{RESEARCH_API_BASE}/v1/validate", headers=_headers(),
                              json=body, timeout=180)
     except requests.RequestException as e:
-        return {"error": f"could not reach research API: {e}"}
+        _raise_tool_error(f"could not reach research API: {e}", error_type="transport")
 
-    err = _handle_error(resp)
-    if err:
-        return err
-    return resp.json()
+    return _api_result(resp)
 
 
 if __name__ == "__main__":

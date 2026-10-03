@@ -163,15 +163,27 @@ def classify_section(title, idx, total, embed_fn=None):
 # Comment stripping / section splitting (regex-based, robust to broken TeX)
 # ---------------------------------------------------------------------------
 
-_COMMENT_RE = re.compile(r"(?<!\\)%.*")
+_LATEX_TOKEN_RE = re.compile(
+    r"(?P<literal>\\begin\{(?P<env>verbatim\*?|Verbatim\*?|lstlisting\*?|minted\*?)\}"
+    r"[\s\S]*?(?:\\end\{(?P=env)\}|\Z)|"
+    r"\\(?:verb\*?|Verb\*?|lstinline\*?(?:\[[^\]\n]*\])?)"
+    r"(?![A-Za-z])(?P<delimiter>[^\s])(?:(?!(?P=delimiter))[^\n])*(?P=delimiter))|"
+    r"\\[^\n]|(?P<comment>%[^\n]*)")
+
+
+def _literal_spans(text):
+    return [match for match in _LATEX_TOKEN_RE.finditer(text) if match.group("literal")]
 
 
 def strip_comments(text):
-    lines = text.split("\n")
     out = []
-    for line in lines:
-        out.append(_COMMENT_RE.sub("", line))
-    return "\n".join(out)
+    pos = 0
+    for match in _LATEX_TOKEN_RE.finditer(text):
+        if match.group("comment"):
+            out.append(text[pos:match.start()])
+            pos = match.end()
+    out.append(text[pos:])
+    return "".join(out)
 
 
 SECTION_RE = re.compile(r"\\(section|subsection)\*?\{([^}]*)\}")
@@ -179,7 +191,14 @@ SECTION_RE = re.compile(r"\\(section|subsection)\*?\{([^}]*)\}")
 
 def split_sections_raw(text):
     """Returns list of (title, raw_body). Falls back to whole doc as one section."""
-    matches = list(SECTION_RE.finditer(text))
+    literals = iter(_literal_spans(text))
+    literal = next(literals, None)
+    matches = []
+    for match in SECTION_RE.finditer(text):
+        while literal is not None and literal.end() <= match.start():
+            literal = next(literals, None)
+        if literal is None or match.start() < literal.start():
+            matches.append(match)
     if not matches:
         return [("full text", text)]
     sections = []
@@ -369,7 +388,68 @@ def _parse_deadline(seconds):
     return _ctx()
 
 
+_LATEX_ENV_TOKEN_RE = re.compile(
+    r"\\(?P<action>begin|end)\{(?P<name>[^{}\s]+)\}|\\[^\n]|%[^\n]*")
+
+
+def _literal_container_spans(raw_body, literals):
+    stack = []
+    spans = []
+    literal_index = 0
+    pos = 0
+    env_types = [(EQUATION_ENVS, "equation"), (ALGORITHM_ENVS, "algorithm"),
+                 (TABLE_ENVS, "table"), (FIGURE_ENVS, "figure")]
+    while True:
+        match = _LATEX_ENV_TOKEN_RE.search(raw_body, pos)
+        if match is None:
+            break
+        while literal_index < len(literals) and literals[literal_index].end() <= match.start():
+            literal_index += 1
+        if literal_index < len(literals) and literals[literal_index].start() <= match.start():
+            pos = literals[literal_index].end()
+            continue
+        pos = match.end()
+        action = match.group("action")
+        if action is None:
+            continue
+        name = match.group("name")
+        if action == "begin":
+            element_type = next((kind for names, kind in env_types if _base_env(name) in names), None)
+            stack.append((name, match.start(), literal_index, element_type))
+            continue
+        for index in range(len(stack) - 1, -1, -1):
+            if stack[index][0] == name:
+                _, start, first_literal, element_type = stack[index]
+                del stack[index:]
+                if element_type is not None and literal_index > first_literal:
+                    spans.append((start, match.end(), element_type))
+                break
+    return spans
+
+
 def extract_elements(raw_body):
+    literals = _literal_spans(raw_body)
+    if not literals:
+        return _extract_elements_latex(raw_body)
+    protected = [(literal.start(), literal.end(), "code") for literal in literals]
+    protected.extend(_literal_container_spans(raw_body, literals))
+    protected.sort(key=lambda span: (span[0], -span[1]))
+    elements = []
+    pos = 0
+    for start, end, element_type in protected:
+        if start < pos:
+            continue
+        if start > pos:
+            elements.extend(_extract_elements_latex(raw_body[pos:start]))
+        raw = raw_body[start:end]
+        elements.append((element_type, table_essence(raw) if element_type == "table" else raw))
+        pos = end
+    if pos < len(raw_body):
+        elements.extend(_extract_elements_latex(raw_body[pos:]))
+    return elements
+
+
+def _extract_elements_latex(raw_body):
     """Returns list of (element_type, text) in order, using pylatexenc.
     element_type in {prose, equation, algorithm, code, table, figure}.
     Raises on hard pylatexenc failure (caller should catch and fall back)."""
@@ -557,8 +637,24 @@ def extract_repo_urls(raw_source, limit=5):
 # Specs are markdown, not LaTeX, so pylatexenc would flatten them into one
 # blob. Their headings are also more informative than a paper's: "Specification"
 # is the implementable part, "Security Considerations" is the caveats section.
-_MD_HEADING_RE = re.compile(r"^\s{0,3}(#{1,4})\s+(.+?)\s*#*\s*$", re.MULTILINE)
-_MD_FENCE_RE = re.compile(r"```[a-zA-Z0-9_+-]*\n(.*?)```", re.DOTALL)
+_MD_HEADING_RE = re.compile(r"^[ \t]{0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*\r?$", re.MULTILINE)
+_MD_FENCE_START_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})[^\n]*\n", re.MULTILINE)
+
+
+def _markdown_fences(text):
+    spans = []
+    pos = 0
+    while True:
+        start = _MD_FENCE_START_RE.search(text, pos)
+        if start is None:
+            break
+        fence = start.group(1)
+        end_re = re.compile(r"^[ \t]{0,3}" + re.escape(fence[0])
+                            + "{" + str(len(fence)) + r",}[ \t]*\r?$", re.MULTILINE)
+        end = end_re.search(text, start.end())
+        pos = end.end() if end else len(text)
+        spans.append((start.start(), pos))
+    return spans
 
 # Spec headings map onto the paper taxonomy fairly directly.
 _MD_SECTION_MAP = [
@@ -591,50 +687,53 @@ def build_chunks_markdown(text):
             body = body[end + 4:]
 
     sections = []
-    matches = list(_MD_HEADING_RE.finditer(body))
+    fences = _markdown_fences(body)
+    fence_index = 0
+    matches = []
+    for match in _MD_HEADING_RE.finditer(body):
+        while fence_index < len(fences) and fences[fence_index][1] <= match.start():
+            fence_index += 1
+        if fence_index == len(fences) or match.start() < fences[fence_index][0]:
+            matches.append(match)
     if not matches:
-        sections.append(("Document", body))
+        sections.append(("Document", "other", body))
     else:
         if matches[0].start() > 0:
             head = body[:matches[0].start()].strip()
             if head:
-                sections.append(("Abstract", head))
+                sections.append(("Abstract", "introduction", head))
+        stack = []
         for i, m in enumerate(matches):
             end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
-            sections.append((m.group(2).strip(), body[m.end():end]))
+            level = len(m.group(1))
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            title = m.group(2).strip()
+            section_type = classify_markdown_heading(title)
+            if stack and (section_type == "other" or stack[-1][1] == "limitations"):
+                section_type = stack[-1][1]
+            stack.append((level, section_type))
+            sections.append((title, section_type, body[m.end():end]))
 
     chunks = []
     index = 0
-    for section_title, section_body in sections:
-        section_type = classify_markdown_heading(section_title)
-
-        # fenced code first, so a long listing is never split mid-block
-        code_blocks = []
-        def _stash(match):
-            code_blocks.append(match.group(0))
-            return "\n"
-        prose = _MD_FENCE_RE.sub(_stash, section_body)
-
-        for piece in split_long_text(prose):
-            if not piece.strip():
-                continue
-            chunks.append({
-                "chunk_index": index, "section_type": section_type,
-                "section_title": section_title, "element_type": "prose",
-                "has_math": False, "has_algorithm": False,
-                "part_index": 0, "part_total": 1, "text": piece.strip(),
-            })
-            index += 1
-
-        for block in code_blocks:
-            parts = split_long_text(block)
+    for section_title, section_type, section_body in sections:
+        elements = []
+        pos = 0
+        for start, end in _markdown_fences(section_body):
+            elements.append(("prose", section_body[pos:start]))
+            elements.append(("code", section_body[start:end]))
+            pos = end
+        elements.append(("prose", section_body[pos:]))
+        for element_type, element_text in elements:
+            parts = [piece for piece in split_long_text(element_text.strip()) if piece.strip()]
             for pi, piece in enumerate(parts):
                 if not piece.strip():
                     continue
                 chunks.append({
                     "chunk_index": index, "section_type": section_type,
-                    "section_title": section_title, "element_type": "code",
-                    "has_math": False, "has_algorithm": True,
+                    "section_title": section_title, "element_type": element_type,
+                    "has_math": False, "has_algorithm": element_type == "code",
                     "part_index": pi, "part_total": len(parts), "text": piece.strip(),
                 })
                 index += 1

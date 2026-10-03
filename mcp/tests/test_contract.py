@@ -2,11 +2,17 @@
 
 import ast
 import inspect
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional
 import unittest
 from unittest.mock import Mock
+
+try:
+    from mcp.server.fastmcp.exceptions import ToolError
+except ModuleNotFoundError:
+    from mcp.server.mcpserver.exceptions import ToolError
 
 
 class RequestException(Exception):
@@ -18,7 +24,8 @@ class MCPContractTests(unittest.TestCase):
     def setUpClass(cls):
         path = Path(__file__).resolve().parents[1] / "server.py"
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        names = {"search_research_paper", "get_research_bundle", "_handle_error"}
+        names = {"search_research_paper", "get_research_bundle", "_handle_error",
+                 "_raise_tool_error", "_api_result"}
         cls.functions = {node.name: node for node in tree.body
                          if isinstance(node, ast.FunctionDef) and node.name in names}
         cls.decorators = {name: list(node.decorator_list) for name, node in cls.functions.items()}
@@ -31,10 +38,11 @@ class MCPContractTests(unittest.TestCase):
         self.requests = SimpleNamespace(post=Mock(), Response=object,
                                         RequestException=RequestException)
         self.namespace = {"requests": self.requests, "Optional": Optional, "List": List,
+                          "ToolError": ToolError, "json": json,
                           "RESEARCH_API_BASE": "http://internal.invalid",
                           "_headers": lambda: {"Content-Type": "application/json"}}
         exec(self.code, self.namespace)
-        self.response = Mock(status_code=200, ok=True)
+        self.response = Mock(status_code=200, ok=True, headers={})
         self.response.json.return_value = {"evidence": [{"id": "paper:1"}]}
         self.requests.post.return_value = self.response
 
@@ -124,14 +132,22 @@ class MCPContractTests(unittest.TestCase):
                 with self.subTest(tool=tool, status=status):
                     self.response.status_code, self.response.ok = status, False
                     self.response.json.return_value = payload
-                    self.assertEqual(self.call(tool, query="consensus"), {"error": expected})
+                    with self.assertRaises(ToolError) as caught:
+                        self.call(tool, query="consensus")
+                    result = json.loads(str(caught.exception))
+                    self.assertEqual(result["error"], expected)
+                    self.assertEqual(result["status"], status)
 
     def test_read_tools_report_network_errors(self):
         self.requests.post.side_effect = RequestException("timed out")
         for tool in ("search_research_paper", "get_research_bundle"):
             with self.subTest(tool=tool):
-                self.assertEqual(self.call(tool, query="consensus"),
-                                 {"error": "could not reach research API: timed out"})
+                with self.assertRaises(ToolError) as caught:
+                    self.call(tool, query="consensus")
+                result = json.loads(str(caught.exception))
+                self.assertEqual(result["error"], "could not reach research API: timed out")
+                self.assertIsNone(result["status"])
+                self.assertEqual(result["error_type"], "transport")
 
     def test_read_tools_preserve_error_detail_fallbacks(self):
         for tool in ("search_research_paper", "get_research_bundle"):
@@ -141,7 +157,9 @@ class MCPContractTests(unittest.TestCase):
                         self.response.status_code, self.response.ok = status, False
                         self.response.json.return_value = {}
                         self.response.json.side_effect = ValueError("not JSON") if malformed else None
-                        self.assertEqual(self.call(tool, query="consensus"), {"error": expected})
+                        with self.assertRaises(ToolError) as caught:
+                            self.call(tool, query="consensus")
+                        self.assertEqual(json.loads(str(caught.exception))["error"], expected)
 
     def test_bundle_has_no_registry_or_chain_calls(self):
         node = self.functions["get_research_bundle"]

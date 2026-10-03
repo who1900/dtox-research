@@ -13,12 +13,26 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, List, Union
+from typing import Annotated, Optional, List, Union
 
 import requests
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+
+def _state_db_path():
+    if os.getenv("STATE_DB_PATH"):
+        return os.getenv("STATE_DB_PATH")
+    data_dir = os.getenv("DTOX_DATA_DIR")
+    return os.path.join(data_dir, "state.db") if data_dir else "/opt/dtox-research/state.db"
+
+
+def _api_keys_path():
+    return Path(os.getenv("API_KEYS_PATH") or os.getenv("KEYS_PATH")
+                or os.getenv("RESEARCH_KEYS_PATH") or "/opt/dtox-research-api/keys.json")
+
+
 try:
     from .search_core import fts_query, fts_query_any, merge_layer_hits, merge_layer_hits_calibrated, reciprocal_rank_fusion
     from .boilerplate import is_boilerplate_chunk
@@ -120,7 +134,7 @@ COARSE_EMBED_TIMEOUT = float(os.getenv("COARSE_EMBED_TIMEOUT", "2"))
 EMBED_URL = os.getenv("EMBED_URL", "http://127.0.0.1:8006/embed")
 EMBED_BATCH_URL = os.getenv("EMBED_BATCH_URL", "http://127.0.0.1:8006/embed_batch")
 QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
-KEYS_PATH = Path(os.getenv("RESEARCH_KEYS_PATH", "/opt/dtox-research-api/keys.json"))
+KEYS_PATH = _api_keys_path()
 
 ALLOWED_LAYERS = {"llm-slm", "web3", "ai-agents", "builder-tech"}
 SPEC_SECTION_TYPES = {"method", "architecture"}
@@ -2692,43 +2706,77 @@ def compare(
 # would weigh a long paper more heavily than a short one. state.db has exactly
 # one row per paper. It is opened read-only, and SQLite WAL lets this coexist
 # with the writing pipeline.
-STATE_DB_PATH = "/opt/dtox-research/state.db"
+STATE_DB_PATH = _state_db_path()
 TRENDS_CACHE = TTLCache(ttl_seconds=1800, max_size=64)
 
 
 TOPIC_PAPER_LIMIT = 600      # enough papers for year-over-year shares to mean anything
-TOPIC_MIN_SCORE = 0.83   # loose topics pull in agentic-RAG noise; measured: 0.78 gave 471 papers with "agentic" on top
 
 
-def _papers_about(topic, layer=None):
-    """arXiv ids of the papers on one subject, for trends inside a topic.
-
-    "What replaced X" is the question people actually ask, and it cannot be
-    answered over the whole corpus: every technique inside KV-cache compression
-    is a rounding error against the whole LLM literature. This runs one semantic
-    query, straight at Qdrant rather than through the 50-result search endpoint,
-    and hands the ids to the same counting code."""
+def _papers_about(topic, layer=None, year_from=None, year_to=None, details=None):
+    """Bounded dense and exact lexical topic candidates, not a corpus census."""
     must = [{"key": "layers", "match": {"any": [layer]}}] if layer else []
-    vector = embed_query(topic)
-    # Asking for 1,800 chunks became slower than Qdrant's 30-second request
-    # budget once the collection passed five million points. Trends need a
-    # representative topic sample, not an exhaustive nearest-neighbour scan.
-    # 200 candidates cover the high-confidence neighbourhood used by trend
-    # analysis. Larger requests time out against a five-million-point live
-    # collection while mostly adding duplicate chunks below TOPIC_MIN_SCORE.
+    if year_from is not None or year_to is not None:
+        bounds = {}
+        if year_from is not None:
+            bounds["gte"] = year_from
+        if year_to is not None:
+            bounds["lte"] = year_to
+        must.append({"key": "year", "range": bounds})
     candidate_limit = min(TOPIC_PAPER_LIMIT, 200)
-    hits = qdrant_search(vector, {"must": must} if must else None, candidate_limit)
-    ids = []
-    seen = set()
-    for h in hits:
-        if h.get("score", 0) < TOPIC_MIN_SCORE:
-            continue
-        pid = (h.get("payload") or {}).get("arxiv_id")
-        if pid and pid not in seen:
-            seen.add(pid)
+    dense_failed = False
+    try:
+        vector = embed_query(topic)
+        hits = qdrant_search(vector, {"must": must} if must else None, candidate_limit,
+                             timeout=SEARCH_QDRANT_TIMEOUT)
+    except HTTPException:
+        hits, dense_failed = [], True
+    lexical = _paper_bm25(topic, layer, year_from, year_to, limit=PAPER_BM25_CANDIDATES)
+    rows = _paper_rows(lexical) if lexical else {}
+    ids, seen, by_layer = [], set(), {}
+
+    def accept(pid, lay, channel):
+        if not pid:
+            return
+        head = canonical_id(pid)
+        counts = by_layer.setdefault(lay or "unknown", {"dense": set(), "lexical": set()})
+        counts[channel].add(head)
+        if head not in seen:
+            seen.add(head)
             ids.append(pid)
-        if len(ids) >= TOPIC_PAPER_LIMIT:
-            break
+
+    for h in hits:
+        pay = h.get("payload") or {}
+        lay = _layer_of(pay, layer)
+        if h.get("score", 0) < _bands_for(lay)[1]:
+            continue
+        accept(pay.get("arxiv_id"), lay, "dense")
+    words = {w for w in re.findall(r"[a-z0-9]+", topic.lower())
+             if w not in CLAIM_WORD_STOP}
+    for pid in lexical:
+        row = rows.get(pid) or {}
+        text = f"{row.get('title') or ''} {row.get('abstract') or ''}".lower()
+        if words and words <= set(re.findall(r"[a-z0-9]+", text)):
+            accept(pid, _layer_of(row, layer), "lexical")
+    if details is not None:
+        details.update({
+            "status": ("insufficient_coverage" if dense_failed else
+                       "no_candidates" if not hits and not lexical else
+                       "insufficient_coverage" if not ids else "bounded_sample"),
+            "dense_chunk_hits": len(hits), "dense_chunk_cap": candidate_limit,
+            "lexical_candidates": len(lexical), "lexical_cap": PAPER_BM25_CANDIDATES,
+            "canonical_papers": len(ids), "dense_unavailable": dense_failed,
+            "is_lower_bound": len(hits) >= candidate_limit or len(lexical) >= PAPER_BM25_CANDIDATES,
+            "thresholds_by_layer": {lay: _bands_for(lay)[1]
+                                    for lay in ([layer] if layer else sorted(SCORE_BANDS_BY_LAYER))},
+            "by_layer": {lay: {"dense": len(counts["dense"]),
+                               "lexical": len(counts["lexical"]),
+                               "canonical_papers": len(counts["dense"] | counts["lexical"])}
+                         for lay, counts in by_layer.items()},
+            "note": "Bounded candidate sample, not exhaustive literature coverage. Dense uses existing "
+                    "layer adjacent bands; lexical requires every topic word in title/abstract. "
+                    "Channel counts overlap; caps limit candidates, not unique papers.",
+        })
     return ids
 
 
@@ -2808,15 +2856,26 @@ def trends(
     if cached is not None:
         return cached
 
-    topic_ids = None
+    topic_ids, topic_coverage = None, None
     if about and about.strip():
-        topic_ids = _papers_about(about.strip(), layer)
+        topic_coverage = {}
+        topic_ids = _papers_about(about.strip(), layer, year_from, year_to, details=topic_coverage)
         # a narrow topic has fewer papers per year, so the default floor of 5
         # would silently empty the answer
         min_papers = min(min_papers, 3)
     per_term, per_year = _load_term_years(layer, year_from, year_to, topic_ids)
+    if topic_coverage is not None:
+        topic_coverage["papers_with_term_years"] = sum(per_year.values())
     years = sorted(per_year)
     if not years:
+        if topic_coverage is not None:
+            if topic_ids:
+                topic_coverage["status"] = "insufficient_coverage"
+            return {"layer": layer, "about": about, "years": [], "trends": [],
+                    "papers_in_topic": len(topic_ids), "topic_coverage": topic_coverage,
+                    "status": topic_coverage["status"],
+                    "note": "The bounded topic sample has no usable term/year data in this window. "
+                            "This does not establish absence of papers in the index or literature."}
         return {"years": [], "trends": [], "note": "no papers in this window"}
     first_year, last_year = years[0], years[-1]
 
@@ -2867,6 +2926,8 @@ def trends(
         "layer": layer,
         "about": about,
         "papers_in_topic": len(topic_ids) if topic_ids is not None else None,
+        "topic_coverage": topic_coverage,
+        "status": topic_coverage["status"] if topic_coverage is not None else "corpus_counts",
         "years": [str(y) for y in years],
         "papers_per_year": {str(y): per_year[y] for y in years},
         "trends": items[:top],
@@ -3355,7 +3416,7 @@ def _query_scope(query):
 
 
 def _topic_coverage(text, layer=None, strict=False, probe_limit=None,
-                    timeout=SEARCH_QDRANT_TIMEOUT):
+                    timeout=SEARCH_QDRANT_TIMEOUT, details=None):
     """How many papers this index holds on the subject of one claim, per layer.
 
     "No match" means one thing over 800 papers and another over 3, and that
@@ -3369,6 +3430,8 @@ def _topic_coverage(text, layer=None, strict=False, probe_limit=None,
     try:
         vector = embed_query(text)
     except HTTPException:
+        if details is not None:
+            details.update(status="unavailable", by_layer={})
         return None, {}, None
     per_layer, best = {}, 0.0
     for lay in layers:
@@ -3390,6 +3453,8 @@ def _topic_coverage(text, layer=None, strict=False, probe_limit=None,
                                                     "match": {"any": [lay]}}]},
                                  probe_limit, timeout=timeout)
         except HTTPException:
+            if details is not None:
+                details.setdefault("by_layer", {})[lay] = {"status": "unavailable"}
             continue
         papers, reaches_band = set(), False
         for h in hits:
@@ -3400,15 +3465,25 @@ def _topic_coverage(text, layer=None, strict=False, probe_limit=None,
             if score >= floor:
                 pid = (h.get("payload") or {}).get("arxiv_id")
                 if pid:
-                    papers.add(pid)
+                    papers.add(canonical_id(pid))
         # Count at the generous floor, but only in layers where something
         # actually reaches the band. A subject with seven papers hovering just
         # above web3's deliberately low floor and nothing near the band is not
         # covered, it is noise -- and it was noise that grew from four papers to
         # seven as the corpus grew, which is how the gate went quiet on robotics.
         per_layer[lay] = len(papers) if (reaches_band or not strict) else 0
+        if details is not None:
+            details.setdefault("by_layer", {})[lay] = {
+                "status": "measured", "canonical_papers": per_layer[lay],
+                "chunk_hits": len(hits), "chunk_cap": probe_limit,
+                "is_lower_bound": len(hits) >= probe_limit,
+                "relevance_floor": floor, "evidence_band": band,
+                "reaches_evidence_band": reaches_band,
+            }
     if not per_layer:
         return None, {}, None
+    if details is not None:
+        details["status"] = "measured" if len(per_layer) == len(layers) else "partial"
     return max(per_layer.values()), per_layer, round(best, 3)
 
 
@@ -3767,14 +3842,15 @@ def _relink_claim_nodes(conn):
 
 
 _relinked = False
+_CLAIM_VECTOR_UNPREPARED = object()
 
 
-def _canonical_claim(conn, claim):
+def _canonical_claim(conn, claim, commit=True, prepared_vector=_CLAIM_VECTOR_UNPREPARED):
     """Existing claim node this wording belongs to, or a new one.
 
-    Returns (claim_id, is_new). Matching is by embedding, because that is the
-    only thing that survives rewording; the threshold is deliberately high, so
-    a near-miss opens its own node rather than poisoning a neighbour's record."""
+    Returns (claim_id, is_new). Only exact wording and explicit links select
+    an existing node. A prepared vector avoids embedding inside a write
+    transaction; None preserves the embedding-unavailable exact-text fallback."""
     norm = _norm_claim(claim)
     row = conn.execute("SELECT claim_id FROM claim_nodes WHERE claim_norm=?", (norm,)).fetchone()
     if row:
@@ -3782,16 +3858,21 @@ def _canonical_claim(conn, claim):
     linked = _follow_claim_links(conn, norm)
     if linked != norm:
         return linked, False
-    try:
-        vector = embed_query(claim)
-    except HTTPException:
-        return norm, False  # embedding down: fall back to the exact-text record
+    vector = prepared_vector
+    if vector is _CLAIM_VECTOR_UNPREPARED:
+        try:
+            vector = embed_query(claim)
+        except HTTPException:
+            vector = None
+    if vector is None:
+        return norm, False
     conn.execute(
         "INSERT OR IGNORE INTO claim_nodes (claim_id, claim_norm, claim_text, vector, created_at) "
         "VALUES (?,?,?,?,?)",
         (norm, norm, claim, json.dumps(vector),
          datetime.now(timezone.utc).isoformat(timespec="seconds")))
-    conn.commit()
+    if commit:
+        conn.commit()
     return norm, True
 
 
@@ -3872,7 +3953,8 @@ def _judgments_conn():
                        ("niche_score", "INTEGER"), ("judged_by_model", "TEXT"),
                        # set only for verdicts backed by a wallet signature verified
                        # by attestor and written on-chain as a SAS attestation
-                       ("attestation_pda", "TEXT"), ("attestation_tx", "TEXT")):
+                       ("attestation_pda", "TEXT"), ("attestation_tx", "TEXT"),
+                       ("signed_issued_at_epoch_ms", "INTEGER")):
         if name not in cols:
             conn.execute(f"ALTER TABLE claim_judgments ADD COLUMN {name} {decl}")
     return conn
@@ -3938,6 +4020,40 @@ def _read_claim_id(conn, claim):
     norm = _norm_claim(claim)
     row = conn.execute("SELECT claim_id FROM claim_nodes WHERE claim_norm=?", (norm,)).fetchone()
     return _follow_claim_links(conn, row["claim_id"] if row else norm)
+
+
+def _signing_claim_id(claim):
+    conn = _judgments_read_conn()
+    if conn is None:
+        return _norm_claim(claim)
+    try:
+        return _read_claim_id(conn, claim)
+    except sqlite3.OperationalError as error:
+        if "no such table" not in str(error):
+            raise
+        return _follow_claim_links(conn, _norm_claim(claim))
+    finally:
+        conn.close()
+
+
+def _prepare_signed_claim_vector(claim, claim_id):
+    norm = _norm_claim(claim)
+    if claim_id != norm:
+        return None
+    conn = _judgments_read_conn()
+    if conn is not None:
+        try:
+            if conn.execute("SELECT 1 FROM claim_nodes WHERE claim_norm=?", (norm,)).fetchone():
+                return None
+        except sqlite3.OperationalError as error:
+            if "no such table" not in str(error):
+                raise
+        finally:
+            conn.close()
+    try:
+        return embed_query(claim)
+    except HTTPException:
+        return None
 
 
 def _follow_claim_links(conn, claim_id):
@@ -4297,8 +4413,8 @@ class VerdictMessageBody(BaseModel):
 def verdict_message(body: VerdictMessageBody, x_api_key: Optional[str] = Header(default=None)):
     """Canonical message to sign for a wallet-backed verdict.
 
-    claim_id is resolved through the same claim-node lookup /v1/adjudicate
-    uses (_canonical_claim), so the same question asked in different words
+    claim_id is resolved through existing nodes and explicit canonical links,
+    without creating a node, so the same question asked in different words
     still signs against the one node it belongs to -- the caller never has to
     know the registry's internal id scheme. The returned message is exactly
     what /v1/adjudicate/signed -> attestor will rebuild and check the
@@ -4315,11 +4431,7 @@ def verdict_message(body: VerdictMessageBody, x_api_key: Optional[str] = Header(
         raise HTTPException(status_code=400,
                             detail=f"verdict must be one of {sorted(JUDGMENT_VERDICTS)}")
 
-    conn = _judgments_conn()
-    try:
-        claim_id, _ = _canonical_claim(conn, claim)
-    finally:
-        conn.close()
+    claim_id = _signing_claim_id(claim)
 
     payload = {
         "claim_id": claim_id,
@@ -4370,9 +4482,9 @@ def adjudicate_signed(body: AdjudicateSignedBody, x_api_key: Optional[str] = Hea
     item with a 400 and the rest of the batch is still processed; attestor
     being unreachable fails the whole call with 503 and nothing is recorded.
 
-    judged_by is stored as "wallet:<reviewer>", so two different wallets are
-    two independent readers for quorum purposes even with no declared model,
-    while the same wallet repeating itself is still one reader (see
+    judged_by is stored as "wallet:<reviewer>". Different wallets are distinct
+    readers, but wallet agreement remains pending without trusted model
+    diversity. The same wallet repeating itself is still one reader (see
     _judgment_status).
     """
     auth_and_limit(x_api_key, "adjudicate")
@@ -4380,11 +4492,7 @@ def adjudicate_signed(body: AdjudicateSignedBody, x_api_key: Optional[str] = Hea
     if not claim:
         raise HTTPException(status_code=400, detail="claim must not be empty")
 
-    conn = _judgments_conn()
-    try:
-        claim_id, is_new = _canonical_claim(conn, claim)
-    finally:
-        conn.close()
+    claim_id, is_new = _signing_claim_id(claim), False
 
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     results = []
@@ -4416,7 +4524,7 @@ def adjudicate_signed(body: AdjudicateSignedBody, x_api_key: Optional[str] = Hea
             # further gets written without its own attestation
             raise HTTPException(status_code=503, detail=f"attestor unavailable: {e}")
 
-        if resp.status_code in (400, 429):
+        if resp.status_code in (400, 409, 429):
             item_result["status"] = resp.status_code
             item_result["error"] = _attestor_error_detail(resp)
             results.append(item_result)
@@ -4426,22 +4534,37 @@ def adjudicate_signed(body: AdjudicateSignedBody, x_api_key: Optional[str] = Hea
                                 detail=f"attestor error: {_attestor_error_detail(resp)}")
 
         attestation = resp.json()
+        issued_at_epoch_ms = attestation.get("issued_at_epoch_ms")
+        if type(issued_at_epoch_ms) is not int or abs(issued_at_epoch_ms) > 8640000000000000:
+            raise HTTPException(status_code=503, detail="attestor returned invalid issued_at_epoch_ms")
+        if not isinstance(attestation.get("attestation"), str) or not attestation["attestation"].strip():
+            raise HTTPException(status_code=503, detail="attestor returned invalid attestation")
+        prepared_vector = _prepare_signed_claim_vector(claim, claim_id)
         identity = f"wallet:{j.reviewer}"
         conn = _judgments_conn()
         try:
-            conn.execute(
+            conn.execute("BEGIN IMMEDIATE")
+            if _read_claim_id(conn, claim) != claim_id:
+                raise HTTPException(status_code=409, detail="claim link changed; prepare and sign a new message")
+            written = conn.execute(
                 "INSERT INTO claim_judgments "
                 "(claim_norm, claim_text, claim_id, paper_id, verdict, reason, judged_by, "
-                " judged_by_model, judged_at, layer, attestation_pda, attestation_tx) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+                " judged_by_model, judged_at, layer, attestation_pda, attestation_tx, signed_issued_at_epoch_ms) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(claim_norm, paper_id, judged_by) DO UPDATE SET "
                 "verdict=excluded.verdict, reason=excluded.reason, judged_at=excluded.judged_at, "
                 "claim_id=excluded.claim_id, attestation_pda=excluded.attestation_pda, "
-                "attestation_tx=excluded.attestation_tx",
+                "attestation_tx=excluded.attestation_tx, "
+                "signed_issued_at_epoch_ms=excluded.signed_issued_at_epoch_ms "
+                "WHERE claim_judgments.signed_issued_at_epoch_ms IS NULL "
+                "OR excluded.signed_issued_at_epoch_ms > claim_judgments.signed_issued_at_epoch_ms",
                 (_norm_claim(claim), claim, claim_id, j.id, j.verdict, (j.reason or "")[:600],
                  identity, JUDGMENT_MODEL_UNKNOWN, now, body.layer,
-                 attestation.get("attestation"), attestation.get("signature")),
+                 attestation.get("attestation"), attestation.get("signature"), issued_at_epoch_ms),
             )
+            if written.rowcount:
+                _, created = _canonical_claim(conn, claim, commit=False, prepared_vector=prepared_vector)
+                is_new = is_new or created
             conn.commit()
         finally:
             conn.close()
@@ -4567,8 +4690,10 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
 
     corpus = _corpus_stats()
     corpus["as_of"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    corpus["note"] = ("The index grows continuously, so a verdict is only "
-                      "reproducible against the same as_of date. Cite it.")
+    corpus["as_of_kind"] = "observed_timestamp"
+    corpus["note"] = ("as_of is an observed timestamp for this audit, not an immutable "
+                      "index snapshot or a reproducibility guarantee. The index and "
+                      "mutable sources can change; cite the timestamp and evidence provenance.")
     layer_size = corpus.get("by_layer", {}).get(body.layer) if body.layer else corpus.get("papers_indexed")
 
     scope_text = " ".join([idea] + [text for text, _ in claim_specs] +
@@ -4610,15 +4735,17 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
     # can be phrased so unusually that it matches nothing while its claims match
     # plenty -- "parimutuel market on Solana settled by an oracle" peaked at
     # 0.703 while the same subject as a claim reached 180 papers.
-    coverage_cache = {}
+    coverage_cache, coverage_details = {}, {}
 
     def _coverage_of(text, strict=False):
         key = (text, strict)
         if key not in coverage_cache:
+            coverage_details[key] = {}
             coverage_cache[key] = _topic_coverage(
                 text, body.layer, strict,
                 FAST_COVERAGE_PROBE_LIMIT if fast_mode else COVERAGE_PROBE_LIMIT,
                 timeout=audit_qdrant_timeout,
+                details=coverage_details[key],
             )
         return coverage_cache[key]
 
@@ -4766,6 +4893,7 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
             if _link_conn is not None:
                 _link_conn.close()
         found, queries_used = _search_union(claim, phrasings)
+        retrieved_today_ids = {h["arxiv_id"] for h in found}
         # papers today's wording failed to retrieve are fetched by id, so a
         # verdict resting on the record is backed by a citable item rather than
         # by a bare identifier in a side block
@@ -4783,7 +4911,10 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
             facts3 = _paper_facts([h["arxiv_id"] for h in hydrated])
             for h in hydrated:
                 h["niche_score"] = facts3.get(h["arxiv_id"])
-                h["found_via"] = "registry: judged against this claim before"
+                rec = registry[h["arxiv_id"]]
+                h["found_via"] = ("registry: judged against a similar, unlinked claim"
+                                  if rec.get("from_claim") else
+                                  "registry: judged against this canonical claim before")
                 h["from_registry"] = True
             found = hydrated + found
         facts = _paper_facts([h["arxiv_id"] for h in found])
@@ -4831,6 +4962,9 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
         finally:
             if _ov_conn is not None:
                 _ov_conn.close()
+        for h in found:
+            if h["arxiv_id"] in registry:
+                h["from_registry"] = True
         found = _hydrate_evidence(found)
         seen_nodes = {c["claim_id"] for c in same_question}
         same_question = same_question + [c for c in overlap_nodes
@@ -4840,23 +4974,28 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
         # expansion query is usually the one that names the subject properly,
         # and leaving it out reported a well-stocked subject as thin
         coverage, coverage_by_layer, strict_coverage = 0, {}, 0
+        coverage_probes = []
         for q in queries_used:
             got, by_layer, _best = _coverage_of(q)
             if got is None:
                 continue
+            coverage_probes.append(dict(query=q, **coverage_details[(q, False)]))
             coverage = max(coverage, got)
-            strict_coverage = max(strict_coverage, len([
-                h for h in found
+            strict_coverage = max(strict_coverage, len({canonical_id(h["arxiv_id"])
+                for h in found
+                if h["arxiv_id"] in retrieved_today_ids
                 if _score_band(h.get("score") or 0,
-                               _layer_of(h, body.layer)) != "weak"]))
+                               _layer_of(h, body.layer)) != "weak"}))
             for lay, n in (by_layer or {}).items():
                 coverage_by_layer[lay] = max(coverage_by_layer.get(lay, 0), n)
         # one lookup, not two: _prior_readings only saw this node, so a paper
         # carried into the evidence from a neighbour's record was displayed as
         # "unread" right next to the verdict that rested on it
         readings = registry
-        mentions = [h for h in found if h.get("section_type") in CONTEXT_SECTIONS]
-        hits = [h for h in found if h.get("section_type") not in CONTEXT_SECTIONS]
+        mentions = [h for h in found if h.get("section_type") in CONTEXT_SECTIONS
+                    and not h.get("from_registry")]
+        hits = [h for h in found if h.get("section_type") not in CONTEXT_SECTIONS
+                or h.get("from_registry")]
         # papers on the record are pinned: their score under today's wording is
         # exactly what the registry exists to overrule, so cutting the list by
         # score would drop them again and leave the verdict unsupported
@@ -4910,19 +5049,29 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
         unread_strong = [h for h in strong if _status_of(h) == "unread"]
         # counting only the retrieval path reported "0 read, 0 unread" while two
         # papers sat in the record with verdicts on them
+        current_registry = {pid: rec for pid, rec in registry.items() if not rec.get("from_claim")}
+        similar_registry = {pid: rec for pid, rec in registry.items() if rec.get("from_claim")}
         by_status = {}
-        for rec in registry.values():
+        for rec in current_registry.values():
             by_status[rec["status"]] = by_status.get(rec["status"], 0) + 1
+        pending_current = sum(n for status, n in by_status.items()
+                              if status not in {"confirmed_prior_art", "ruled_out", "contested"})
         settled = {
             "confirmed_prior_art": len(confirmed) + by_status.get("confirmed_prior_art", 0),
             "ruled_out": len(ruled_out) + by_status.get("ruled_out", 0),
-            "pending_quorum": len(read_once) + by_status.get("read_once", 0),
+            "pending_quorum": len(read_once) + pending_current,
             "agreed_same_model": by_status.get("agreed_same_model", 0),
             "contested": len(contested) + by_status.get("contested", 0),
             "unread": len(unread_strong),
             "on_record_total": len(registry),
+            "current_claim_total": len(current_registry),
+            "reported_on_similar_claim": len(similar_registry),
+            "note": "Settled and pending counts refer only to the current canonical claim. "
+                    "Similar unlinked claims require separate claim verification; agreed_same_model "
+                    "is a subset of pending_quorum, not scientific quorum.",
         }
-        ruled_out_ids = {h["arxiv_id"] for h in ruled_out}
+        ruled_out_ids = {h["arxiv_id"] for h in ruled_out} | {
+            pid for pid, rec in current_registry.items() if rec["status"] == "ruled_out"}
         direct = [h for h in direct if h["arxiv_id"] not in ruled_out_ids]
 
         # a reading already on the record outranks anything today's phrasing did
@@ -4937,6 +5086,11 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
             reading = ("Independent readers have already confirmed these papers make "
                        "this claim, under this or an equivalent wording. Treat it as "
                        "existing work.")
+        elif by_status.get("contested", 0):
+            verdict = "registry_readings_contested"
+            reading = ("Readers disagree about the current canonical claim. The registry is "
+                       "unresolved, not empty; review the recorded reasons and evidence before "
+                       "drawing a conclusion.")
         elif on_similar and not [p for p in registry_asserts if p not in on_similar]:
             verdict = "prior_art_reported_on_similar_claim"
             reading = ("A reader judged these papers against a claim worded very "
@@ -4945,9 +5099,20 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
                        "link the nodes so the next caller inherits the verdict.")
         elif registry_asserts and not confirmed:
             verdict = "prior_art_reported_pending_quorum"
-            reading = ("A reader has recorded that these papers assert this claim. One "
-                       "reading is not a settled verdict, but it outranks a retrieval "
-                       "score: read them and file a second opinion.")
+            reading = ("Readers have recorded that these papers assert this claim. Their "
+                       "readings remain pending without trusted model diversity; wallet votes "
+                       "alone do not establish scientific quorum. Read the evidence and file "
+                       "an independent, verified opinion.")
+        elif similar_registry and not current_registry:
+            verdict = "readings_reported_on_similar_claim"
+            reading = ("Readings exist on similar, unlinked claims, not on this canonical claim. "
+                       "Their partial or negative verdicts do not settle this claim; verify the "
+                       "claim relationship and read the evidence.")
+        elif pending_current:
+            verdict = "candidates_read_pending_quorum"
+            reading = ("Registry readings exist for the current canonical claim but remain "
+                       "unsettled. Partial readings or agreement without trusted model diversity "
+                       "are not scientific quorum. Review the evidence and unresolved verdicts.")
         elif confirmed:
             verdict = "prior_art_confirmed"
             reading = ("Independent readers agreed these papers make this claim. "
@@ -4957,7 +5122,7 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
             reading = ("Every candidate has been read once and none is settled yet. "
                        "A second independent reading closes this claim; until then "
                        "each paper carries the earlier reader's reasons.")
-        elif ruled_out and not direct:
+        elif ruled_out_ids and not direct:
             verdict = "candidates_ruled_out"
             reading = ("The strong candidates were read and rejected as not making "
                        "this claim. That is not proof of novelty, only that these "
@@ -5043,9 +5208,20 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
                 "counts": rec["counts"],
                 "reasons": rec["reasons"][:2],
                 "from_claim": rec.get("from_claim"),
-                "retrieved_today": pid in {h["arxiv_id"] for h in found},
+                "claim_scope": "similar_unlinked" if rec.get("from_claim") else "current_canonical",
+                "retrieved_today": pid in retrieved_today_ids,
+                "hydrated_from_registry": pid in {h["arxiv_id"] for h in hydrated},
+                "evidence_returned": pid in {h["arxiv_id"] for h in hits},
             } for pid, rec in sorted(registry.items(),
                                      key=lambda kv: -kv[1]["readers"])[:8]],
+            "registry_summary": {
+                "current_claim": len(current_registry), "similar_claims": len(similar_registry),
+                "retrieved_today": len(set(registry) & retrieved_today_ids),
+                "hydrated_from_registry": len({h["arxiv_id"] for h in hydrated}),
+                "without_returned_evidence": len(set(registry) - {h["arxiv_id"] for h in hits}),
+                "note": "Counts are papers, not wallet votes. Retrieval, hydration and claim scope "
+                        "are separate sets. Hydration does not mean today's wording retrieved the paper.",
+            },
             # neighbours the bibliography points at are shown even when their
             # own similarity to the claim is mediocre: that is the whole point
             # of the channel. They are candidates, not evidence, and are kept
@@ -5075,18 +5251,20 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
             },
             "corpus_coverage": {
                 "papers_about_this_claim": coverage,
-                "is_lower_bound": coverage >= (FAST_COVERAGE_PROBE_LIMIT if fast_mode
-                                                else COVERAGE_PROBE_LIMIT),
+                "is_lower_bound": any(lay.get("is_lower_bound", False)
+                                      for probe in coverage_probes
+                                      for lay in probe.get("by_layer", {}).values()),
                 "probe_cap": (FAST_COVERAGE_PROBE_LIMIT if fast_mode
                               else COVERAGE_PROBE_LIMIT),
                 "by_layer": coverage_by_layer,
-                "how_counted": ("papers_about_this_claim is the largest of the "
-                                "per-layer counts, not their sum: a paper can sit "
-                                "in several layers and each layer is probed with "
-                                "its own filter and its own band. When is_lower_bound "
-                                "is true, the subject has at least probe_cap papers; "
-                                "the endpoint stops counting there to keep audits "
-                                "responsive while the live index is being written"),
+                "probes": coverage_probes,
+                "how_counted": ("Canonical twin IDs count once per layer and wording. by_layer "
+                                "takes the maximum count across wordings, not a union; "
+                                "papers_about_this_claim takes the largest layer count, not their sum. "
+                                "Counts use the existing layer relevance floor. probe_cap limits chunk "
+                                "hits, not unique papers. is_lower_bound means a probe reached its "
+                                "chunk cap and may be truncated; it does not imply probe_cap papers. "
+                                "Registry hydration is excluded from these retrieval counts."),
                 "depth": _coverage_grade(coverage),
                 "reading": ("A quiet result over a well-covered subject is a real "
                             "signal; over a thin one it only shows the index is thin."
@@ -5103,8 +5281,13 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
                 # soft gripper cleared the bar that perovskite cells failed. Two
                 # weak signals together do draw it: almost nothing in the index
                 # is about the subject, AND nothing reaches the layer's band.
-                {"verdict": "outside_the_index",
-                 "reading": ("The index holds almost nothing on this subject and "
+                {"verdict": ("thin_retrieval_with_registry_evidence" if registry else "outside_the_index"),
+                 "reading": ("Today's bounded wording-based retrieval is thin, but registry evidence "
+                             "exists. Zero retrieved papers is not zero indexed literature. Current "
+                             "canonical and similar unlinked records are counted separately; similar "
+                             "records need claim verification and do not settle this claim."
+                             if registry else
+                             "The index holds almost nothing on this subject and "
                              "nothing that clears the relevance band for its layer. "
                              "Treat this as a statement about the index, not about "
                              "the literature: no conclusion about novelty follows."),
@@ -5113,6 +5296,8 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
                  # coverage for a claim about tactile grippers
                  "papers_on_subject": strict_coverage,
                  "papers_at_relevance_floor": coverage,
+                 "current_claim_registry_papers": len(current_registry),
+                 "similar_claim_registry_papers": len(similar_registry),
                  "depth": _coverage_grade(coverage)}
                 if (not direct and not adjacent
                     and _coverage_grade(coverage) in ("empty", "thin"))
@@ -5125,7 +5310,8 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
             "confidence": ("high" if len([h for h in direct
                                           if h.get("section_type") in ("method", "experiments")]) >= 2
                            else "medium" if direct or adjacent else "low"),
-            "verification_required": bool(unread_strong),
+            "verification_required": bool(unread_strong or pending_current
+                                          or by_status.get("contested", 0) or similar_registry),
             "settled": settled,
             # was reading hits[0], which after registry hydration can be a
             # paper pinned for its verdict rather than for its score
@@ -5133,12 +5319,15 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
                            if (direct or adjacent) else
                            round(hits[0]["score"], 3) if hits else None),
             "matches": {"strong_unread": len(unread_strong),
-                        "strong_read": len(confirmed) + len(read_once) + len(contested),
-                        "ruled_out": len(ruled_out),
+                        "strong_read": settled["confirmed_prior_art"] + settled["pending_quorum"]
+                                       + settled["contested"],
+                        "ruled_out": settled["ruled_out"],
+                        "similar_claim_read": len(similar_registry),
                         "adjacent": len(adjacent),
                         "returned": len(hits),
-                        "note": "strong_unread counts candidates by wording alone; it is "
-                                "not a count of papers that make this claim"},
+                        "note": "strong_unread counts direct retrieval candidates, not proven prior art. "
+                                "strong_read includes pinned current-claim registry readings regardless "
+                                "of today's score; similar_claim_read is separate and never settles this claim."},
             "year_range": [min(years), max(years)] if years else None,
             "evidence": [{
                 "from_registry": h.get("from_registry", False),
@@ -5209,12 +5398,14 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
     read_total = sum(c["settled"]["pending_quorum"] + c["settled"]["confirmed_prior_art"]
                      + c["settled"]["ruled_out"] + c["settled"]["contested"]
                      for c in claim_reports)
+    similar_total = sum(c["settled"]["reported_on_similar_claim"] for c in claim_reports)
     settled_total = sum(c["settled"]["confirmed_prior_art"] + c["settled"]["ruled_out"]
                         for c in claim_reports)
     unread_total = sum(c["settled"]["unread"] for c in claim_reports)
     counts = {v: sum(1 for c in claim_reports if c["verdict"] == v)
               for v in ("prior_art_confirmed", "prior_art_reported_pending_quorum",
                         "prior_art_reported_on_similar_claim",
+                        "readings_reported_on_similar_claim", "registry_readings_contested",
                         "candidates_read_pending_quorum",
                         "candidates_ruled_out", "strong_candidates",
                         "adjacent_work_only", "weak_signal_only",
@@ -5231,9 +5422,10 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
             "someone reads them."
         ),
         "headline": (
-            f"{len(claim_reports)} claims audited: {read_total} candidates already read "
-            f"({settled_total} settled by independent agreement), {unread_total} still "
-            f"unread. {counts['no_match_in_corpus']} claims have no match in this index."
+            f"{len(claim_reports)} claims audited: {read_total} papers read against current canonical claims "
+            f"({settled_total} settled with trusted model diversity), {unread_total} direct candidates still "
+            f"unread; {similar_total} papers reported on similar, unlinked claims require claim verification. "
+            f"{counts['no_match_in_corpus']} claims have no match in this index."
         ),
         "scope": {
             "sources": ["arXiv", "IACR ePrint", "Ethereum EIPs", "Solana SIMDs",
@@ -5818,7 +6010,7 @@ def similar_papers(paper_id: str, limit: int = 10, layer: Optional[str] = None,
 
 @app.get("/v1/paper/{paper_id:path}/section")
 def paper_section(paper_id: str, title: Optional[str] = None, section_type: Optional[str] = None,
-                  offset: int = 0, max_chars: int = SECTION_MAX_CHARS,
+                  offset: Annotated[int, Query(ge=0)] = 0, max_chars: int = SECTION_MAX_CHARS,
                   x_api_key: Optional[str] = Header(default=None)):
     """Text of one section, in paper order, paged by characters. Pick the
     section by its exact title from /v1/paper/{id}, or by section_type

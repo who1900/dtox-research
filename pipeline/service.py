@@ -49,12 +49,23 @@ LOCK_FILE = BASE_DIR / "service.lock"
 LOG_FILE = BASE_DIR / "pipeline.log"
 STAGE_HEARTBEAT_FILE = BASE_DIR / "stage_heartbeats.json"
 LATEX_CACHE_DIR = BASE_DIR / "latex_cache"
-EXTRACTOR_VERSION = 3
+EXTRACTOR_VERSION = 4
+
+
+def _pipeline_log_handlers():
+    file_handler = logging.FileHandler(LOG_FILE)
+    try:
+        if os.path.samestat(os.fstat(sys.stdout.fileno()), os.stat(LOG_FILE)):
+            return [file_handler]
+    except (OSError, ValueError, AttributeError):
+        pass
+    return [file_handler, logging.StreamHandler(sys.stdout)]
+
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)],
+    handlers=_pipeline_log_handlers(),
 )
 log = logging.getLogger("dtox-research")
 logging.getLogger("pylatexenc").setLevel(logging.WARNING)  # tolerant-parsing notices are noise
@@ -414,6 +425,7 @@ HAL_ID_PREFIX = "hal:"
 HAL_API_URL = "https://api.archives-ouvertes.fr/search/"
 HAL_PAGE_SIZE = 100
 HAL_MAX_PAGES = 20
+HAL_REFRESH_SECONDS = 24 * 60 * 60
 HAL_MIN_NICHE_AUTO_PASS = 6
 HAL_QUERIES = (
     "zero knowledge proof blockchain", "zk rollup blockchain", "blockchain consensus",
@@ -1448,6 +1460,18 @@ def init_db(conn):
         )
         """
     )
+    conn.execute("CREATE TABLE IF NOT EXISTS paper_index_sync "
+                 "(arxiv_id TEXT PRIMARY KEY, revision TEXT NOT NULL, retry_after REAL NOT NULL DEFAULT 0)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_paper_index_sync_retry ON paper_index_sync(retry_after)")
+    conn.execute("CREATE TABLE IF NOT EXISTS paper_index_sync_progress "
+                 "(arxiv_id TEXT PRIMARY KEY, revision TEXT NOT NULL, completed TEXT NOT NULL DEFAULT '[]')")
+    conn.execute("CREATE TABLE IF NOT EXISTS completion_history "
+                 "(arxiv_id TEXT PRIMARY KEY, first_known INTEGER NOT NULL, completed INTEGER NOT NULL DEFAULT 0)")
+    conn.execute("CREATE TABLE IF NOT EXISTS completion_totals "
+                 "(singleton INTEGER PRIMARY KEY CHECK(singleton=1), started_at REAL NOT NULL, "
+                 "first_completed INTEGER NOT NULL DEFAULT 0, reprocessed INTEGER NOT NULL DEFAULT 0, "
+                 "unknown INTEGER NOT NULL DEFAULT 0)")
+    conn.execute("INSERT OR IGNORE INTO completion_totals(singleton,started_at) VALUES (1,?)", (time.time(),))
     # cleanup: legacy bare-category cursors (cat:cs.CL@YYYY etc). Those queries
     # pulled whole categories and flooded the base with off-niche papers; the
     # niche-scoped queries replaced them.
@@ -1485,7 +1509,7 @@ def upsert_discovered(conn, arxiv_id, title, year, layer, abstract=None,
     _, primary_score = niche_filter.primary_layer(scores)
     matched_terms_json = json.dumps(niche_filter.all_matched_terms(scores))
 
-    row = conn.execute("SELECT layers, status, abstract FROM papers WHERE arxiv_id=?", (arxiv_id,)).fetchone()
+    row = conn.execute("SELECT * FROM papers WHERE arxiv_id=?", (arxiv_id,)).fetchone()
     if row is None:
         if matched_layers:
             conn.execute(
@@ -1503,23 +1527,28 @@ def upsert_discovered(conn, arxiv_id, title, year, layer, abstract=None,
                 (arxiv_id, title, year, "", "off_niche", abstract,
                  primary_score, matched_terms_json, source_url, citation_count, venue, now_iso()),
             )
+        conn.execute("INSERT OR IGNORE INTO completion_history(arxiv_id,first_known) VALUES (?,1)",
+                     (arxiv_id,))
     else:
-        if row["status"] == "off_niche" and matched_layers:
+        if row["status"] == "graph_unresolved" or (row["status"] == "off_niche" and matched_layers):
             # a later harvest query / a richer abstract now proves this paper
             # niche after all - resurrect it into the pipeline
             conn.execute(
-                "UPDATE papers SET status='discovered', layers=?, abstract=COALESCE(abstract, ?), "
+                "UPDATE papers SET status=?, title=?, year=?, layers=?, abstract=COALESCE(NULLIF(abstract,''), ?), "
                 "niche_score=?, matched_terms=?, updated_at=? WHERE arxiv_id=?",
-                (",".join(matched_layers), abstract, primary_score, matched_terms_json, now_iso(), arxiv_id),
+                ("discovered" if matched_layers else "off_niche", title, year,
+                 ",".join(matched_layers), abstract, primary_score, matched_terms_json, now_iso(), arxiv_id),
             )
         elif row["status"] != "off_niche":
             layers = set(row["layers"].split(",")) if row["layers"] else set()
             new_layers = layers | set(matched_layers)
-            if new_layers != layers or (abstract and not row["abstract"]):
+            if (new_layers != layers or (abstract and abstract != row["abstract"])
+                    or (title and title != row["title"]) or (year and year != row["year"])):
                 conn.execute(
-                    "UPDATE papers SET layers=?, abstract=COALESCE(abstract, ?), "
+                    "UPDATE papers SET title=COALESCE(NULLIF(?,''),title), year=COALESCE(NULLIF(?,0),year), "
+                    "layers=?, abstract=COALESCE(NULLIF(?,''),abstract), "
                     "niche_score=?, matched_terms=?, updated_at=? WHERE arxiv_id=?",
-                    (",".join(sorted(new_layers)) if new_layers else layer, abstract,
+                    (title, year, ",".join(sorted(new_layers)), abstract,
                      primary_score, matched_terms_json, now_iso(), arxiv_id),
                 )
         if source_url or citation_count is not None or venue:
@@ -1529,6 +1558,14 @@ def upsert_discovered(conn, arxiv_id, title, year, layer, abstract=None,
                 "WHERE arxiv_id=?",
                 (source_url, citation_count, venue, arxiv_id),
             )
+        if row["status"] == "done":
+            current = conn.execute("SELECT * FROM papers WHERE arxiv_id=?", (arxiv_id,)).fetchone()
+            fields = ("title", "year", "layers", "abstract", "niche_score", "matched_terms",
+                      "source_url", "citation_count", "venue")
+            if any(row[field] != current[field] for field in fields):
+                _queue_index_sync(conn, arxiv_id)
+            conn.execute("INSERT INTO completion_history(arxiv_id,first_known,completed) VALUES (?,0,1) "
+                         "ON CONFLICT(arxiv_id) DO UPDATE SET completed=1", (arxiv_id,))
     if commit:
         conn.commit()
 
@@ -1629,6 +1666,8 @@ def pick_next_query(conn):
             "AND query_key NOT LIKE 'openalex@%' "
             "AND query_key NOT LIKE 'openalex-fresh@%' "
             "AND query_key NOT LIKE 'pmlr@%' "
+            "AND query_key NOT LIKE 'hal-%' "
+            "AND query_key NOT LIKE 'hal@%' "
             "ORDER BY (last_run_at IS NOT NULL), last_run_at ASC LIMIT 1",
             keys + [layer],
         ).fetchone()
@@ -2898,34 +2937,60 @@ def _run_embed_batch(session, batch, slots=None):
     return batch, vectors
 
 
-def fts_write(points):
-    """Mirror freshly embedded chunks into the FTS5 index.
+def _fts_rowids(fts, table, arxiv_id, fresh=False):
+    """Use the indexed sidecatalog only; unmapped legacy papers are deferred."""
+    if table not in ("chunks", "papers_fts"):
+        raise ValueError("unsupported FTS table")
+    fts.execute("CREATE TABLE IF NOT EXISTS pipeline_fts_papers "
+                "(table_name TEXT, arxiv_id TEXT, PRIMARY KEY(table_name,arxiv_id))")
+    fts.execute("CREATE TABLE IF NOT EXISTS pipeline_fts_rows "
+                "(table_name TEXT, arxiv_id TEXT, row_id INTEGER, PRIMARY KEY(table_name,row_id))")
+    fts.execute("CREATE INDEX IF NOT EXISTS pipeline_fts_rows_paper "
+                "ON pipeline_fts_rows(table_name,arxiv_id)")
+    known = fts.execute("SELECT 1 FROM pipeline_fts_papers WHERE table_name=? AND arxiv_id=?",
+                        (table, arxiv_id)).fetchone()
+    if not known:
+        if not fresh:
+            raise sqlite3.OperationalError("legacy FTS sidecatalog not ready; reconciliation deferred")
+        fts.execute("INSERT INTO pipeline_fts_papers VALUES (?,?)", (table, arxiv_id))
+    return [row[0] for row in fts.execute(
+        "SELECT row_id FROM pipeline_fts_rows WHERE table_name=? AND arxiv_id=?", (table, arxiv_id))]
 
-    Failure here must never cost a paper: the vectors are already written, and
-    a missing lexical row only means this chunk is found by meaning and not by
-    exact term until the next rebuild."""
-    if not points:
-        return
+
+def fts_write(points, paper_ids=None, fresh_ids=()):
+    """Atomically replace complete paper snapshots, deduplicated by point ID."""
+    paper_ids = set(paper_ids or []) | {pt["payload"]["arxiv_id"] for pt in points}
+    if not paper_ids:
+        return True
     try:
-        fts = sqlite3.connect(FTS_DB_PATH, timeout=30)
+        fts = sqlite3.connect(f"file:{FTS_DB_PATH}?mode=rw", uri=True, timeout=30)
     except sqlite3.Error as e:
         log.warning(f"fts: cannot open index: {e}")
-        return
+        return False
     try:
-        rows = []
+        fts.execute("BEGIN IMMEDIATE")
+        rows = {}
         for pt in points:
             pay = pt.get("payload") or {}
             if pay.get("text"):
-                rows.append((pay["text"], str(pt["id"]), pay.get("arxiv_id"),
-                             pay.get("section_type"), pay.get("element_type"),
-                             str(pay.get("layers") or ""), pay.get("year")))
-        if rows:
-            fts.executemany(
+                rows[str(pt["id"])] = (pay["text"], str(pt["id"]), pay["arxiv_id"],
+                                       pay.get("section_type"), pay.get("element_type"),
+                                       str(pay.get("layers") or ""), pay.get("year"))
+        for arxiv_id in paper_ids:
+            old = _fts_rowids(fts, "chunks", arxiv_id, fresh=arxiv_id in fresh_ids)
+            fts.executemany("DELETE FROM chunks WHERE rowid=?", [(rowid,) for rowid in old])
+            fts.execute("DELETE FROM pipeline_fts_rows WHERE table_name='chunks' AND arxiv_id=?", (arxiv_id,))
+        for row in rows.values():
+            cursor = fts.execute(
                 "INSERT INTO chunks (text, point_id, arxiv_id, section_type, "
-                "element_type, layers, year) VALUES (?,?,?,?,?,?,?)", rows)
-            fts.commit()
+                "element_type, layers, year) VALUES (?,?,?,?,?,?,?)", row)
+            fts.execute("INSERT INTO pipeline_fts_rows VALUES ('chunks',?,?)", (row[2], cursor.lastrowid))
+        fts.commit()
+        return True
     except sqlite3.Error as e:
+        fts.rollback()
         log.warning(f"fts: write failed: {e}")
+        return False
     finally:
         fts.close()
 
@@ -2935,29 +3000,190 @@ def _sync_coarse_index(conn, arxiv_ids):
     Imported lazily (coarse_index imports this module) and never allowed to
     cost a paper: any failure here is a warning, not a pipeline error."""
     if not COARSE_INDEX_ENABLED or not arxiv_ids:
-        return
+        return True
     try:
         import coarse_index
-        coarse_index.upsert_papers(conn, arxiv_ids)
+        return coarse_index.upsert_papers(conn, arxiv_ids) == len(arxiv_ids)
     except Exception as e:
         log.warning(f"coarse-index: sync failed for {arxiv_ids}: {e}")
+        return False
 
 
 def _sync_paper_fts(arxiv_ids):
-    """Best-effort mirror into papers_fts.db right after papers hit status='done'.
-    Imported lazily (build_paper_fts.py has no other import-time side effects,
-    but this keeps the same shape as _sync_coarse_index) and never allowed to
-    cost a paper: any failure here is a warning, not a pipeline error."""
+    """Compatibility hook; live reconciliation uses the conn-owned helper below."""
     if not PAPER_FTS_ENABLED or not arxiv_ids:
         return
     try:
         import build_paper_fts
         build_paper_fts.upsert_papers(arxiv_ids)
+    except Exception as exc:
+        log.warning(f"paper-fts: sync failed for {arxiv_ids}: {exc}")
+
+
+def _sync_paper_fts_owned(conn, arxiv_ids):
+    """Addressed paper FTS sync; failures remain in the durable retry queue."""
+    if not PAPER_FTS_ENABLED or not arxiv_ids:
+        return True
+    try:
+        import build_paper_fts
+        fts = sqlite3.connect(f"file:{build_paper_fts.PAPER_FTS_PATH}?mode=rw", uri=True, timeout=30)
+        try:
+            fts.execute("BEGIN IMMEDIATE")
+            for arxiv_id in arxiv_ids:
+                row = conn.execute("SELECT arxiv_id,title,abstract,layers,year FROM papers "
+                                   "WHERE status='done' AND arxiv_id=?", (arxiv_id,)).fetchone()
+                if row is None:
+                    raise ValueError("paper is not done")
+                history = conn.execute("SELECT first_known FROM completion_history WHERE arxiv_id=?",
+                                       (arxiv_id,)).fetchone()
+                old = _fts_rowids(fts, "papers_fts", arxiv_id, fresh=bool(history and history[0]))
+                fts.executemany("DELETE FROM papers_fts WHERE rowid=?", [(rowid,) for rowid in old])
+                fts.execute("DELETE FROM pipeline_fts_rows WHERE table_name='papers_fts' AND arxiv_id=?", (arxiv_id,))
+                cursor = fts.execute("INSERT INTO papers_fts(arxiv_id,title,abstract,layers,year) VALUES (?,?,?,?,?)",
+                                     (row[0], row[1] or "", row[2] or "", row[3] or "", row[4]))
+                fts.execute("INSERT INTO pipeline_fts_rows VALUES ('papers_fts',?,?)", (arxiv_id, cursor.lastrowid))
+            fts.commit()
+        finally:
+            fts.close()
+        return True
     except Exception as e:
         log.warning(f"paper-fts: sync failed for {arxiv_ids}: {e}")
+        return False
+
+
+def _queue_index_sync(conn, arxiv_id):
+    revision = uuid.uuid4().hex
+    conn.execute("INSERT INTO paper_index_sync(arxiv_id,revision) VALUES (?,?) "
+                 "ON CONFLICT(arxiv_id) DO UPDATE SET revision=excluded.revision,retry_after=0",
+                 (arxiv_id, revision))
+    conn.execute("INSERT INTO paper_index_sync_progress(arxiv_id,revision) VALUES (?,?) "
+                 "ON CONFLICT(arxiv_id) DO UPDATE SET revision=excluded.revision,completed='[]'",
+                 (arxiv_id, revision))
+
+
+def _fresh_fts_ids(conn, arxiv_id):
+    history = conn.execute("SELECT first_known,completed FROM completion_history WHERE arxiv_id=?",
+                           (arxiv_id,)).fetchone()
+    return [arxiv_id] if history and history[0] and not history[1] else []
+
+
+def _sync_chunk_fts_owned(conn, row):
+    arxiv_id = row["arxiv_id"]
+    path = CHUNK_DIR / f"{safe_id(arxiv_id)}.json"
+    if path.exists():
+        chunks = json.loads(path.read_text(encoding="utf-8"))
+        points = [{"id": str(uuid.uuid5(NAMESPACE_URL, f"{arxiv_id}#{chunk['chunk_index']}")),
+                   "payload": {"arxiv_id": arxiv_id, "text": chunk["text"], "year": row["year"],
+                               "layers": (row["layers"] or "").split(",") if row["layers"] else [],
+                               "section_type": chunk["section_type"], "element_type": chunk.get("element_type", "prose")}}
+                  for chunk in chunks if extractor.should_embed(chunk)]
+        history = conn.execute("SELECT first_known FROM completion_history WHERE arxiv_id=?", (arxiv_id,)).fetchone()
+        return fts_write(points, [arxiv_id], [arxiv_id] if history and history[0] else [])
+    fts = sqlite3.connect(f"file:{FTS_DB_PATH}?mode=rw", uri=True, timeout=30)
+    try:
+        fts.execute("BEGIN IMMEDIATE")
+        ids = _fts_rowids(fts, "chunks", arxiv_id)
+        layers = (row["layers"] or "").split(",") if row["layers"] else []
+        fts.executemany("UPDATE chunks SET layers=?,year=? WHERE rowid=?",
+                        [(str(layers), row["year"], rowid) for rowid in ids])
+        fts.commit()
+        return True
+    finally:
+        fts.close()
+
+
+def _sync_qdrant_metadata(session, row):
+    payload = {key: row[key] for key in ("title", "year", "citation_count", "venue", "niche_score")}
+    payload.update(layers=(row["layers"] or "").split(",") if row["layers"] else [],
+                   terms=json.loads(row["matched_terms"] or "[]")[:12], url=row["source_url"])
+    response = session.post(f"{QDRANT_URL}/collections/{COLLECTION_NAME}/points/payload",
+                            params={"wait": "true"}, timeout=60,
+                            json={"payload": payload, "filter": {"must": [
+                                {"key": "arxiv_id", "match": {"value": row["arxiv_id"]}}]}})
+    response.raise_for_status()
+    return True
+
+
+def _upsert_chunk_snapshot(session, arxiv_id, points):
+    try:
+        for offset in range(0, max(1, len(points)), UPSERT_BATCH_SIZE):
+            response = session.put(f"{QDRANT_URL}/collections/{COLLECTION_NAME}/points",
+                                   params={"wait": "true"}, json={"points": points[offset:offset + UPSERT_BATCH_SIZE]},
+                                   timeout=60)
+            response.raise_for_status()
+        conditions = [{"key": "arxiv_id", "match": {"value": arxiv_id}}]
+        if points:
+            last_index = max(point["payload"]["chunk_index"] for point in points)
+            conditions.append({"key": "chunk_index", "range": {"gt": last_index}})
+        response = session.post(f"{QDRANT_URL}/collections/{COLLECTION_NAME}/points/delete",
+                                params={"wait": "true"}, timeout=60,
+                                json={"filter": {"must": conditions}})
+        response.raise_for_status()
+        return True
+    except requests.RequestException as exc:
+        log.warning("embed: snapshot/tail prune failed for %s: %s", arxiv_id, exc)
+        return False
+
+
+def _complete_paper(conn, arxiv_id):
+    changed = conn.execute("UPDATE papers SET status='done',updated_at=? WHERE arxiv_id=? AND status='chunked'",
+                           (now_iso(), arxiv_id)).rowcount
+    if not changed:
+        conn.commit()
+        return False
+    history = conn.execute("SELECT first_known,completed FROM completion_history WHERE arxiv_id=?",
+                           (arxiv_id,)).fetchone()
+    kind = "reprocessed" if history and history[1] else "first_completed" if history and history[0] else "unknown"
+    conn.execute("INSERT INTO completion_history(arxiv_id,first_known,completed) VALUES (?,0,1) "
+                 "ON CONFLICT(arxiv_id) DO UPDATE SET completed=1", (arxiv_id,))
+    conn.execute(f"UPDATE completion_totals SET {kind}={kind}+1 WHERE singleton=1")
+    _queue_index_sync(conn, arxiv_id)
+    conn.commit()
+    return True
+
+
+def _reconcile_index_sync(conn, session, limit=1):
+    rows = conn.execute("SELECT p.*,s.revision,g.revision AS progress_revision,g.completed AS sync_completed "
+                        "FROM paper_index_sync s JOIN papers p USING(arxiv_id) "
+                        "LEFT JOIN paper_index_sync_progress g USING(arxiv_id) "
+                        "WHERE s.retry_after<=? AND p.status='done' ORDER BY s.retry_after LIMIT ?",
+                        (time.time(), limit)).fetchall()
+    conn.commit()
+    completed = 0
+    for row in rows:
+        arxiv_id, revision = row["arxiv_id"], row["revision"]
+        done = set(json.loads(row["sync_completed"] or "[]")) if row["progress_revision"] == revision else set()
+        operations = (
+            ("qdrant", lambda: _sync_qdrant_metadata(session, row)),
+            ("coarse", lambda: _sync_coarse_index(conn, [arxiv_id])),
+            ("chunk_fts", lambda: _sync_chunk_fts_owned(conn, row)),
+            ("paper_fts", lambda: _sync_paper_fts_owned(conn, [arxiv_id])),
+        )
+        for component, operation in operations:
+            if component in done:
+                continue
+            try:
+                if operation():
+                    done.add(component)
+            except Exception as exc:
+                log.warning("index-sync: %s/%s pending: %s", arxiv_id, component, exc)
+        if len(done) < len(operations):
+            conn.execute("INSERT INTO paper_index_sync_progress(arxiv_id,revision,completed) "
+                         "SELECT ?,?,? WHERE EXISTS(SELECT 1 FROM paper_index_sync WHERE arxiv_id=? AND revision=?) "
+                         "ON CONFLICT(arxiv_id) DO UPDATE SET revision=excluded.revision,completed=excluded.completed",
+                         (arxiv_id, revision, json.dumps(sorted(done)), arxiv_id, revision))
+            conn.execute("UPDATE paper_index_sync SET retry_after=? WHERE arxiv_id=? AND revision=?",
+                         (time.time() + STAGE_ERROR_SLEEP, arxiv_id, revision))
+        else:
+            completed += conn.execute("DELETE FROM paper_index_sync WHERE arxiv_id=? AND revision=?",
+                                      (arxiv_id, revision)).rowcount
+            conn.execute("DELETE FROM paper_index_sync_progress WHERE arxiv_id=? AND revision=?", (arxiv_id, revision))
+        conn.commit()
+    return completed
 
 
 def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT):
+    processed = _reconcile_index_sync(conn, session)
     # Specs and docs first, oldest first after that: they are short, and while
     # thousands of reprocessed 300-chunk papers queued ahead of them, Geyser,
     # RISC Zero and Aave v3 sat unsearchable for a day
@@ -2970,8 +3196,7 @@ def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT):
         (limit,),
     ).fetchall()
     if not rows:
-        return 0
-    processed = 0
+        return processed
     paper_meta = {}
     flat_items = []  # (arxiv_id, chunk_dict), preserves per-paper chunk order across papers
     for row in rows:
@@ -2987,11 +3212,10 @@ def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT):
         if not embeddable:
             # nothing left to embed after the filter (or paper had 0 chunks):
             # safe to close out immediately, still counted 'done' as usual.
-            conn.execute("UPDATE papers SET status='done', updated_at=? WHERE arxiv_id=?", (now_iso(), arxiv_id))
-            conn.commit()
-            processed += 1
-            _sync_coarse_index(conn, [arxiv_id])
-            _sync_paper_fts([arxiv_id])
+            if _upsert_chunk_snapshot(session, arxiv_id, []):
+                fts_write([], [arxiv_id], _fresh_fts_ids(conn, arxiv_id))
+                if _complete_paper(conn, arxiv_id):
+                    processed += 1
             continue
         paper_meta[arxiv_id] = row
         for c in embeddable:
@@ -3075,24 +3299,11 @@ def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT):
                     "url": row["source_url"],
                 },
             })
-        try:
-            for i in range(0, len(points), UPSERT_BATCH_SIZE):
-                batch_pts = points[i:i + UPSERT_BATCH_SIZE]
-                r = session.put(
-                    f"{QDRANT_URL}/collections/{COLLECTION_NAME}/points",
-                    json={"points": batch_pts},
-                    timeout=60,
-                )
-                r.raise_for_status()
-        except requests.RequestException as e:
-            log.warning(f"embed: qdrant upsert failed for {arxiv_id}: {e}")
+        if not _upsert_chunk_snapshot(session, arxiv_id, points):
             return
-        fts_write(points)
-        conn.execute("UPDATE papers SET status='done', updated_at=? WHERE arxiv_id=?", (now_iso(), arxiv_id))
-        conn.commit()
-        processed += 1
-        _sync_coarse_index(conn, [arxiv_id])
-        _sync_paper_fts([arxiv_id])
+        fts_write(points, [arxiv_id], _fresh_fts_ids(conn, arxiv_id))
+        if _complete_paper(conn, arxiv_id):
+            processed += 1
 
     # Batches run concurrently against embed-small; qdrant upsert + status commit
     # happen per-paper, sequentially, in this (main) thread as soon as a paper's
@@ -3212,8 +3423,12 @@ def stage_heartbeat(name, event="ready", processed=None):
         elif event == "end":
             record.update(phase="idle" if not processed else "waiting",
                           ended_at=now, last_success_at=now, processed=processed)
+            record.pop("error_since_at", None)
+            if processed:
+                record["last_progress_at"] = now
         elif event == "error":
             record.update(phase="backoff", ended_at=now)
+            record.setdefault("error_since_at", now)
         else:
             record["phase"] = "starting"
 
@@ -3264,6 +3479,10 @@ def stalled_stages(now=None):
     with _heartbeats_lock:
         stalled = {}
         for name, record in _heartbeats.items():
+            error_since = record.get("error_since_at")
+            if error_since is not None and now - error_since > WATCHDOG_STALL_SECONDS:
+                stalled[name] = "repeated errors without a successful cycle"
+                continue
             busy = record.get("phase") == "busy"
             since = record["started_at"] if busy else record["heartbeat_at"]
             if now - since > WATCHDOG_STALL_SECONDS:
@@ -3275,20 +3494,30 @@ def _stage_loop(name, fn, wants_session):
     conn = get_conn()
     session = requests.Session() if wants_session else None
     log.info(f"stage {name}: started")
-    while True:
-        try:
-            stage_heartbeat(name, "start")
-            processed = fn(conn, session) if wants_session else fn(conn)
-            stage_heartbeat(name, "end", processed)
-            if processed:
-                log.info(f"stage {name}: {processed}")
-                time.sleep(STAGE_BUSY_SLEEP)
-            else:
-                time.sleep(STAGE_IDLE_SLEEP)
-        except Exception:
-            log.exception(f"stage {name} failed, retrying shortly")
-            stage_heartbeat(name, "error")
-            time.sleep(STAGE_ERROR_SLEEP)
+    try:
+        while True:
+            try:
+                stage_heartbeat(name, "start")
+                processed = fn(conn, session) if wants_session else fn(conn)
+                stage_heartbeat(name, "end", processed)
+                if processed:
+                    log.info(f"stage {name}: {processed}")
+                    time.sleep(STAGE_BUSY_SLEEP)
+                else:
+                    time.sleep(STAGE_IDLE_SLEEP)
+            except Exception:
+                log.exception(f"stage {name} failed, retrying shortly")
+                stage_heartbeat(name, "error")
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    conn.close()
+                    conn = get_conn()
+                time.sleep(STAGE_ERROR_SLEEP)
+    finally:
+        conn.close()
+        if session is not None:
+            session.close()
 
 
 def _reporter_loop():
@@ -3658,6 +3887,11 @@ def hal_seed_cursors(conn):
             "INSERT OR IGNORE INTO harvest_cursor "
             "(query_key,next_start,done,layer) VALUES (?,0,0,'web3')", (f"{HAL_CURSOR_PREFIX}{idx}",))
         added += conn.total_changes - before
+    cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - HAL_REFRESH_SECONDS))
+    conn.execute(
+        "UPDATE harvest_cursor SET next_start=0,done=0,last_run_at=NULL "
+        "WHERE query_key LIKE 'hal-v2@%' AND done=1 AND (last_run_at IS NULL OR last_run_at<=?)",
+        (cutoff,))
     conn.commit()
     if added:
         log.info(f"hal: {added} durable query cursors queued")

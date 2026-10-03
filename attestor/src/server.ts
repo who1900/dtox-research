@@ -13,11 +13,11 @@ import {
 import {
   attestVerdict,
   getAttestation,
-  ensureCredential,
-  ensureSchema,
-  getChainContext,
+  getInitializationState,
+  AttestationConflictError,
+  AttestationBusyError,
+  parseIssuedAtTimestamp,
   explorerUrl,
-  deriveCredentialAddress,
 } from "./sas.js";
 import { address } from "@solana/kit";
 
@@ -28,18 +28,26 @@ const INTERNAL_TOKEN = process.env.ATTESTOR_INTERNAL_TOKEN ?? "";
 const MAX_CLAIM_TEXT_LEN = 20_000;
 const MAX_REVIEWER_REQUESTS_PER_HOUR = 30;
 const rateLimitWindowMs = 60 * 60 * 1000;
-const reviewerHits = new Map<string, number[]>();
+const MAX_CONCURRENT_SIGNATURE_CHECKS = 32;
 
-function checkRateLimit(reviewer: string): boolean {
-  const now = Date.now();
-  const hits = (reviewerHits.get(reviewer) ?? []).filter((t) => now - t < rateLimitWindowMs);
-  if (hits.length >= MAX_REVIEWER_REQUESTS_PER_HOUR) {
+export function createReviewerRateLimiter(maxReviewers = 10_000, clock = Date.now) {
+  const reviewerHits = new Map<string, number[]>();
+  let nextCleanup = 0;
+  return (reviewer: string): "allowed" | "quota" | "capacity" => {
+    const now = clock();
+    if (now >= nextCleanup) {
+      for (const [key, hits] of reviewerHits) {
+        if (now - hits[hits.length - 1] >= rateLimitWindowMs) reviewerHits.delete(key);
+      }
+      nextCleanup = now + 60_000;
+    }
+    if (!reviewerHits.has(reviewer) && reviewerHits.size >= maxReviewers) return "capacity";
+    const hits = (reviewerHits.get(reviewer) ?? []).filter((t) => now - t < rateLimitWindowMs);
+    if (hits.length >= MAX_REVIEWER_REQUESTS_PER_HOUR) return "quota";
+    hits.push(now);
     reviewerHits.set(reviewer, hits);
-    return false;
-  }
-  hits.push(now);
-  reviewerHits.set(reviewer, hits);
-  return true;
+    return "allowed";
+  };
 }
 
 interface AttestBody {
@@ -80,7 +88,14 @@ function requireInternalToken(req: express.Request, res: express.Response, next:
   next();
 }
 
-export function buildApp(): express.Express {
+export function buildApp(dependencies: Partial<{
+  attestVerdict: typeof attestVerdict;
+  getAttestation: typeof getAttestation;
+  getInitializationState: typeof getInitializationState;
+}> = {}): express.Express {
+  const operations = { attestVerdict, getAttestation, getInitializationState, ...dependencies };
+  const checkRateLimit = createReviewerRateLimiter();
+  let activeSignatureChecks = 0;
   const app = express();
   app.disable("x-powered-by");
   app.use(express.json({ limit: "64kb" }));
@@ -88,26 +103,11 @@ export function buildApp(): express.Express {
 
   app.get("/healthz", async (_req, res) => {
     try {
-      const ctx = await getChainContext();
-      const credential = await deriveCredentialAddress(ctx.authority.address);
-      const { value: balance } = await ctx.rpc.getBalance(ctx.authority.address).send();
-      let credentialExists = false;
-      let schemaExists = false;
-      try {
-        await ensureCredential();
-        credentialExists = true;
-        await ensureSchema(credential);
-        schemaExists = true;
-      } catch {
-        // report what we know even if ensure* can't reach the chain right now
-      }
-      res.json({
-        status: "ok",
-        authority: ctx.authority.address,
-        credential,
-        credential_exists: credentialExists,
-        schema_exists: schemaExists,
-        balance_lamports: balance.toString(),
+      const state = await operations.getInitializationState();
+      const initialized = state.credential_exists && state.schema_exists;
+      res.status(initialized ? 200 : 503).json({
+        status: initialized ? "ok" : "not_initialized",
+        ...state,
         rpc_url: process.env.SOLANA_RPC_URL ?? "https://api.devnet.solana.com",
       });
     } catch (error) {
@@ -193,13 +193,12 @@ export function buildApp(): express.Express {
       return;
     }
     try {
+      if (!Number.isFinite(parseIssuedAtTimestamp(issuedAt))) {
+        throw new Error("issued_at must be a valid ISO 8601 timestamp");
+      }
       checkIssuedAtWindow(issuedAt);
     } catch (error) {
       badRequest(res, error instanceof Error ? error.message : "invalid issued_at");
-      return;
-    }
-    if (!checkRateLimit(reviewer)) {
-      res.status(429).json({ error: "rate limit exceeded (30 verdicts/hour per reviewer)" });
       return;
     }
     try {
@@ -225,14 +224,33 @@ export function buildApp(): express.Express {
       return;
     }
 
-    const valid = await verifyVerdictSignature(message, signature, reviewer);
+    if (activeSignatureChecks >= MAX_CONCURRENT_SIGNATURE_CHECKS) {
+      res.status(503).json({ error: "signature verification capacity exceeded; retry later" });
+      return;
+    }
+    let valid: boolean;
+    activeSignatureChecks++;
+    try {
+      valid = await verifyVerdictSignature(message, signature, reviewer);
+    } finally {
+      activeSignatureChecks--;
+    }
     if (!valid) {
       badRequest(res, "signature does not verify against reviewer's public key over the canonical message");
       return;
     }
+    const rateLimit = checkRateLimit(reviewer);
+    if (rateLimit === "capacity") {
+      res.status(503).json({ error: "reviewer rate limiter capacity exceeded; retry later" });
+      return;
+    }
+    if (rateLimit === "quota") {
+      res.status(429).json({ error: "rate limit exceeded (30 verdicts/hour per reviewer)" });
+      return;
+    }
 
     try {
-      const result = await attestVerdict({
+      const result = await operations.attestVerdict({
         claimId,
         claimSha256,
         paperId,
@@ -248,17 +266,19 @@ export function buildApp(): express.Express {
         explorer_url: explorerUrl(result.signature ? "tx" : "address", result.signature ?? result.pda),
         reused: result.reused,
         claim_sha256: claimSha256,
+        issued_at_epoch_ms: Date.parse(issuedAt),
         normalized_claim_preview: normalizeClaimText(claimText).slice(0, 200),
       });
     } catch (error) {
-      res.status(502).json({ error: error instanceof Error ? error.message : "attestation failed" });
+      const status = error instanceof AttestationConflictError ? 409 : error instanceof AttestationBusyError ? 503 : 502;
+      res.status(status).json({ error: error instanceof Error ? error.message : "attestation failed" });
     }
   });
 
   app.get("/attestation/:pda", async (req, res) => {
     try {
       const pda = address(req.params.pda);
-      const record = await getAttestation(pda);
+      const record = await operations.getAttestation(pda);
       if (!record) {
         res.status(404).json({ error: "no attestation at that address" });
         return;

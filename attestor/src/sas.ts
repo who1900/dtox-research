@@ -165,6 +165,57 @@ async function sendInstructions(ctx: ChainContext, instructions: readonly Instru
   return getSignatureFromTransaction(signedTransaction);
 }
 
+const chainOperations = {
+  getChainContext,
+  fetchMaybeCredential,
+  fetchMaybeSchema,
+  fetchMaybeAttestation,
+  fetchSchema,
+  sendInstructions,
+};
+
+export class AttestationConflictError extends Error {}
+export class AttestationBusyError extends Error {}
+
+const MAX_LOCKED_PDAS = 256;
+const MAX_PENDING_PER_PDA = 32;
+const READ_CONFIG = { commitment: "confirmed" } as const;
+const attestationLocks = new Map<string, { tail: Promise<void>; pending: number }>();
+
+async function withAttestationLock<T>(pda: Address, run: () => Promise<T>): Promise<T> {
+  let lock = attestationLocks.get(pda);
+  if (!lock) {
+    if (attestationLocks.size >= MAX_LOCKED_PDAS) {
+      throw new AttestationBusyError("too many attestation updates in flight");
+    }
+    lock = { tail: Promise.resolve(), pending: 0 };
+    attestationLocks.set(pda, lock);
+  }
+  if (lock.pending >= MAX_PENDING_PER_PDA) {
+    throw new AttestationBusyError("too many pending updates for this attestation");
+  }
+  const previous = lock.tail;
+  let release!: () => void;
+  lock.tail = new Promise<void>((resolve) => { release = resolve; });
+  lock.pending++;
+  try {
+    await previous;
+    return await run();
+  } finally {
+    release();
+    if (--lock.pending === 0) attestationLocks.delete(pda);
+  }
+}
+
+export function parseIssuedAtTimestamp(value: string): number {
+  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$/.exec(value);
+  const timestamp = Date.parse(value);
+  if (!match || !Number.isFinite(timestamp)) return NaN;
+  const localIso = `${match[1]}.${(match[2] ?? "").slice(0, 3).padEnd(3, "0")}Z`;
+  const localTimestamp = Date.parse(localIso);
+  return Number.isFinite(localTimestamp) && new Date(localTimestamp).toISOString() === localIso ? timestamp : NaN;
+}
+
 export async function requestDevnetAirdrop(solAmount = 1): Promise<string> {
   const ctx = await getChainContext();
   const rpcUrl = process.env.SOLANA_RPC_URL ?? "https://api.devnet.solana.com";
@@ -189,11 +240,11 @@ export async function deriveSchemaAddress(credential: Address): Promise<Address>
 }
 
 /** Idempotent: returns the existing Credential PDA if one is already there. */
-export async function ensureCredential(): Promise<Address> {
-  const ctx = await getChainContext();
+export async function ensureCredential(operations = chainOperations): Promise<Address> {
+  const ctx = await operations.getChainContext();
   const credentialAddress = await deriveCredentialAddress(ctx.authority.address);
 
-  const maybe = await fetchMaybeCredential(ctx.rpc, credentialAddress);
+  const maybe = await operations.fetchMaybeCredential(ctx.rpc, credentialAddress, READ_CONFIG);
   if (maybe.exists) return credentialAddress;
 
   const instruction = getCreateCredentialInstruction({
@@ -203,16 +254,16 @@ export async function ensureCredential(): Promise<Address> {
     name: CREDENTIAL_NAME,
     signers: [ctx.authority.address],
   });
-  await sendInstructions(ctx, [instruction]);
+  await operations.sendInstructions(ctx, [instruction]);
   return credentialAddress;
 }
 
 /** Idempotent: returns the existing Schema PDA if one is already there. */
-export async function ensureSchema(credentialAddress: Address): Promise<Address> {
-  const ctx = await getChainContext();
+export async function ensureSchema(credentialAddress: Address, operations = chainOperations): Promise<Address> {
+  const ctx = await operations.getChainContext();
   const schemaAddress = await deriveSchemaAddress(credentialAddress);
 
-  const maybe = await fetchMaybeSchema(ctx.rpc, schemaAddress);
+  const maybe = await operations.fetchMaybeSchema(ctx.rpc, schemaAddress, READ_CONFIG);
   if (maybe.exists) return schemaAddress;
 
   const instruction = getCreateSchemaInstruction({
@@ -225,8 +276,27 @@ export async function ensureSchema(credentialAddress: Address): Promise<Address>
     layout: FIELD_LAYOUT,
     fieldNames: [...FIELD_NAMES],
   });
-  await sendInstructions(ctx, [instruction]);
+  await operations.sendInstructions(ctx, [instruction]);
   return schemaAddress;
+}
+
+export async function getInitializationState(operations = chainOperations) {
+  const ctx = await operations.getChainContext();
+  const credential = await deriveCredentialAddress(ctx.authority.address);
+  const schema = await deriveSchemaAddress(credential);
+  const [credentialAccount, schemaAccount, { value: balance }] = await Promise.all([
+    operations.fetchMaybeCredential(ctx.rpc, credential, READ_CONFIG),
+    operations.fetchMaybeSchema(ctx.rpc, schema, READ_CONFIG),
+    ctx.rpc.getBalance(ctx.authority.address, READ_CONFIG).send(),
+  ]);
+  return {
+    authority: ctx.authority.address,
+    credential,
+    schema,
+    credential_exists: credentialAccount.exists,
+    schema_exists: schemaAccount.exists,
+    balance_lamports: balance.toString(),
+  };
 }
 
 /** One attestation per (claim, paper, reviewer): nonce is derived, never random. */
@@ -284,72 +354,69 @@ export interface AttestResult {
 /**
  * Attests a verdict. Idempotent on (claim_id, paper_id, reviewer): a repeat
  * of the exact same record returns the existing attestation untouched. A
- * changed verdict for the same triple closes the old attestation and creates
+ * strictly newer verdict for the same triple closes the old attestation and creates
  * a fresh one in the same transaction, so there is never more than one live
  * attestation per (claim, paper, reviewer).
  */
-export async function attestVerdict(record: AttestationRecord): Promise<AttestResult> {
-  const ctx = await getChainContext();
-  const credential = await ensureCredential();
-  const schemaAddress = await ensureSchema(credential);
-  const schemaAccount = await fetchSchema(ctx.rpc, schemaAddress);
-
+export async function attestVerdict(record: AttestationRecord, operations = chainOperations): Promise<AttestResult> {
+  const issuedAt = parseIssuedAtTimestamp(record.issuedAt);
+  if (!Number.isFinite(issuedAt)) throw new Error("issued_at must be a valid ISO 8601 timestamp");
+  const ctx = await operations.getChainContext();
+  const credential = await deriveCredentialAddress(ctx.authority.address);
+  const schemaAddress = await deriveSchemaAddress(credential);
   const nonce = deriveVerdictNonce(record.claimId, record.paperId, record.reviewer);
   const [attestationPda] = await deriveAttestationPda({ credential, schema: schemaAddress, nonce });
 
-  const existing = await fetchMaybeAttestation(ctx.rpc, attestationPda);
-  const dataBytes = serializeAttestationData(schemaAccount.data, recordToDataObject(record));
-
-  if (existing.exists) {
-    const existingRecord = dataObjectToRecord(
-      deserializeAttestationData<Record<string, unknown>>(schemaAccount.data, Uint8Array.from(existing.data.data))
-    );
-    if (sameRecord(existingRecord, record)) {
-      return { pda: attestationPda, signature: null, reused: true };
+  return withAttestationLock(attestationPda, async () => {
+    // Process-local only; never expire an active write and let another one overlap.
+    await ensureCredential(operations);
+    await ensureSchema(credential, operations);
+    const schemaAccount = await operations.fetchSchema(ctx.rpc, schemaAddress, READ_CONFIG);
+    const existing = await operations.fetchMaybeAttestation(ctx.rpc, attestationPda, READ_CONFIG);
+    const instructions: Instruction[] = [];
+    if (existing.exists) {
+      const existingRecord = dataObjectToRecord(
+        deserializeAttestationData<Record<string, unknown>>(schemaAccount.data, Uint8Array.from(existing.data.data))
+      );
+      const existingIssuedAt = parseIssuedAtTimestamp(existingRecord.issuedAt);
+      if (!Number.isFinite(existingIssuedAt)) {
+        throw new AttestationConflictError("persisted issued_at is malformed; refusing to replace attestation");
+      }
+      if (sameRecord(existingRecord, record)) {
+        return { pda: attestationPda, signature: null, reused: true };
+      }
+      if (issuedAt <= existingIssuedAt) {
+        throw new AttestationConflictError("verdict is older than or conflicts with the current attestation");
+      }
+      instructions.push(getCloseAttestationInstruction({
+        payer: ctx.authority,
+        authority: ctx.authority,
+        credential,
+        attestation: attestationPda,
+      }));
     }
-
-    const closeIx = getCloseAttestationInstruction({
-      payer: ctx.authority,
-      authority: ctx.authority,
-      credential,
-      attestation: attestationPda,
-    });
-    const createIx = getCreateAttestationInstruction({
+    instructions.push(getCreateAttestationInstruction({
       payer: ctx.authority,
       authority: ctx.authority,
       credential,
       schema: schemaAddress,
       attestation: attestationPda,
       nonce,
-      data: dataBytes,
+      data: serializeAttestationData(schemaAccount.data, recordToDataObject(record)),
       expiry: 0n,
-    });
-    const signature = await sendInstructions(ctx, [closeIx, createIx]);
+    }));
+    const signature = await operations.sendInstructions(ctx, instructions);
     return { pda: attestationPda, signature, reused: false };
-  }
-
-  const createIx = getCreateAttestationInstruction({
-    payer: ctx.authority,
-    authority: ctx.authority,
-    credential,
-    schema: schemaAddress,
-    attestation: attestationPda,
-    nonce,
-    data: dataBytes,
-    expiry: 0n,
   });
-  const signature = await sendInstructions(ctx, [createIx]);
-  return { pda: attestationPda, signature, reused: false };
 }
 
-export async function getAttestation(pda: Address): Promise<AttestationRecord | null> {
-  const ctx = await getChainContext();
-  const credential = await ensureCredential();
-  const schemaAddress = await ensureSchema(credential);
-  const schemaAccount = await fetchSchema(ctx.rpc, schemaAddress);
-
-  const maybe = await fetchMaybeAttestation(ctx.rpc, pda);
+export async function getAttestation(pda: Address, operations = chainOperations): Promise<AttestationRecord | null> {
+  const ctx = await operations.getChainContext();
+  const maybe = await operations.fetchMaybeAttestation(ctx.rpc, pda, READ_CONFIG);
   if (!maybe.exists) return null;
+  const credential = await deriveCredentialAddress(ctx.authority.address);
+  const schemaAddress = await deriveSchemaAddress(credential);
+  const schemaAccount = await operations.fetchSchema(ctx.rpc, schemaAddress, READ_CONFIG);
   const decoded = deserializeAttestationData<Record<string, unknown>>(
     schemaAccount.data,
     Uint8Array.from(maybe.data.data)
