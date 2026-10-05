@@ -1,12 +1,12 @@
 <p align="center">
-  <img src="presentation/pitch-2026-10-05/cover.png" alt="dtox research: evidence infrastructure for Web3 builders" width="100%">
+  <img src="presentation/pitch-visual/cover.png" alt="dtox research: source-grounded Web3 research for builders" width="100%">
 </p>
 
 # dtox research
 
-**Web3 research your agent can build from.** A free MCP research service with embeddings-based vector search over structured papers and protocol specifications, returning cited evidence for agents and builders.
+**dtox helps AI agents test Web3 ideas against scientific research.** A free MCP research service with embeddings-based vector search over structured papers and protocol specifications, returning cited evidence for agents and builders.
 
-[Live research](https://read.whoim.space/research/) · [Free MCP endpoint](https://read.whoim.space/mcp) · [Technical reference](docs/technical-reference.md) · [Pitch deck](presentation/pitch-2026-10-05/dtox-research-pitch.pptx)
+[Live research](https://read.whoim.space/research/) · [Free MCP endpoint](https://read.whoim.space/mcp) · [Technical reference](docs/technical-reference.md) · [Visual pitch deck](presentation/pitch-visual/dtox-research-visual.pptx)
 
 ## The problem
 
@@ -77,19 +77,21 @@ Then ask your agent to discover available papers first, read the source, and rep
 
 These are product milestones, not customer traction or a commitment to a launch date. More detail: [pitch roadmap](docs/pitch-roadmap.md).
 
-## Evidence snapshot · as of 2026-10-05 09:30Z
+## Observed corpus counters · 2026-10-05T10:00Z
 
-**180,833 indexed documents** · **17,365 Web3 documents** · **10,801,846 indexed chunks**
+**180,834 indexed documents** · **17,365 Web3 records** · **10,801,902 indexed chunks** · **3,388,476 citation edges**
 
-Counts describe indexed records and chunks, not customers, active usage, or universally available full text. The live [stats endpoint](https://read.whoim.space/research/stats.json) is the source for current counts; snapshot values can change.
+These counters were observed at 2026-10-05T10:00Z; this is not a frozen or reproducible index version. They describe indexed records, chunks, and citation links, not customers, active usage, or universally available full text. Full-text availability varies by record. The live [stats endpoint](https://read.whoim.space/research/stats.json) is the source for current counts; values change.
 
 ## Resources
 
 - [Live research interface](https://read.whoim.space/research/)
 - [MCP endpoint](https://read.whoim.space/mcp)
-- [Pitch deck PDF](presentation/pitch-2026-10-05/dtox-research-pitch.pdf)
-- [Editable pitch deck](presentation/pitch-2026-10-05/dtox-research-pitch.pptx)
-- [Browser deck file](presentation/pitch-2026-10-05/index.html) (download/open locally; not hosted as a live web page)
+- [Pitch deck PDF](presentation/pitch-visual/dtox-research-visual.pdf)
+- [Editable pitch deck](presentation/pitch-visual/dtox-research-visual.pptx)
+- [Browser deck file](presentation/pitch-visual/index.html) (download/open locally; not hosted as a live web page)
+- [Pitch evidence ledger](presentation/pitch-visual/evidence.md)
+- [Pitch QA questions](presentation/pitch-visual/QA-questions.md)
 - [Judges’ guide: proof, boundaries, and alternatives](docs/judges-guide.md)
 - [Full technical reference and original README](docs/technical-reference.md)
 - [AGPL-3.0 license](LICENSE)
@@ -97,7 +99,7 @@ Counts describe indexed records and chunks, not customers, active usage, or univ
 
 ## Founder
 
-Daniyar Gabdullin · Solo founder. Independent mobile/Web3/AI engineer since 2019, with blockchain and wallet QA experience. Previous Solana mobile work includes SeekerVault and X-Booster/Aibat. [Portfolio](https://portfolio.whoim.space/) · [LinkedIn](https://www.linkedin.com/in/daniyar-gabdullin-11312b252/) · [CV](https://portfolio.whoim.space/Daniyar_Gabdullin_CV.pdf)
+Daniyar Gabdullin · Solo founder and mobile/Web3 engineer, with blockchain, dApp, and wallet QA experience. [Portfolio](https://portfolio.whoim.space/) · [LinkedIn](https://www.linkedin.com/in/daniyar-gabdullin-11312b252/) · [CV](https://portfolio.whoim.space/Daniyar_Gabdullin_CV.pdf)
 
 ---
 
