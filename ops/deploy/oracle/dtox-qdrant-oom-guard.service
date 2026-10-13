@@ -1,0 +1,28 @@
+[Unit]
+Description=Protect the verified local qdrant process from host OOM
+After=docker.service
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 -I -B /opt/dtox-research/ops/qdrant_oom_guard.py
+TimeoutStartSec=20
+MemoryMax=64M
+CPUQuota=20%
+TasksMax=16
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_SYS_RESOURCE
+AmbientCapabilities=CAP_SYS_RESOURCE
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+# Must see the host PID and permit its oom_score_adj write.
+ProtectProc=default
+ProcSubset=all
