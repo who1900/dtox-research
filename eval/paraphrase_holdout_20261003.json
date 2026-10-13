@@ -1,0 +1,143 @@
+{
+  "dataset": "paraphrase-holdout-20261003",
+  "scope_notes": [
+    "Disjoint sidecar of 12 newly authored English queries in four mechanism groups; no paper identifiers or names appear in queries.",
+    "Targets and hard negatives are known-source anchors. A hit measures retrieval of a known source only, not precision or exhaustive coverage.",
+    "Comparators are focal-mechanism contrasts, not claims that the compared works are wholly irrelevant.",
+    "Mechanism labels and source identities were checked against primary arXiv abstracts, and the HotStuff comparator against the original Bitcoin white paper."
+  ],
+  "groups": [
+    {
+      "id": "llm-grpo-vs-preference-objective",
+      "layer": "llm-slm",
+      "mechanism": "Group-relative policy optimization for mathematical reasoning compares sampled responses within a group to form relative advantages, avoiding a separate critic model.",
+      "targets": [
+        {
+          "canonical_id": "2402.03300",
+          "aliases": [],
+          "source_url": "https://arxiv.org/abs/2402.03300"
+        }
+      ],
+      "hard_negatives": [
+        {
+          "id": "2305.18290",
+          "reason": "Directly optimizes a preference-based classification objective from chosen and rejected responses; this is a different focal mechanism from group-relative policy advantages.",
+          "source_url": "https://arxiv.org/abs/2305.18290"
+        }
+      ],
+      "phrases": [
+        {
+          "id": "sample-group-relative-signal",
+          "query": "For mathematical reasoning, estimate each completion's policy update signal by comparing its reward with other completions sampled for the same problem, without training a value critic"
+        },
+        {
+          "id": "criticless-relative-advantages",
+          "query": "Which reinforcement-learning approach forms advantages from a batch of sibling responses and uses no separate critic network?"
+        },
+        {
+          "id": "within-prompt-baseline",
+          "query": "Improve a language model's math solutions by using outcomes within each prompt's response group as the baseline for policy learning"
+        }
+      ]
+    },
+    {
+      "id": "llm-low-rank-adaptation-vs-prefix",
+      "layer": "llm-slm",
+      "mechanism": "Low-rank adaptation freezes pretrained model weights and trains injected low-rank matrix factors as updates to model layers.",
+      "targets": [
+        {
+          "canonical_id": "2106.09685",
+          "aliases": [],
+          "source_url": "https://arxiv.org/abs/2106.09685"
+        }
+      ],
+      "hard_negatives": [
+        {
+          "id": "2101.00190",
+          "reason": "Prefix tuning keeps model weights frozen but learns continuous task-specific prefix vectors, rather than injecting trainable low-rank matrix factors into model layers.",
+          "source_url": "https://arxiv.org/abs/2101.00190"
+        }
+      ],
+      "phrases": [
+        {
+          "id": "factorized-layer-updates",
+          "query": "Adapt a pretrained transformer while leaving its original weights fixed, by adding trainable rank-decomposed matrices inside its layers"
+        },
+        {
+          "id": "compact-matrix-deltas",
+          "query": "What parameter-efficient method represents task-specific weight changes with two small matrices whose product has low rank?"
+        },
+        {
+          "id": "frozen-backbone-rank-factors",
+          "query": "Keep the backbone parameters frozen and learn low-dimensional matrix factors that modify selected projections for a downstream task"
+        }
+      ]
+    },
+    {
+      "id": "llm-self-consistency-vs-single-chain",
+      "layer": "llm-slm",
+      "mechanism": "Self-consistency samples multiple chain-of-thought reasoning paths and selects an answer by aggregating their final answers, commonly with a majority vote.",
+      "targets": [
+        {
+          "canonical_id": "2203.11171",
+          "aliases": [],
+          "source_url": "https://arxiv.org/abs/2203.11171"
+        }
+      ],
+      "hard_negatives": [
+        {
+          "id": "2201.11903",
+          "reason": "Introduces chain-of-thought prompting with demonstrations to elicit intermediate reasoning; the focal method here does not aggregate answers across multiple sampled reasoning paths.",
+          "source_url": "https://arxiv.org/abs/2201.11903"
+        }
+      ],
+      "phrases": [
+        {
+          "id": "sample-and-vote",
+          "query": "At inference time, generate several independent reasoning traces for one question and return the answer that appears most often"
+        },
+        {
+          "id": "aggregate-final-responses",
+          "query": "How can multiple sampled step-by-step solutions be combined by voting over their final results to improve reasoning accuracy?"
+        },
+        {
+          "id": "diverse-rationales-consensus",
+          "query": "Instead of trusting one generated derivation, draw many reasoning paths and use agreement among their answers as the prediction"
+        }
+      ]
+    },
+    {
+      "id": "web3-hotstuff-vs-proof-of-work",
+      "layer": "web3",
+      "mechanism": "A leader-based three-phase Byzantine fault-tolerant consensus protocol uses quorum certificates and achieves linear communication in the number of replicas during leader failover.",
+      "targets": [
+        {
+          "canonical_id": "1803.05069",
+          "aliases": ["oa:W2964159515"],
+          "source_url": "https://arxiv.org/abs/1803.05069"
+        }
+      ],
+      "hard_negatives": [
+        {
+          "id": "wp:bitcoin",
+          "reason": "Describes Nakamoto-style proof-of-work and longest-chain consensus, a distinct consensus mechanism from leader-based Byzantine fault tolerance with quorum certificates.",
+          "source_url": "https://bitcoin.org/bitcoin.pdf"
+        }
+      ],
+      "phrases": [
+        {
+          "id": "three-phase-quorum-certificates",
+          "query": "A leader-driven Byzantine consensus protocol uses three voting phases and chained quorum certificates to commit blocks"
+        },
+        {
+          "id": "linear-replica-communication",
+          "query": "Which blockchain BFT design keeps communication linear in the replica count, including when leadership changes?"
+        },
+        {
+          "id": "responsive-bft-leader-failover",
+          "query": "Replicated state-machine consensus with a rotating leader, quorum-certified proposals, and lower communication overhead during leader recovery"
+        }
+      ]
+    }
+  ]
+}

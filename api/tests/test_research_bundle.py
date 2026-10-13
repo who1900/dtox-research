@@ -6,10 +6,101 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from api import main
-from api.research_bundle import BUNDLE_CHUNK_LIMIT, ResearchBundleBody
+from api.evidence import provenance
+from api.research_bundle import BUNDLE_CHUNK_LIMIT, ResearchBundleBody, build_bundle
 
 
 class ResearchBundleTests(unittest.TestCase):
+    def test_retrieval_envelope_uses_canonical_math_provenance(self):
+        hit = {"arxiv_id": "legacy:7", "title": "Selected title", "score": 0.8, "fulltext": True}
+        envelope = {"sources": [
+            {"id": "legacy:7", "points": [{"payload": {"arxiv_id": "legacy:7", "text": "PDF prose",
+                                                              "element_type": "paragraph"}}],
+             "metadata": {"fulltext_source": "whitepaper-pdf"}, "passport": {"url": "https://x.test/pdf"}},
+            {"id": "arxiv:1234.5", "points": [{"payload": {"arxiv_id": "arxiv:1234.5", "text": "x^2=1",
+                                                                   "element_type": "equation", "chunk_index": 1}}],
+             "metadata": {"fulltext_source": "latex"}, "passport": {"url": "https://arxiv.org/pdf/1234.5"}}],
+            "resolution": {"requested_id": "legacy:7", "source_ids": ["legacy:7", "arxiv:1234.5"],
+                           "attempted_ids": ["legacy:7", "arxiv:1234.5"], "partial": False,
+                           "time_budget_exhausted": False}}
+        out = build_bundle(ResearchBundleBody(query="q"), {"partial": False}, [hit], lambda _pid: envelope)
+        paper, math = out["papers"][0], out["equations"][0]
+        self.assertEqual((paper["id"], paper["title"], paper["score"]), ("legacy:7", "Selected title", 0.8))
+        self.assertEqual(math["paper_id"], "legacy:7")
+        self.assertEqual(math["source_paper_id"], "arxiv:1234.5")
+        self.assertEqual(math["evidence"]["source_paper_id"], "arxiv:1234.5")
+        self.assertEqual(math["evidence"]["source_url"], "https://arxiv.org/pdf/1234.5")
+        self.assertEqual(math["evidence"]["acquisition_type"], "latex")
+        self.assertTrue(math["evidence"]["exact_latex"])
+        expected_hash = provenance("arxiv:1234.5", {"text": "x^2=1", "element_type": "equation"},
+                                   {"fulltext_source": "latex"}, "https://arxiv.org/pdf/1234.5",
+                                   scope="indexed_chunk")["fragment_hash"]
+        self.assertEqual(math["evidence"]["fragment_hash"], expected_hash)
+        self.assertEqual(paper["source_resolution"], envelope["resolution"])
+
+    def test_envelope_deduplicates_sources_and_preserves_requested_origin(self):
+        hit = {"arxiv_id": "p", "title": "P"}
+        envelope = {"sources": [
+            {"id": "p", "points": [{"payload": {"arxiv_id": "p", "text": "requested equation",
+                                                       "element_type": "equation"}}], "metadata": {}, "passport": {}},
+            {"id": "alias", "points": [{"payload": {"arxiv_id": "alias", "text": "duplicate equation",
+                                                           "element_type": "equation"}},
+                                          {"payload": {"arxiv_id": "alias", "text": "alias algorithm",
+                                                        "element_type": "algorithm"}}],
+             "metadata": {}, "passport": {}}],
+                    "resolution": {"partial": False}}
+        out = build_bundle(ResearchBundleBody(query="q"), {}, [hit], lambda _pid: envelope)
+        self.assertEqual(len(out["equations"]), 1)
+        self.assertEqual(out["equations"][0]["source_paper_id"], "p")
+        self.assertEqual(out["algorithms"][0]["source_paper_id"], "alias")
+
+    def test_envelope_rejects_payload_id_mismatch(self):
+        hit = {"arxiv_id": "p", "fulltext": True}
+        envelope = {"sources": [{"id": "alias", "points": [{"payload": {"arxiv_id": "attacker",
+                                                                                "text": "x=1", "element_type": "equation"}}],
+                                  "metadata": {}, "passport": {}}],
+                    "resolution": {"partial": True}}
+        out = build_bundle(ResearchBundleBody(query="q"), {}, [hit], lambda _pid: envelope)
+        self.assertEqual(out["equations"], [])
+        self.assertTrue(out["papers"][0]["partial"])
+
+    def test_partial_time_budget_envelope_keeps_requested_evidence(self):
+        hit = {"arxiv_id": "p", "fulltext": True}
+        envelope = {"sources": [{"id": "p", "points": [{"payload": {"arxiv_id": "p", "text": "x=1",
+                                                                              "element_type": "equation"}}],
+                                  "metadata": {}, "passport": {}}],
+                    "resolution": {"partial": True, "time_budget_exhausted": True}}
+        out = build_bundle(ResearchBundleBody(query="q"), {}, [hit], lambda _pid: envelope)
+        self.assertEqual(len(out["equations"]), 1)
+        self.assertTrue(out["papers"][0]["partial"])
+        self.assertEqual(out["papers"][0]["missing"]["algorithms"], "time_budget")
+
+    def test_source_attribution_metadata_survives_bundle_when_fragment_has_no_title(self):
+        url = "https://docs.example.org/whitepaper.pdf"
+        hit = {"arxiv_id": "wp:bundle", "title": "Whitepaper title", "url": url,
+               "source": "Industry whitepaper", "fulltext": True,
+               "completeness": "fulltext_acquired", "provenance_missing": False,
+               "source_url_origin": "curated_historical_list",
+               "source_url_status": "syntax_only_source_not_verified",
+               "legacy_id_alias": "preserved alias",
+               "evidence": {"acquisition_type": "whitepaper-pdf",
+                            "source_url_origin": "curated_historical_list",
+                            "source_url_status": "syntax_only_source_not_verified",
+                            "legacy_id_alias": "preserved alias"}}
+        result = build_bundle(
+            ResearchBundleBody(query="method"), {"results": [hit]}, [hit],
+            lambda _pid: [{"payload": {"arxiv_id": "wp:bundle", "text": "x=1",
+                                        "element_type": "equation"}}])
+        paper = result["papers"][0]
+        evidence = result["equations"][0]["evidence"]
+        self.assertEqual(paper["source_url_origin"], "curated_historical_list")
+        self.assertEqual(paper["source_url_status"], "syntax_only_source_not_verified")
+        self.assertEqual(paper["legacy_id_alias"], "preserved alias")
+        self.assertEqual(evidence["source_url"], url)
+        self.assertEqual(evidence["source_url_origin"], paper["source_url_origin"])
+        self.assertEqual(evidence["source_url_status"], paper["source_url_status"])
+        self.assertEqual(evidence["legacy_id_alias"], paper["legacy_id_alias"])
+
     def _run(self, hits=None, points=None, **kwargs):
         hits = hits if hits is not None else [{"arxiv_id": "acl:x", "title": "Paper", "score": 0.9}]
         rows = {h["arxiv_id"]: {"fulltext_source": "acl-pdf", "source_url": "https://example.test/p.pdf"} for h in hits}
@@ -19,6 +110,7 @@ class ResearchBundleTests(unittest.TestCase):
             {"payload": {"text": "Do X", "element_type": "algorithm", "chunk_index": 1}},
             {"payload": {"text": "Limited", "section_type": "limitations", "chunk_index": 3}}]
         with (patch.object(main, "auth_and_limit"),
+              patch.object(main, "_twins", return_value={"canonical": {}, "members": {}}),
               patch.object(main, "_run_search", return_value={"results": hits, "partial": kwargs.pop("partial", False)}) as search,
               patch.object(main, "_paper_rows", return_value=rows) as metadata,
               patch.object(main, "qdrant_scroll_by_arxiv", return_value=points) as scroll):
@@ -59,6 +151,7 @@ class ResearchBundleTests(unittest.TestCase):
         flood.append({"payload": {"text": "Important limitation", "section_type": "limitations", "chunk_index": 99}})
         second = [{"payload": {"text": "Second paper algorithm", "element_type": "algorithm"}}]
         with (patch.object(main, "auth_and_limit"),
+              patch.object(main, "_twins", return_value={"canonical": {}, "members": {}}),
               patch.object(main, "_run_search", return_value={"results": hits}),
               patch.object(main, "qdrant_scroll_by_arxiv", side_effect=[flood, second]) as scroll):
             out = main.research_bundle(ResearchBundleBody(query="q", limit=2, max_chars=12000))
@@ -112,6 +205,7 @@ class ResearchBundleTests(unittest.TestCase):
     def test_retrieval_failure_and_chunk_cap_are_partial(self):
         for response in (HTTPException(502, "failed"), [{"payload": {}}] * BUNDLE_CHUNK_LIMIT):
             with (patch.object(main, "auth_and_limit"),
+                  patch.object(main, "_twins", return_value={"canonical": {}, "members": {}}),
                   patch.object(main, "_run_search", return_value={"results": [{"arxiv_id": "1", "fulltext": True, "evidence": {}}]}),
                   patch.object(main, "qdrant_scroll_by_arxiv", side_effect=response if isinstance(response, Exception) else None,
                                return_value=response if isinstance(response, list) else None)):
@@ -131,6 +225,7 @@ class ResearchBundleTests(unittest.TestCase):
     def test_five_retrievals_have_bounded_timeouts_without_waiting(self):
         hits = [{"arxiv_id": str(i), "fulltext": True, "evidence": {}} for i in range(5)]
         with (patch.object(main, "auth_and_limit"),
+              patch.object(main, "_twins", return_value={"canonical": {}, "members": {}}),
               patch.object(main, "_run_search", return_value={"results": hits}),
               patch.object(main.time, "monotonic", side_effect=[0, 4, 7, 10, 13, 16]),
               patch.object(main, "qdrant_scroll_by_arxiv", return_value=[]) as scroll):
@@ -145,6 +240,7 @@ class ResearchBundleTests(unittest.TestCase):
         for ticks, expected_timeouts in (([0, 18, 20, 21, 22, 23], [2]),
                                          ([0, 20, 21, 22, 23, 24], [])):
             with (patch.object(main, "auth_and_limit"),
+                  patch.object(main, "_twins", return_value={"canonical": {}, "members": {}}),
                   patch.object(main, "_run_search", return_value={"results": hits}),
                   patch.object(main.time, "monotonic", side_effect=ticks),
                   patch.object(main, "qdrant_scroll_by_arxiv", return_value=[]) as scroll):

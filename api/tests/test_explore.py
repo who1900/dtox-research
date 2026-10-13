@@ -125,7 +125,10 @@ class OutlineAndSectionTest(unittest.TestCase):
         with patch.object(main.requests, "post", side_effect=lambda url, json, timeout: sent.append(json) or Resp()):
             main.qdrant_scroll_by_arxiv("x", payload_fields=["a"], page=500)
             main.qdrant_scroll_by_arxiv("x")
-        self.assertEqual(sent[0]["with_payload"], {"include": ["a"]})
+        self.assertEqual(sent[0]["with_payload"],
+                         {"include": ["a", "arxiv_id", "publication_revision"]})
+        self.assertNotIn("text", sent[0]["with_payload"]["include"])
+        self.assertFalse(sent[0]["with_vector"])
         self.assertEqual(sent[0]["limit"], 500)
         self.assertIs(sent[1]["with_payload"], True)
         self.assertEqual(sent[1]["limit"], 200)

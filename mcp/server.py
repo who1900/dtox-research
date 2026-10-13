@@ -29,7 +29,7 @@ REGISTRY_WRITES_ENABLED = os.getenv("MCP_REGISTRY_WRITES_ENABLED", "0") == "1"
 MCP_HOST = os.getenv("MCP_HOST", "127.0.0.1")
 MCP_PORT = int(os.getenv("MCP_PORT", "8011"))
 
-# Server sits behind nginx at https://read.whoim.space/mcp — the Host header
+# Server sits behind nginx at https://read.whoim.space/mcp, the Host header
 # seen by uvicorn is the external hostname, so it must be explicitly allowed
 # (DNS-rebinding protection otherwise only allows 127.0.0.1/localhost).
 transport_security = TransportSecuritySettings(
@@ -59,15 +59,31 @@ builder-tech. Treat it as a library you explore in steps, not a single search:
 - Two approaches side by side: compare_methods.
 - Where a field is moving: research_trends (use about= for one subject), then
   find_papers sort="recent" and the limitations sections of what it returns.
-- Whether an idea already exists: validate_project with each claim phrased
-  two or three ways.
+- Whether an idea already exists: validate_project with each distinct
+  technical claim passed separately; reformulate only when evidence warrants it.
 
 How to ask:
-- Keep queries short and exact: a paper's name ("HotStuff", "Reflexion") or
-  an identifier ("EIP-7702", "SIMD-96", "2303.11366", "iacr:2019/953") finds
-  that document first. Do not pad a name with keywords.
-- To find the canon on a subject start with find_papers (sort="foundational"
-  or "relevance"), or open a known id with get_paper.
+- Ask in natural language about the mechanism, object and relevant constraint
+  (for example, "data availability sampling for light clients with limited
+  bandwidth"). Names and ids are useful when you already know them, not a
+  prerequisite; do not assume synonyms or paraphrases retrieve equivalent
+  results. Scores and source_candidates are leads, not proof of a shared claim
+  or probabilities.
+- For a research question, start with find_papers or search_research_paper.
+  Inspect a promising result with get_paper, then read the relevant section
+  and, when needed, get_code_or_math_spec for indexed formulas or algorithms.
+  Use compare_methods to retrieve two papers' reported results and limitations.
+  Use get_research_bundle for a bounded, cited evidence packet, and
+  validate_project for an idea's distinct technical claims. State coverage
+  caveats from the returned evidence.
+- Map each conclusion to its evidence. Distinguish limitations explicitly
+  reported by authors from your inference and from information the index does
+  not contain. Quote formulas only as extracted; never reconstruct or invent
+  an equation. Abstract-only records are not full text: say so and do not
+  imply that an unindexed section was inspected.
+- If inspected results are sparse or inconsistent for the mechanism, try one
+  reformulated natural-language query or a more targeted tool; avoid repeated
+  near-duplicate searches by default.
 - "Does this idea already exist": validate_project, not search.
   "A versus B": compare_methods.
 - Leave min_score unset: scores on this index are calibrated per layer and a
@@ -76,6 +92,9 @@ How to ask:
   papers are often tagged llm-slm), so layer there is a soft preference.
   search_research_paper(strict=True) keeps the requested filters exact and
   disables automatic relaxation; its existing default remains strict=False.
+- For validate_project, pass distinct technical claims separately; rephrase a
+  claim only when its evidence is sparse or inconsistent, not as a fixed
+  multi-query requirement.
 
 Cite every claim with the paper id and url you got it from. Empty results
 reflect index coverage and retrieval limits, never establish novelty; inspect
@@ -97,6 +116,28 @@ def _path_id(paper_id):
     colon (the API routes take a path), anything else that could break the URL
     (spaces, ?, #) is percent-encoded."""
     return quote(str(paper_id).strip(), safe="/:")
+
+
+def _resolve_paper_id(paper_id, legacy_id, label):
+    """Resolve a neutral paper_id and its legacy alias before any API request."""
+    values = []
+    for name, value in (("paper_id", paper_id), (label, legacy_id)):
+        if value is None:
+            values.append(None)
+        elif not isinstance(value, str):
+            _raise_tool_error({"error": f"{name} must be a string",
+                               "error_type": "validation"}, status=400)
+        else:
+            values.append(value.strip() or None)
+    current, legacy = values
+    if current and legacy and current != legacy:
+        _raise_tool_error({"error": f"paper_id conflicts with {label}",
+                           "error_type": "validation"}, status=400)
+    resolved = current or legacy
+    if not resolved:
+        _raise_tool_error({"error": "paper_id is required",
+                           "error_type": "validation"}, status=400)
+    return resolved
 
 
 def _headers():
@@ -141,6 +182,20 @@ def _handle_error(resp: requests.Response) -> None:
 
 
 def _api_result(resp, reject_failed_batch=False):
+    def signed_outcome(value):
+        results = value.get("results") if isinstance(value, dict) else None
+        if not isinstance(results, list) or not results:
+            return "malformed"
+        accepted = False
+        for item in results:
+            status = item.get("status") if isinstance(item, dict) else None
+            if (type(status) not in (int, float)
+                    or not (200 <= status < 300 or 400 <= status < 600)
+                    or status != int(status)):
+                return "malformed"
+            accepted = accepted or status < 300
+        return "accepted" if accepted else "rejected"
+
     _handle_error(resp)
     try:
         payload = resp.json()
@@ -148,13 +203,14 @@ def _api_result(resp, reject_failed_batch=False):
         _raise_tool_error("research API returned invalid JSON", status=resp.status_code)
     if isinstance(payload, dict) and payload.get("error"):
         _raise_tool_error(payload, status=resp.status_code)
-    if reject_failed_batch and isinstance(payload, dict):
-        results = payload.get("results")
-        if isinstance(results, list) and results and all(
-                isinstance(item, dict) and isinstance(item.get("status"), int)
-                and item["status"] >= 400 for item in results):
-            _raise_tool_error({**payload, "error": "all signed verdict judgments were rejected"},
-                              status=resp.status_code)
+    if reject_failed_batch:
+        outcome = signed_outcome(payload)
+        if outcome != "accepted":
+            diagnostics = payload if isinstance(payload, dict) else {"upstream_result": payload}
+            _raise_tool_error({**diagnostics, "error": (
+                "malformed signed verdict batch result" if outcome == "malformed"
+                else "all signed verdict judgments were rejected"), "error_type": "protocol"},
+                status=resp.status_code)
     return payload
 
 
@@ -261,6 +317,27 @@ def search_research_paper(
         with confidence "low" means no indexed-topic term was recognised in
         the query, so judge relevance from the titles; in_scope=null means few
         close papers (a thin shelf or an uncovered subject), so check before relying.
+        An optional root-level "source_candidates" list contains unverified
+        reading leads from sources already retrieved. These may be below the
+        fragment relevance floor and may include "candidate_channel" values
+        "fused" or "citation_graph". Compact candidate cards contain IDs,
+        source and channel metadata, and section hints, but no excerpt text.
+        Use each candidate's arxiv_id, candidate_reason, candidate_channel,
+        found_via and section fields to select a lead, then call get_paper for
+        its outline and read_paper_section for source text. Candidates are
+        excluded from audit evidence and verdicts, and do not change "results"
+        or "count". A graph neighbor may discuss a different mechanism, citation
+        is a pointer for reading, not corroboration. Candidates can be hard
+        negatives, so read them and compare mechanisms before drawing conclusions.
+
+        Prefer "results" first. If none fit, inspect candidate source outlines
+        or sections and verify the mechanism, never auto-assert prior art from
+        a candidate. Candidate discovery interleaves existing hierarchy and
+        citation-ranked pools without extra retrieval calls; it does not change
+        primary results. Offline source visibility (30/32 versus 16 primary,
+        including 9 known-negative queries in the auxiliary set) is not a
+        precision-gain claim. There is no promise that all relevant papers were
+        found or that discovery is independent of query formulation.
     """
     body = {"query": query, "limit": limit, "compact": True, "strict": strict}
     if strict:
@@ -537,19 +614,24 @@ def similar_papers(paper_id: str, limit: int = 10, layer: Optional[str] = None) 
 
 @mcp.tool()
 def get_code_or_math_spec(
-    arxiv_id: str,
+    paper_id: Optional[str] = None,
     target_elements: Optional[str] = None,
     include_prose: bool = False,
     max_chars: int = 12000,
+    arxiv_id: Optional[str] = None,
+    cursor: Optional[str] = None,
 ) -> dict:
-    """Fetch the technical "spec" of a paper: its pseudocode, equations,
-    listings and benchmark tables as raw LaTeX objects, NOT the abstract or
-    narrative text. Use this to get implementable detail (exact algorithm
-    steps, formulas, parameters) for writing code from a paper.
+    """Fetch the indexed structured elements of a paper: pseudocode,
+    equations, listings and benchmark tables, not its abstract or general
+    narrative. Some equations retain raw LaTeX; PDF-derived extraction is not
+    guaranteed to be exact LaTeX. Use this for implementable detail when the
+    requested elements are actually present in the index.
 
     Args:
-        arxiv_id: Paper identifier, e.g. "2401.12345" for arXiv or
-            "iacr:2025/1040" for an IACR ePrint paper.
+        paper_id: Paper identifier, e.g. "2401.12345", "eip:1559" or
+            "iacr:2025/1040". Preferred neutral name.
+        arxiv_id: Deprecated compatibility alias for paper_id. Existing
+            clients may continue using it; do not pass conflicting values.
         target_elements: Comma-separated subset of "algorithm,equation,
             code,table" (default: all four). Narrow it to keep context
             small, e.g. "algorithm" for pseudocode only.
@@ -558,60 +640,85 @@ def get_code_or_math_spec(
         max_chars: Hard cap on returned characters (default 12000, roughly
             3000 tokens). The response reports "returned", "available" and
             "truncated" so you can ask for more deliberately.
+        cursor: Optional opaque v1 string returned as next_cursor. Keep the
+            paper and element filters unchanged; a changed indexed snapshot
+            returns 409. Clipped formulas are incomplete extracted fragments,
+            not whole equations; concatenate pages using returned_offset.
 
     Returns:
-        dict with "arxiv_id", "title", "sections" (each with element_type,
-        section_type, section_title, text), plus "returned", "available",
-        "chars" and "truncated". Returns an "error" key if the paper is not
-        in the database or has no structured elements.
+        Existing API fields including "arxiv_id", "title", "sections" (each
+        with element_type, section_type, section_title, text), "returned",
+        "available", "chars" and "truncated", plus "paper_id" as the exact
+        requested identifier when the API did not already provide it.
+        "next_cursor" allows continuation of bounded text. An absent paper
+        returns an error; a known paper without requested elements can return
+        empty sections and resolution reasons. Raw fragment_hash remains the
+        hash of the indexed chunk across clipping and pagination. Returned
+        PDF-derived text is not necessarily raw LaTeX.
     """
+    resolved_id = _resolve_paper_id(paper_id, arxiv_id, "arxiv_id")
     params = {"include_prose": str(bool(include_prose)).lower(), "max_chars": max_chars}
     if target_elements:
         params["target_elements"] = target_elements
+    if cursor is not None:
+        if not isinstance(cursor, str) or not cursor.strip() or len(cursor) > 1024:
+            _raise_tool_error({"error": "cursor must be a non-empty string of at most 1024 characters",
+                               "error_type": "validation"}, status=400)
+        params["cursor"] = cursor
     try:
         resp = requests.get(
-            f"{RESEARCH_API_BASE}/v1/paper/{_path_id(arxiv_id)}/spec",
+            f"{RESEARCH_API_BASE}/v1/paper/{_path_id(resolved_id)}/spec",
             headers=_headers(), params=params, timeout=30,
         )
     except requests.RequestException as e:
         _raise_tool_error(f"could not reach research API: {e}", error_type="transport")
 
-    return _api_result(resp)
+    result = _api_result(resp)
+    if isinstance(result, dict):
+        result.setdefault("paper_id", resolved_id)
+    return result
 
 
 @mcp.tool()
 def compare_methods(
-    arxiv_id_a: str,
-    arxiv_id_b: str,
+    paper_id_a: Optional[str] = None,
+    paper_id_b: Optional[str] = None,
     extract_tables_only: bool = False,
     max_chars: int = 12000,
+    arxiv_id_a: Optional[str] = None,
+    arxiv_id_b: Optional[str] = None,
 ) -> dict:
     """Fetch the Results/Benchmarks (and Limitations) sections of two
     papers side by side, for comparing their reported performance and
     tradeoffs. The comparison/analysis itself is left to the calling
-    model — this tool only retrieves the raw sections.
+    model, this tool only retrieves the raw sections.
 
     Args:
-        arxiv_id_a: id of the first paper, e.g. "2401.12345" (arXiv) or
-            "iacr:2025/1040" (IACR ePrint).
-        arxiv_id_b: id of the second paper.
+        paper_id_a: Identifier for the first paper, e.g. "2401.12345",
+            "eip:1559" or "iacr:2025/1040". Preferred neutral name.
+        paper_id_b: Identifier for the second paper.
+        arxiv_id_a: Deprecated compatibility alias for paper_id_a.
+        arxiv_id_b: Deprecated compatibility alias for paper_id_b.
         extract_tables_only: Return only table elements, which is where
             latency, memory and accuracy numbers usually live. Much
             cheaper in context than full results prose.
         max_chars: Hard cap per paper (default 12000, roughly 3000 tokens).
 
     Returns:
-        dict with "a" and "b", each {arxiv_id, title, results_chunks,
-        available, chars}. Returns an "error" key if either paper is not
-        in the database.
+        Existing "a" and "b" result objects, each with API fields such as
+        arxiv_id, title, results_chunks, available and chars; a paper_id alias
+        is added to each object when absent. Returns an "error" if either
+        paper is not in the database.
     """
+    resolved_a = _resolve_paper_id(paper_id_a, arxiv_id_a, "arxiv_id_a")
+    resolved_b = _resolve_paper_id(paper_id_b, arxiv_id_b, "arxiv_id_b")
     try:
         resp = requests.get(
             f"{RESEARCH_API_BASE}/v1/compare",
             headers=_headers(),
             params={
-                "a": arxiv_id_a,
-                "b": arxiv_id_b,
+                "a": resolved_a,
+                "b": resolved_b,
                 "extract_tables_only": str(bool(extract_tables_only)).lower(),
                 "max_chars": max_chars,
             },
@@ -620,7 +727,12 @@ def compare_methods(
     except requests.RequestException as e:
         _raise_tool_error(f"could not reach research API: {e}", error_type="transport")
 
-    return _api_result(resp)
+    result = _api_result(resp)
+    if isinstance(result, dict):
+        for key, paper_id in (("a", resolved_a), ("b", resolved_b)):
+            if isinstance(result.get(key), dict):
+                result[key].setdefault("paper_id", paper_id)
+    return result
 
 
 @mcp.tool()

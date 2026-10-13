@@ -1,0 +1,256 @@
+{
+  "dataset": "paraphrase-cases-20261003",
+  "scope_notes": [
+    "Cases were selected before any live evaluation. After the initial live run, a source-identity correction added the confirmed alias pmlr:v202/leviathan23a for 2211.17192 following primary-source title and author verification; no queries, targets, or mechanisms changed. The initial raw result preserves its original embedded fixture and hash.",
+    "Targets are known-source anchors, not an exhaustive bibliography. A hit measures retrieval of a known source only; it does not measure precision or coverage of all valid answers.",
+    "Hard negatives are focal-mechanism comparators, not claims that the entire work is irrelevant. A negative outranking a target is an alert requiring inspection, not an automatic scientific-error judgment.",
+    "The multi-target oracle and speculative-decoding families intentionally accept either listed source. Their shared mechanism does not require every target to appear for every phrasing."
+  ],
+  "groups": [
+    {
+      "id": "web3-fungible-token-interface",
+      "layer": "web3",
+      "mechanism": "Standard interface for interchangeable fungible token balances, transfers, approvals, and delegated spending.",
+      "targets": [
+        {
+          "canonical_id": "eip:20",
+          "aliases": [],
+          "source_url": "https://eips.ethereum.org/EIPS/eip-20"
+        }
+      ],
+      "hard_negatives": [
+        {
+          "id": "eip:721",
+          "reason": "Token interface for non-fungible assets with unique ownership, a close token-standard comparator but a different asset model.",
+          "source_url": "https://eips.ethereum.org/EIPS/eip-721"
+        }
+      ],
+      "phrases": [
+        {
+          "id": "technical-interface",
+          "query": "standard interface for fungible tokens with transfer, approve and allowance"
+        },
+        {
+          "id": "capped-delegation",
+          "query": "How can a token holder authorize another address to spend a capped amount of interchangeable units?"
+        },
+        {
+          "id": "delegated-balances",
+          "query": "Which Ethereum token interface defines delegated spending with balances and transferFrom for mutually interchangeable assets?"
+        }
+      ]
+    },
+    {
+      "id": "web3-external-oracle",
+      "layer": "web3",
+      "mechanism": "Decentralized oracle networks that validate and deliver externally observed data to on-chain applications.",
+      "targets": [
+        {
+          "canonical_id": "wp:chainlink-v1",
+          "aliases": [],
+          "source_url": "https://research.chain.link/whitepaper-v1.pdf"
+        },
+        {
+          "canonical_id": "wp:chainlink-v2",
+          "aliases": [],
+          "source_url": "https://research.chain.link/whitepaper-v1.pdf"
+        }
+      ],
+      "hard_negatives": [
+        {
+          "id": "1509.08443",
+          "reason": "Timeline ordering for decentralized event data rather than external-data validation and oracle delivery.",
+          "source_url": "https://arxiv.org/abs/1509.08443"
+        }
+      ],
+      "phrases": [
+        {
+          "id": "external-event-validation",
+          "query": "on-chain oracle validating external real-world event data"
+        },
+        {
+          "id": "independent-reporters",
+          "query": "How can a smart contract obtain off-chain facts from independent reporters rather than trust a single data server?"
+        },
+        {
+          "id": "oracle-network",
+          "query": "decentralized oracle network for bringing externally observed information into blockchain applications"
+        }
+      ]
+    },
+    {
+      "id": "llm-slm-exact-io-aware-attention",
+      "layer": "llm-slm",
+      "mechanism": "An exact, IO-aware attention kernel that tiles computation to reduce high-bandwidth-memory traffic using on-chip SRAM.",
+      "targets": [
+        {
+          "canonical_id": "2205.14135",
+          "aliases": [],
+          "source_url": "https://arxiv.org/abs/2205.14135"
+        }
+      ],
+      "hard_negatives": [
+        {
+          "id": "2309.06180",
+          "reason": "KV-cache paging and memory management for serving, not the exact IO-tiled attention-kernel mechanism.",
+          "source_url": "https://arxiv.org/abs/2309.06180"
+        }
+      ],
+      "phrases": [
+        {
+          "id": "io-aware-kernel",
+          "query": "IO-aware exact attention kernel with tiling"
+        },
+        {
+          "id": "sram-blocks",
+          "query": "Compute transformer attention exactly while keeping blocks on GPU SRAM to avoid writing the full attention matrix to high-bandwidth memory"
+        },
+        {
+          "id": "fused-blockwise-ops",
+          "query": "Reduce memory traffic in attention by fusing blockwise matrix operations without approximating softmax"
+        }
+      ]
+    },
+    {
+      "id": "llm-slm-speculative-decoding",
+      "layer": "llm-slm",
+      "mechanism": "A cheaper draft model proposes multiple tokens for parallel verification by a larger model, with correction preserving the sampling distribution.",
+      "targets": [
+        {
+          "canonical_id": "2211.17192",
+          "aliases": [
+            "pmlr:v202/leviathan23a"
+          ],
+          "source_url": "https://arxiv.org/abs/2211.17192"
+        },
+        {
+          "canonical_id": "2302.01318",
+          "aliases": [],
+          "source_url": "https://arxiv.org/abs/2302.01318"
+        }
+      ],
+      "hard_negatives": [
+        {
+          "id": "2205.14135",
+          "reason": "Exact IO-aware attention-kernel optimization, not draft-token verification and exact correction sampling.",
+          "source_url": "https://arxiv.org/abs/2205.14135"
+        }
+      ],
+      "phrases": [
+        {
+          "id": "parallel-verification",
+          "query": "draft model proposes tokens and the large model verifies them in parallel without changing the sampling distribution"
+        },
+        {
+          "id": "guess-and-check",
+          "query": "Use a cheap language model to guess several next tokens, then let the expensive model accept or reject them together while preserving its distribution"
+        },
+        {
+          "id": "batched-correction",
+          "query": "accelerate autoregressive generation through batched checking of proposals from an approximation model with exact correction sampling"
+        }
+      ]
+    },
+    {
+      "id": "ai-agents-verbal-reflection",
+      "layer": "ai-agents",
+      "mechanism": "Agents improve repeated attempts through written self-reflection and episodic feedback, without updating model weights.",
+      "targets": [
+        {
+          "canonical_id": "2303.11366",
+          "aliases": [],
+          "source_url": "https://arxiv.org/abs/2303.11366"
+        }
+      ],
+      "hard_negatives": [
+        {
+          "id": "2210.03629",
+          "reason": "Interleaved reasoning and acting in an agent loop, rather than trial-feedback reflection stored to improve later attempts.",
+          "source_url": "https://arxiv.org/abs/2210.03629"
+        }
+      ],
+      "phrases": [
+        {
+          "id": "verbal-self-reflection",
+          "query": "agent learns from verbal self-reflection on failures without updating model weights"
+        },
+        {
+          "id": "episodic-diagnosis",
+          "query": "After an unsuccessful attempt, store a written diagnosis in episodic memory and use it to improve the next try without retraining"
+        },
+        {
+          "id": "linguistic-feedback",
+          "query": "Improve repeated task attempts using remembered linguistic feedback instead of gradient updates"
+        }
+      ]
+    },
+    {
+      "id": "llm-slm-multimodal-entropy-kv-allocation",
+      "layer": "llm-slm",
+      "mechanism": "Dynamic multimodal key-value cache allocation guided by cross-modal attention entropy.",
+      "targets": [
+        {
+          "canonical_id": "2502.17599",
+          "aliases": [
+            "acl:2025.naacl-long.125"
+          ],
+          "source_url": "https://arxiv.org/abs/2502.17599"
+        }
+      ],
+      "hard_negatives": [
+        {
+          "id": "2405.14366",
+          "reason": "KV-cache compression by merging representations across model depth, not cross-modal attention-entropy allocation.",
+          "source_url": "https://arxiv.org/abs/2405.14366"
+        }
+      ],
+      "phrases": [
+        {
+          "id": "entropy-guided-allocation",
+          "query": "dynamic multimodal KV cache allocation using cross-modal attention entropy"
+        },
+        {
+          "id": "uncertainty-per-layer",
+          "query": "For image-and-text generation, give different transformer layers cache space according to how uncertain their cross-modal attention is"
+        },
+        {
+          "id": "vision-language-retention",
+          "query": "Adapt the memory retained for keys and values in a vision-language model using uncertainty of attention between modalities"
+        }
+      ]
+    },
+    {
+      "id": "llm-slm-auxiliary-moe-load-balance",
+      "layer": "llm-slm",
+      "mechanism": "An auxiliary training loss encourages balanced token assignment across experts in a sparse mixture-of-experts router.",
+      "targets": [
+        {
+          "canonical_id": "2101.03961",
+          "aliases": [],
+          "source_url": "https://arxiv.org/abs/2101.03961"
+        }
+      ],
+      "hard_negatives": [
+        {
+          "id": "2408.15664",
+          "reason": "Expert-bias adjustment for balancing routing without the requested auxiliary-loss mechanism; related balancing approaches can coexist with auxiliary-loss baselines, so an outrank is an alert for review rather than proof of irrelevance.",
+          "source_url": "https://arxiv.org/abs/2408.15664"
+        }
+      ],
+      "phrases": [
+        {
+          "id": "auxiliary-balancing-objective",
+          "query": "auxiliary load-balancing loss for sparse mixture of experts routing"
+        },
+        {
+          "id": "balanced-specialists",
+          "query": "Add a training penalty so that roughly equal numbers of tokens reach each specialist network"
+        },
+        {
+          "id": "regularized-router",
+          "query": "Regularize the expert selector with an extra objective that prevents a few specialists receiving nearly all input tokens"
+        }
+      ]
+    }
+  ]
+}

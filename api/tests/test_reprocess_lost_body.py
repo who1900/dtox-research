@@ -14,13 +14,15 @@ import reprocess_lost_body as rlb  # noqa: E402
 
 
 class FakeQdrant:
-    """Stands in for requests.Session: counts and deletes by arxiv_id."""
+    """Stands in for requests.Session and records all count/delete requests."""
 
     def __init__(self, counts=None):
         self.counts = dict(counts or {})
         self.deleted = []
+        self.calls = []
 
     def post(self, url, json=None, params=None, timeout=None):
+        self.calls.append((url, json, params))
         aid = json["filter"]["must"][0]["match"]["value"]
         resp = MagicMock()
         if url.endswith("/points/count"):
@@ -29,6 +31,12 @@ class FakeQdrant:
             self.deleted.append(aid)
             self.counts[aid] = 0
         return resp
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
 
 
 class Env(unittest.TestCase):
@@ -123,6 +131,28 @@ class FeedTest(Env):
     def run_feed(self, q, **kw):
         return rlb.feed(self.conn(), q, self.args(**kw), log=self.log.append)
 
+    def state_snapshot(self):
+        conn = sqlite3.connect(self.db)
+        papers = conn.execute("SELECT * FROM papers ORDER BY arxiv_id").fetchall()
+        conn.close()
+        fts = sqlite3.connect(self.fts)
+        chunks = fts.execute("SELECT text,point_id,arxiv_id FROM chunks ORDER BY rowid").fetchall()
+        fts.close()
+        files = {}
+        for sub in ("fulltext_cache", "chunk_cache", "latex_cache"):
+            root = pathlib.Path(self.dir) / sub
+            if root.exists():
+                files[sub] = {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+        progress = pathlib.Path(self.progress)
+        return papers, chunks, files, progress.read_bytes() if progress.exists() else None
+
+    def assert_apply_refused_unchanged(self, q):
+        before = self.state_snapshot()
+        self.assertEqual(self.run_feed(q, apply=True), 2)
+        self.assertEqual(self.state_snapshot(), before)
+        self.assertEqual(q.calls, [])
+        self.assertEqual(q.deleted, [])
+
     def seed_paper_files(self, aid):
         for sub, name in [("fulltext_cache", f"{aid}.tex"), ("chunk_cache", f"{aid}.json"),
                           (os.path.join("latex_cache", aid), "source.tex")]:
@@ -130,15 +160,20 @@ class FeedTest(Env):
             with open(os.path.join(self.dir, sub, name), "w") as f:
                 f.write("x")
 
-    def test_queue_full_resets_nothing(self):
+    def test_apply_is_retired_even_when_queue_is_full(self):
         for i in range(3):
             self.paper(f"2002.0000{i}", status="quality_checked")
         self.paper("2001.00001")
         self.write_list([{"id": "2001.00001", "citations": 1, "chunks": 2}])
         q = FakeQdrant()
-        self.assertEqual(self.run_feed(q, apply=True, target=3), 0)
+        self.assert_apply_refused_unchanged_with_args(q, target=3)
+
+    def assert_apply_refused_unchanged_with_args(self, q, **kwargs):
+        before = self.state_snapshot()
+        self.assertEqual(self.run_feed(q, apply=True, **kwargs), 2)
+        self.assertEqual(self.state_snapshot(), before)
+        self.assertEqual(q.calls, [])
         self.assertEqual(q.deleted, [])
-        self.assertEqual(self.status("2001.00001")[0], "done")
 
     def test_queue_counts_all_three_statuses(self):
         self.paper("2002.00001", status="quality_checked")
@@ -158,7 +193,7 @@ class FeedTest(Env):
         self.assertTrue(os.path.exists(os.path.join(self.dir, "fulltext_cache", "2001.00001.tex")))
         self.assertFalse(os.path.exists(self.progress))
 
-    def test_apply_resets_and_cleans(self):
+    def test_apply_refusal_preserves_database_fts_and_cached_inputs(self):
         self.paper("2001.00001")
         self.seed_paper_files("2001.00001")
         f = sqlite3.connect(self.fts)
@@ -168,27 +203,27 @@ class FeedTest(Env):
         f.close()
         self.write_list([{"id": "2001.00001", "citations": 1, "chunks": 2}])
         q = FakeQdrant()
-        self.assertEqual(self.run_feed(q, apply=True), 1)
-        self.assertEqual(q.deleted, ["2001.00001"])
-        self.assertEqual(self.status("2001.00001"), ("quality_checked", None, None))
+        before = self.state_snapshot()
+        self.assertEqual(self.run_feed(q, apply=True), 2)
+        self.assertEqual(self.state_snapshot(), before)
+        self.assertEqual(q.calls, [])
+        self.assertEqual(q.deleted, [])
         for sub in ("fulltext_cache/2001.00001.tex", "chunk_cache/2001.00001.json", "latex_cache/2001.00001"):
-            self.assertFalse(os.path.exists(os.path.join(self.dir, sub)), sub)
+            self.assertTrue(os.path.exists(os.path.join(self.dir, sub)), sub)
         f = sqlite3.connect(self.fts)
-        self.assertEqual(f.execute("SELECT arxiv_id FROM chunks").fetchall(), [("2001.00002",)])
+        self.assertEqual(f.execute("SELECT arxiv_id FROM chunks ORDER BY rowid").fetchall(),
+                         [("2001.00001",), ("2001.00001",), ("2001.00002",)])
         f.close()
-        self.assertEqual(rlb.load_progress(self.progress), {"2001.00001"})
+        self.assertFalse(os.path.exists(self.progress))
 
-    def test_continues_by_progress_and_respects_batch(self):
+    def test_apply_refusal_does_not_advance_candidates_or_progress(self):
         ids = [f"2001.0000{i}" for i in range(1, 6)]
         for aid in ids:
             self.paper(aid)
         self.write_list([{"id": a, "citations": 10 - i, "chunks": 1} for i, a in enumerate(ids)])
         q = FakeQdrant()
-        self.run_feed(q, apply=True, batch=2)
-        self.assertEqual(q.deleted, ids[:2])
-        # the two now sit in the queue; a bigger target lets the next run go on after them
-        self.run_feed(q, apply=True, batch=2, target=4)
-        self.assertEqual(q.deleted, ids[:4])
+        self.assert_apply_refused_unchanged_with_args(q, batch=2)
+        self.assert_apply_refused_unchanged_with_args(q, batch=2, target=4)
 
     def test_target_minus_queue_limits_reset(self):
         self.paper("2002.00001", status="chunked")
@@ -197,8 +232,7 @@ class FeedTest(Env):
             self.paper(aid)
         self.write_list([{"id": a, "citations": 1, "chunks": 1} for a in ids])
         q = FakeQdrant()
-        self.run_feed(q, apply=True, target=3)
-        self.assertEqual(q.deleted, ids[:2])
+        self.assert_apply_refused_unchanged_with_args(q, target=3)
 
     def test_commit_per_paper_leaves_no_open_transaction(self):
         ids = ["2001.00001", "2001.00002"]
@@ -219,17 +253,20 @@ class FeedTest(Env):
                 seen.append(conn.in_transaction)
                 return super().post(url, **kw)
 
-        rlb.feed(conn, Probe(), self.args(apply=True), log=lambda *a: None)
-        self.assertEqual(seen, [False, False])
+        before = self.state_snapshot()
+        probe = Probe()
+        self.assertEqual(rlb.feed(conn, probe, self.args(apply=True), log=lambda *a: None), 2)
+        self.assertEqual(self.state_snapshot(), before)
+        self.assertEqual(probe.calls, [])
+        self.assertEqual(seen, [])
         self.assertFalse(conn.in_transaction)
-        self.assertEqual(rlb.load_progress(self.progress), set(ids))
+        self.assertFalse(os.path.exists(self.progress))
 
-    def test_paper_no_longer_done_is_skipped(self):
+    def test_apply_refusal_preserves_paper_that_is_no_longer_done(self):
         self.paper("2001.00001", status="chunked")
         self.write_list([{"id": "2001.00001", "citations": 1, "chunks": 1}])
         q = FakeQdrant()
-        self.assertEqual(self.run_feed(q, apply=True, target=5), 0)
-        self.assertEqual(q.deleted, [])
+        self.assert_apply_refused_unchanged_with_args(q, target=5)
         self.assertEqual(self.status("2001.00001")[0], "chunked")
 
 

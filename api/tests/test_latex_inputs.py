@@ -1,25 +1,39 @@
+import ast
+import gzip
+import hashlib
+import io
+import json
+import logging
+import os
 import pathlib
-import sys
+import posixpath
+import re
+import tarfile
+import tempfile
 import types
 import unittest
 
-# Same import fixup as test_spec_niche.py: pipeline/ on sys.path, fcntl stubbed
-# on non-POSIX hosts. Test-only; nothing under pipeline/ is changed.
-_PIPELINE_DIR = str(pathlib.Path(__file__).resolve().parents[2] / "pipeline")
-if _PIPELINE_DIR not in sys.path:
-    sys.path.insert(0, _PIPELINE_DIR)
 
-if "fcntl" not in sys.modules:
-    try:
-        import fcntl  # noqa: F401
-    except ImportError:
-        stub = types.ModuleType("fcntl")
-        stub.flock = lambda *a, **kw: None
-        stub.LOCK_EX = 2
-        stub.LOCK_NB = 4
-        sys.modules["fcntl"] = stub
+def load_service():
+    source = pathlib.Path(__file__).resolve().parents[2] / "pipeline" / "service.py"
+    names = {"safe_id", "latex_cache_path", "read_latex_cache", "write_latex_cache",
+             "read_latex_bibliography", "_is_commented", "assemble_latex_source", "fetch_latex_source",
+             "_bibliography_path", "_bibliography_files", "_bibliography_json",
+             "_bibliography_unique_object", "_latex_source_sha256"}
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    nodes = [node for node in tree.body
+             if (isinstance(node, ast.FunctionDef) and node.name in names)
+             or (isinstance(node, ast.Assign) and any(isinstance(t, ast.Name)
+                 and (t.id in {"_INC_RE", "LATEX_MAX_INCLUDE_DEPTH"} or t.id.startswith("LATEX_BIB_"))
+                 for t in node.targets))]
+    module = types.ModuleType("latex_fixture")
+    module.__dict__.update(globals(), Path=pathlib.Path, log=logging.getLogger("latex_fixture"),
+                           requests=types.SimpleNamespace(Session=object, RequestException=OSError))
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), module.__dict__)
+    return module
 
-from pipeline import service  # noqa: E402
+
+service = load_service()
 
 DOC = "\\documentclass{article}\n\\begin{document}\n%s\n\\end{document}\n"
 
@@ -180,6 +194,63 @@ class AssembleLatexTests(unittest.TestCase):
     def test_article_without_input_unchanged(self):
         src = DOC % "\\section{Intro} hello \\includegraphics{f.png} \\cite{x}"
         self.assertEqual(build([("paper.tex", src)]), src)
+
+    def test_bibliography_is_separate_and_main_relative(self):
+        source = DOC % "\\input{section}\n\\bibliography{refs}"
+        files = [("paper/main.tex", source), ("paper/section.tex", "BODY"),
+                 ("paper/refs.bib", "LOCAL_BIB"), ("refs.bib", "ROOT_BIB"),
+                 ("paper/main.bbl", "COMPILED_BIB"), ("unused.bib", "UNUSED")]
+        sink = []
+        text = service.assemble_latex_source("fixture", files, bibliography_sink=sink)
+        self.assertEqual(text, source.replace("\\input{section}", "BODY"))
+        self.assertEqual([f["path"] for f in sink], ["paper/refs.bib", "paper/main.bbl"])
+        self.assertTrue(text.endswith("\\end{document}\n"))
+        self.assertNotIn("BIB", text)
+
+    def test_expanded_declarations_root_and_unique_basename(self):
+        files = [("paper/main.tex", DOC % "\\input{section}"),
+                 ("paper/section.tex", "\\addbibresource[location=local]{refs.bib}\\bibliography{other}"),
+                 ("refs.bib", "ROOT"), ("deep/other.bib", "UNIQUE"),
+                 ("deep/other.bbl", "COMPILED"), ("unused.tex", "\\bibliography{unused}"),
+                 ("unused.bib", "UNUSED")]
+        sink = []
+        service.assemble_latex_source("fixture", files, bibliography_sink=sink)
+        self.assertEqual([f["text"] for f in sink], ["ROOT", "UNIQUE", "COMPILED"])
+
+    def test_ambiguous_duplicate_and_unsafe_resources_fail_closed(self):
+        for resources, ref in [([("a/refs.bib", "A"), ("b/refs.bib", "B")], "refs"),
+                               ([("refs.bib", "A"), ("./refs.bib", "B")], "refs"),
+                               ([("../refs.bib", "ESCAPE")], "refs"),
+                               ([("refs.bib", "A")], "/refs"),
+                               ([("refs.bib", "A")], "../../refs")]:
+            with self.subTest(ref=ref, resources=resources), self.assertLogs(service.log, level="WARNING"):
+                sink = []
+                service.assemble_latex_source("fixture", [("main.tex", DOC % ("\\bibliography{%s}" % ref))]
+                                              + resources, bibliography_sink=sink)
+                self.assertEqual(sink, [])
+
+    def test_comments_and_inlined_bibitems_do_not_require_artifacts(self):
+        for body in ("%\\bibliography{refs}\nBODY", "\\bibitem{x} INLINE\\bibliography{refs}"):
+            sink = []
+            source = DOC % body
+            self.assertEqual(service.assemble_latex_source("fixture", [("main.tex", source),
+                             ("refs.bib", "EXTRA"), ("main.bbl", "EXTRA")], bibliography_sink=sink), source)
+            self.assertEqual(sink, [])
+
+    def test_only_chosen_main_selects_bibliography(self):
+        sink = []
+        files = [("short.tex", DOC % "\\bibliography{unused}"),
+                 ("main.tex", DOC % ("BODY" * 100 + "\\bibliography{refs,refs}")),
+                 ("refs.bib", "KEEP"), ("unused.bib", "DROP")]
+        service.assemble_latex_source("fixture", files, bibliography_sink=sink)
+        self.assertEqual(sink, [{"path": "refs.bib", "text": "KEEP"}])
+
+    def test_parent_reference_and_main_bbl_root_priority(self):
+        sink = []
+        files = [("paper/main.tex", DOC % "\\bibliography{../refs}"),
+                 ("refs.bib", "ROOT_BIB"), ("main.bbl", "ROOT_BBL"), ("other/main.bbl", "OTHER")]
+        service.assemble_latex_source("fixture", files, bibliography_sink=sink)
+        self.assertEqual([f["text"] for f in sink], ["ROOT_BIB", "ROOT_BBL"])
 
 
 if __name__ == "__main__":

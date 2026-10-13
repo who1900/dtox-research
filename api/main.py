@@ -1,3 +1,4 @@
+import copy
 import functools
 import hashlib
 import json
@@ -34,17 +35,29 @@ def _api_keys_path():
 
 
 try:
-    from .search_core import fts_query, fts_query_any, merge_layer_hits, merge_layer_hits_calibrated, reciprocal_rank_fusion
+    from .search_core import fts_query, fts_query_any, merge_layer_hits, merge_layer_hits_calibrated, reciprocal_rank_fusion, RRF_K
+    from .source_representations import MAX_CONTEXTS as _SOURCE_MAX_CONTEXTS, MAX_ORIGINS as _SOURCE_MAX_ORIGINS
     from .boilerplate import is_boilerplate_chunk
     from .exact_match import TitleIndex, extract_ids
-    from .evidence import hydrate_results, provenance
+    from .evidence import bounded_evidence_page, hydrate_results, provenance, resolution_reasons
+    from .source_attribution import curated_source, stored_source_url, valid_source_url
     from .research_bundle import ResearchBundleBody, build_bundle, BUNDLE_CHUNK_LIMIT, BUNDLE_SECONDS, BoundedRetriever
+    from .grouped_search import grouped_hits
+    from .source_discovery import select_source_candidates, merge_source_candidates
+    from .candidate_pool import build_candidate_pool, rows_as_hits
+    from .rerank_runtime import RerankRuntime
 except ImportError:
-    from search_core import fts_query, fts_query_any, merge_layer_hits, merge_layer_hits_calibrated, reciprocal_rank_fusion
+    from search_core import fts_query, fts_query_any, merge_layer_hits, merge_layer_hits_calibrated, reciprocal_rank_fusion, RRF_K
+    from source_representations import MAX_CONTEXTS as _SOURCE_MAX_CONTEXTS, MAX_ORIGINS as _SOURCE_MAX_ORIGINS
     from boilerplate import is_boilerplate_chunk
     from exact_match import TitleIndex, extract_ids
-    from evidence import hydrate_results, provenance
+    from evidence import bounded_evidence_page, hydrate_results, provenance, resolution_reasons
+    from source_attribution import curated_source, stored_source_url, valid_source_url
     from research_bundle import ResearchBundleBody, build_bundle, BUNDLE_CHUNK_LIMIT, BUNDLE_SECONDS, BoundedRetriever
+    from grouped_search import grouped_hits
+    from source_discovery import select_source_candidates, merge_source_candidates
+    from candidate_pool import build_candidate_pool, rows_as_hits
+    from rerank_runtime import RerankRuntime
 
 # Preamble/author-block/checklist/reference chunks must not stand in for their
 # paper in search results. 0 restores the old behavior.
@@ -68,6 +81,9 @@ log = logging.getLogger("dtox-research.api")
 # separates the origin paper from its citations. Flagged off by default so it
 # can be A/B'd against the existing single-tier path in production.
 HIER_SEARCH = os.getenv("HIER_SEARCH", "0") == "1"
+SOURCE_DISCOVERY = os.getenv("SOURCE_DISCOVERY", "0") == "1"
+SOURCE_GENERATION_MANIFEST = os.getenv("SOURCE_GENERATION_MANIFEST", "")
+HIER_GROUPED_SEARCH = os.getenv("HIER_GROUPED_SEARCH", "0") == "1"
 COARSE_COLLECTION = os.getenv("COARSE_COLLECTION", "papers_coarse")
 HIER_PAPERS = int(os.getenv("HIER_PAPERS", "40"))
 # How many extra article candidates the article-level lexical index (see
@@ -89,6 +105,7 @@ HIER_GLOBAL_EXTRA = int(os.getenv("HIER_GLOBAL_EXTRA", "3"))
 # paper-level rankings (dense/mix shortlist, article-lexical, old global
 # chunk channel) by weighted reciprocal rank fusion -- see _hier_run.
 HIER_FUSION = os.getenv("HIER_FUSION", "mix")
+HIER_RANK_CHANNELS = os.getenv("HIER_RANK_CHANNELS", "0") == "1"
 HIER_W_DENSE = float(os.getenv("HIER_W_DENSE", "1.0"))
 HIER_W_LEX = float(os.getenv("HIER_W_LEX", "0.8"))
 HIER_W_GLOBAL = float(os.getenv("HIER_W_GLOBAL", "0.5"))
@@ -122,6 +139,7 @@ HIER_GRAPH_QUOTA_MAX = int(os.getenv("HIER_GRAPH_QUOTA_MAX", "1"))
 # only while hier search is on and actually succeeds -- a stage A/B fallback
 # still gets the chunk-level channel, exactly as before.
 HIER_CHUNK_LEXICAL = os.getenv("HIER_CHUNK_LEXICAL", "1") == "1"
+PAPER_LEXICAL_SOURCE_BALANCE = os.getenv("PAPER_LEXICAL_SOURCE_BALANCE", "0") == "1"
 # papers_coarse is migrating from bge-small (384-dim, shared EMBED_URL below) to
 # bge-base (768-dim, embed/embed_service.py). Empty by default: stage A embeds
 # with the same query vector as chunk search, byte-for-byte the old behavior.
@@ -267,6 +285,8 @@ qdrant_result_cache = TTLCache(ttl_seconds=600, max_size=1000)
 # separate from embedding_cache: a coarse-model vector must never be handed
 # back to a caller expecting a bge-small one, or vice versa.
 coarse_embedding_cache = TTLCache(ttl_seconds=1800, max_size=2000)
+source_embedding_cache = TTLCache(ttl_seconds=1800, max_size=2000)
+source_health_cache = TTLCache(ttl_seconds=30, max_size=32)
 
 
 # ---------------- lexical half of the search ----------------
@@ -279,6 +299,7 @@ coarse_embedding_cache = TTLCache(ttl_seconds=1800, max_size=2000)
 FTS_DB_PATH = os.getenv("FTS_DB_PATH", "/opt/dtox-research/fts.db")
 BM25_CANDIDATES = 40
 LEXICAL_QUERY_TIMEOUT = float(os.getenv("LEXICAL_QUERY_TIMEOUT", "2"))
+TITLE_BUILD_PRIORITY = os.getenv("TITLE_BUILD_PRIORITY", "0") == "1"
 # papers_fts.db (see pipeline/build_paper_fts.py): title+abstract only,
 # ~164k rows, small enough to sit entirely in the OS page cache -- unlike
 # fts.db (9.2M chunks, 13GB, on the slow disk that makes _bm25_candidates
@@ -389,6 +410,34 @@ def _bm25_candidates(query, layer=None, section_type=None, element_type=None,
     return out
 
 
+_TITLE_BUILD_PRIORITY_CONDITION = threading.Condition()
+_ACTIVE_LEXICAL_CALLS = 0
+
+
+def _track_lexical_call(func):
+    @functools.wraps(func)
+    def tracked(*args, **kwargs):
+        global _ACTIVE_LEXICAL_CALLS
+        if not TITLE_BUILD_PRIORITY:
+            return func(*args, **kwargs)
+        with _TITLE_BUILD_PRIORITY_CONDITION:
+            _ACTIVE_LEXICAL_CALLS += 1
+        try:
+            return func(*args, **kwargs)
+        finally:
+            with _TITLE_BUILD_PRIORITY_CONDITION:
+                _ACTIVE_LEXICAL_CALLS -= 1
+                _TITLE_BUILD_PRIORITY_CONDITION.notify_all()
+    return tracked
+
+
+def _yield_title_build():
+    with _TITLE_BUILD_PRIORITY_CONDITION:
+        _TITLE_BUILD_PRIORITY_CONDITION.wait_for(
+            lambda: _ACTIVE_LEXICAL_CALLS == 0, timeout=.05)
+
+
+@_track_lexical_call
 def _paper_bm25(query, layer=None, year_from=None, year_to=None, limit=PAPER_BM25_CANDIDATES):
     """Article ids whose title/abstract contain the query's words, best first.
 
@@ -412,23 +461,52 @@ def _paper_bm25(query, layer=None, year_from=None, year_to=None, limit=PAPER_BM2
     if year_to is not None:
         where.append("CAST(year AS INTEGER) <= ?")
         params.append(year_to)
-    sql = (f"SELECT arxiv_id, bm25(papers_fts, 0, 3.0, 1.0, 0, 0) AS rank FROM papers_fts "
-           f"WHERE {' AND '.join(where)} ORDER BY rank LIMIT ?")
+    source_balance = PAPER_LEXICAL_SOURCE_BALANCE and layer == "web3"
+    fetch_limit = max(limit, 120) if source_balance and limit <= 120 else limit
+    sql = (f"SELECT arxiv_id, rank FROM papers_fts "
+           f"WHERE {' AND '.join(where)} AND rank MATCH 'bm25(0, 3.0, 1.0, 0, 0)' "
+           "ORDER BY rank LIMIT ?")
+    deadline = time.monotonic() + LEXICAL_QUERY_TIMEOUT
+
+    def fetch_rows(conn):
+        conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
+        try:
+            return conn.execute(sql, params + [fetch_limit]).fetchall()
+        except sqlite3.OperationalError as error:
+            if time.monotonic() >= deadline:
+                raise FuturesTimeoutError() from error
+            raise
+        finally:
+            conn.set_progress_handler(None, 0)
+
     try:
         conn = _ro_conn(PAPER_FTS_PATH)
-        rows = conn.execute(sql, params + [limit]).fetchall()
+        rows = fetch_rows(conn)
+    except FuturesTimeoutError:
+        raise
     except sqlite3.OperationalError:
         # cached connection may have gone stale, or the file doesn't exist yet
         # (PAPER_LEXICAL flipped on before the first --rebuild); reconnect once.
         _ro_conn_drop(PAPER_FTS_PATH)
         try:
-            conn = _ro_conn(PAPER_FTS_PATH)
-            rows = conn.execute(sql, params + [limit]).fetchall()
+            rows = fetch_rows(_ro_conn(PAPER_FTS_PATH))
+        except FuturesTimeoutError:
+            raise
         except sqlite3.Error:
+            if time.monotonic() >= deadline:
+                raise FuturesTimeoutError()
             return []
     except sqlite3.Error:
+        if time.monotonic() >= deadline:
+            raise FuturesTimeoutError()
         return []
-    return [row[0] for row in rows if row[0]]
+    ids = [row[0] for row in rows if row[0]]
+    if not source_balance:
+        return ids[:limit]
+    whitepapers = [pid for pid in ids if pid.startswith("wp:")][:2]
+    standards = [pid for pid in ids if pid.startswith(("eip:", "simd:"))][:2]
+    fused = reciprocal_rank_fusion(ids, whitepapers, standards)
+    return sorted(ids, key=lambda pid: -fused[pid])[:limit]
 
 
 # Asking for a specific paper and asking about a subject look identical to a
@@ -663,12 +741,67 @@ def prime_qdrant_searches(texts, layer, limit=80):
         return
 
 
+def _filter_publication_points(points):
+    """Hide revision-tagged points until their exact snapshot is published.
+
+    Unmarked points predate publication journaling and intentionally remain
+    visible without opening state.db. Journal lookups are exact-pair bounded.
+    """
+    points = list(points or [])
+    marked = []
+    for point in points:
+        payload = point.get("payload") or {}
+        if "publication_revision" in payload:
+            revision = payload.get("publication_revision")
+            paper_id = payload.get("arxiv_id")
+            if isinstance(paper_id, str) and paper_id and isinstance(revision, str) and revision:
+                marked.append((paper_id, revision))
+    if not any("publication_revision" in (point.get("payload") or {}) for point in points):
+        return points
+    if not marked:
+        return [point for point in points
+                if "publication_revision" not in (point.get("payload") or {})]
+
+    visible = set()
+    unique_pairs = list(dict.fromkeys(marked))
+    try:
+        conn = _ro_conn(STATE_DB_PATH)
+        for start in range(0, len(unique_pairs), 200):
+            batch = unique_pairs[start:start + 200]
+            exact_pairs = " OR ".join(
+                "(arxiv_id=? AND revision=? AND kind='snapshot' AND state='published')"
+                for _ in batch)
+            params = [value for pair in batch for value in pair]
+            rows = conn.execute(
+                "SELECT arxiv_id, revision FROM paper_publications "
+                f"WHERE {exact_pairs}",
+                params,
+            ).fetchall()
+            visible.update((row[0], row[1]) for row in rows)
+    except (sqlite3.Error, OSError):
+        # Journal uncertainty fails closed only for revision-tagged points.
+        visible.clear()
+
+    def is_visible(point):
+        payload = point.get("payload") or {}
+        if "publication_revision" not in payload:
+            return True
+        paper_id, revision = payload.get("arxiv_id"), payload.get("publication_revision")
+        return (isinstance(paper_id, str) and bool(paper_id)
+                and isinstance(revision, str) and bool(revision)
+                and (paper_id, revision) in visible)
+
+    return [point for point in points if is_visible(point)]
+
+
 def qdrant_search(vector, qfilter, limit, timeout=45, with_payload=True, collection=None):
     collection = collection or COLLECTION
+    if isinstance(with_payload, list):
+        with_payload = list(dict.fromkeys(with_payload + ["arxiv_id", "publication_revision"]))
     cache_key = _qdrant_cache_key(vector, qfilter, with_payload, collection)
     cached = qdrant_result_cache.get(cache_key)
     if cached is not None and cached["limit"] >= limit:
-        return cached["results"][:limit]
+        return _filter_publication_points(cached["results"][:limit])
     body = {"vector": vector, "limit": limit, "with_payload": with_payload}
     if qfilter:
         body["filter"] = qfilter
@@ -678,7 +811,7 @@ def qdrant_search(vector, qfilter, limit, timeout=45, with_payload=True, collect
         resp.raise_for_status()
         results = resp.json()["result"]
         qdrant_result_cache.set(cache_key, {"limit": limit, "results": results})
-        return results
+        return _filter_publication_points(results)
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"qdrant error: {e}")
 
@@ -702,6 +835,7 @@ def qdrant_fetch_payloads(ids, timeout=45):
         )
         resp.raise_for_status()
         points = resp.json().get("result") or []
+        points = _filter_publication_points(points)
         return {p["id"]: (p.get("payload") or {}) for p in points}
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"qdrant error: {e}")
@@ -825,7 +959,7 @@ def _coarse_paper_search(vector, layer, year_from, year_to, limit, timeout, quer
 
 
 def _lexical_paper_shortlist(papers, query, layer, year_from, year_to,
-                             limit=HIER_LEXICAL_PAPERS):
+                             limit=HIER_LEXICAL_PAPERS, lexical_future=None):
     """Stage A extra: articles found by exact title/abstract term match that
     the coarse dense shortlist didn't surface (e.g. an exact acronym like
     "GRPO" that the coarse embedding doesn't place near the query vector).
@@ -843,7 +977,9 @@ def _lexical_paper_shortlist(papers, query, layer, year_from, year_to,
     best-first, kept around for HIER_FUSION="rrf" (see _hier_run) to build
     its own lexical ranking without a second BM25 round trip.
     """
-    lexical_ids = _paper_bm25(query, layer, year_from, year_to, limit=limit)
+    lexical_ids = (lexical_future.result(timeout=LEXICAL_QUERY_TIMEOUT)
+                   if lexical_future is not None else
+                   _paper_bm25(query, layer, year_from, year_to, limit=limit))[:limit]
     if not lexical_ids:
         return papers, []
     existing = {p["arxiv_id"] for p in papers}
@@ -856,18 +992,145 @@ def _lexical_paper_shortlist(papers, query, layer, year_from, year_to,
     return papers, lexical_ids
 
 
+def _document_layer_filter(must, arxiv_ids):
+    ids = list(dict.fromkeys(arxiv_ids))
+    legacy = {"must": list(must) + [{"key": "arxiv_id", "match": {"any": ids}}]}
+    layer_filters = [item for item in must if item.get("key") == "layers"]
+    if not layer_filters or len(ids) > 500:
+        return legacy
+    requested = []
+    for item in layer_filters:
+        match = item.get("match") or {}
+        if set(item) != {"key", "match"} or set(match) not in ({"any"}, {"value"}):
+            return legacy
+        values = match["any"] if "any" in match else [match["value"]]
+        if not isinstance(values, list) or not values or any(not isinstance(value, str) for value in values):
+            return legacy
+        requested.append(set(values))
+    rows = _evidence_rows(ids)
+    verified, unknown = [], []
+    for pid in ids:
+        row = rows.get(pid) or {}
+        layers = row.get("layers")
+        if (row.get("arxiv_id") != pid or not isinstance(layers, list) or not layers
+                or any(not isinstance(layer, str) or not layer for layer in layers)):
+            unknown.append(pid)
+        elif all(set(layers) & values for values in requested):
+            verified.append(pid)
+    if not verified:
+        if not unknown:
+            return None
+        return {"must": list(must) + [{"key": "arxiv_id", "match": {"any": unknown}}]}
+    facets = [item for item in must if item.get("key") != "layers"]
+    allowed = [pid for pid in ids if pid in verified or pid in unknown]
+    result = {"must": facets + [{"key": "arxiv_id", "match": {"any": allowed}}]}
+    if unknown:
+        result["should"] = [
+            {"must": [{"key": "arxiv_id", "match": {"any": verified}}]},
+            {"must": [{"key": "arxiv_id", "match": {"any": unknown}}] + layer_filters},
+        ]
+    return result
+
+
+class _StageBHits(list):
+    def __init__(self, hits, trace, partial=()):
+        super().__init__(hits)
+        self.trace = trace
+        self.partial = list(partial)
+
+
+def _shortlist_diversity_hits(vector, filt, arxiv_ids, hits, budget, timeout):
+    allowed = next(item["match"]["any"] for item in filt["must"]
+                   if item.get("key") == "arxiv_id" and "any" in item.get("match", {}))
+    covered = {canonical_id((hit.get("payload") or {}).get("arxiv_id")) for hit in hits}
+    groups = {}
+    for aid in arxiv_ids:
+        if aid in allowed and canonical_id(aid) not in covered:
+            groups.setdefault(canonical_id(aid), []).append(aid)
+    missing = list(groups.values())
+    selected = missing[:min(max(budget, 0), 500)]
+    trace = {"pooled_chunk_count": len(hits), "missing_source_count": len(missing),
+             "rescue_query_count": 0, "rescued_source_count": 0,
+             "source_status": {aid: "not_attempted" for group in missing for aid in group}}
+    partial = ["stage_b_diversity_budget"] if len(selected) < len(missing) else []
+    if not selected:
+        return _StageBHits(hits, trace, partial)
+    if timeout <= 0:
+        return _StageBHits(hits, trace, [*partial, "stage_b_diversity_timeout"])
+    searches = []
+    for group in selected:
+        per_source = copy.deepcopy(filt)
+        per_source["must"].append({"key": "arxiv_id", "match": {"any": group}})
+        searches.append({"vector": vector, "filter": per_source, "limit": 1,
+                         "with_payload": True, "with_vector": False})
+    trace["rescue_query_count"] = len(searches)
+    try:
+        response = requests.post(f"{QDRANT_URL}/collections/{COLLECTION}/points/search/batch",
+                                 json={"searches": searches}, timeout=timeout)
+        response.raise_for_status()
+        results = response.json().get("result")
+        if (not isinstance(results, list) or len(results) != len(selected)
+                or any(not isinstance(result, list) or len(result) > 1 for result in results)):
+            raise ValueError("malformed Qdrant shortlist batch")
+        for group, result in zip(selected, results):
+            for hit in result:
+                score = hit.get("score")
+                if (not isinstance(hit.get("payload"), dict)
+                        or hit["payload"].get("arxiv_id") not in group
+                        or hit.get("id") is None or isinstance(score, bool)
+                        or not isinstance(score, (int, float)) or not math.isfinite(score)):
+                    raise ValueError("malformed Qdrant shortlist hit")
+        visible_ids = {hit["id"] for hit in _filter_publication_points(
+            [hit for result in results for hit in result])}
+        rescued = []
+        for group, result in zip(selected, results):
+            visible = [hit for hit in result if hit["id"] in visible_ids]
+            for aid in group:
+                trace["source_status"][aid] = "rescued" if visible else "no_visible_chunk_returned"
+            if visible:
+                rescued.append({**visible[0], "stage_b_origin": "shortlist_rescue"})
+        trace["rescued_source_count"] = len(rescued)
+        return _StageBHits([*hits, *rescued], trace, partial)
+    except (requests.RequestException, ValueError, TypeError, AttributeError) as error:
+        log.warning("HIER_SEARCH: shortlist diversity incomplete: %s", error)
+        for group in selected:
+            for aid in group:
+                trace["source_status"][aid] = "batch_failed"
+        return _StageBHits(hits, trace, [*partial, "stage_b_diversity"])
+
+
 def _hier_stage_b_hits(vector, must, arxiv_ids, dense_limit, timeout):
     """Stage B: chunk evidence for exactly the stage-A shortlist.
 
     One filtered two_phase_dense_search over papers_fulltext -- arxiv_id in
-    the shortlist, plus every other filter the caller applied (section_type,
-    element_type, terms, year, layer) -- through the ordinary single-filter
-    path (layers=None), never the per-layer one.
+    the shortlist, canonical document layer where known, and every chunk
+    facet (section_type, element_type, terms, year). Unknown metadata keeps
+    the original chunk-layer constraint. If the pooled budget can hide a
+    shortlisted source, one bounded batch checks its best matching chunk.
     """
-    filt = {"must": list(must) + [{"key": "arxiv_id", "match": {"any": arxiv_ids}}]}
+    unique_ids = list(dict.fromkeys(arxiv_ids))
+    if not unique_ids:
+        return []
+    filt = _document_layer_filter(must, unique_ids)
+    if filt is None:
+        return []
+    if HIER_GROUPED_SEARCH:
+        try:
+            hits = grouped_hits(requests.post, QDRANT_URL, COLLECTION, vector, filt,
+                                limit=len(unique_ids), timeout=timeout, group_size=1)
+            return _filter_publication_points(hits)
+        except (requests.RequestException, ValueError) as error:
+            raise HTTPException(status_code=502,
+                                detail=f"qdrant grouped search error: {error}") from error
+    deadline = time.monotonic() + timeout
     final_limit = max(len(arxiv_ids), 1)
-    hits, _, _, _ = two_phase_dense_search(vector, filt, dense_limit, final_limit, timeout,
-                                           layers=None)
+    hits, hydrated_pool, leftover_pool, _ = two_phase_dense_search(
+        vector, filt, dense_limit, final_limit, timeout, layers=None)
+    if len(hydrated_pool) + len(leftover_pool) >= dense_limit or leftover_pool:
+        result = _shortlist_diversity_hits(vector, filt, unique_ids, hits, dense_limit,
+                                          deadline - time.monotonic())
+        result.trace["pooled_candidate_count"] = len(hydrated_pool) + len(leftover_pool)
+        return result
     return hits
 
 
@@ -968,7 +1231,11 @@ def _graph_channel(pool_ids, known_ids, chunk_ids, vector, must, timeout, counts
         need = [a for a in ranked if a not in chunk_ids]
         chunks = {}
         if need:
-            for h in _hier_stage_b_hits(vector, must, need, HIER_CHUNKS, timeout):
+            stage_b = _hier_stage_b_hits(vector, must, need, HIER_CHUNKS, timeout)
+            if getattr(stage_b, "partial", []):
+                if counts_out is not None:
+                    counts_out["_error"] = True
+            for h in stage_b:
                 aid = (h.get("payload") or {}).get("arxiv_id")
                 if aid and (aid not in chunks or (h.get("score") or 0) > (chunks[aid].get("score") or 0)):
                     chunks[aid] = h
@@ -980,7 +1247,8 @@ def _graph_channel(pool_ids, known_ids, chunk_ids, vector, must, timeout, counts
         return [], {}
 
 
-def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, layers, query=""):
+def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, layers, query="",
+              paper_lexical_future=None):
     """Stages A+B+C of HIER_SEARCH, sharing _run_search's old dense-retrieval
     shape so the caller doesn't need to know which path ran.
 
@@ -1012,18 +1280,28 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
         two_phase_dense_search, vector, qfilter, dense_limit, limit, dense_timeout,
         layers=layers)
     fallback_reason = "coarse_fallback"
+    paper_dense_ids = []
+    stage_b_partial = []
     try:
         papers = _coarse_paper_search(vector, body.layer, body.year_from, body.year_to,
                                       HIER_PAPERS, dense_timeout, query=query)
+        paper_dense_ids = [p["arxiv_id"] for p in papers]
         lexical_ids = []
+        paper_lexical_skipped = False
         if PAPER_LEXICAL:
-            papers, lexical_ids = _lexical_paper_shortlist(papers, query, body.layer,
-                                                            body.year_from, body.year_to)
+            try:
+                papers, lexical_ids = _lexical_paper_shortlist(
+                    papers, query, body.layer, body.year_from, body.year_to,
+                    lexical_future=paper_lexical_future)
+            except FuturesTimeoutError:
+                paper_lexical_skipped = True
         if not papers:
             fallback_reason = "no_coarse_candidates"
             raise RuntimeError("papers_coarse returned no candidates")
         arxiv_ids = [p["arxiv_id"] for p in papers]
         stage_b_hits = _hier_stage_b_hits(vector, must, arxiv_ids, HIER_CHUNKS, dense_timeout)
+        stage_b_partial = getattr(stage_b_hits, "partial", [])
+        stage_b_trace = getattr(stage_b_hits, "trace", None)
         best_chunk = {}
         for h in stage_b_hits:
             aid = (h.get("payload") or {}).get("arxiv_id")
@@ -1053,23 +1331,27 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
             global_pool.shutdown(wait=False)
         if fallback_reason == "coarse_fallback":
             dense_partial = list(dense_partial) + [fallback_reason]
+        dense_partial = list(dense_partial) + stage_b_partial
         return hits, leftover_pool, dense_partial, None
 
     known_ids = {chunk["payload"]["arxiv_id"] for chunk in hits}
     global_channel = None
     c_hits = []
-    c_partial = []
+    c_partial = list(stage_b_partial)
     try:
-        c_hits, _, _, c_partial = global_future.result(timeout=HIER_GLOBAL_GRACE)
+        c_hits, _, _, global_partial = global_future.result(timeout=HIER_GLOBAL_GRACE)
+        c_partial.extend(global_partial)
     except (FuturesTimeoutError, HTTPException):
         global_channel = "skipped"
-        c_partial = ["global"]
+        c_partial.append("global")
     finally:
         global_pool.shutdown(wait=False)
 
     if HIER_FUSION != "rrf":
         extra = {"paper_scores": paper_scores, "global_channel": global_channel,
-                 "global_extra": []}
+                 "global_extra": [], "paper_lexical_used": bool(lexical_ids),
+                 "paper_lexical_skipped": paper_lexical_skipped,
+                 "stage_b_trace": stage_b_trace}
         for h in c_hits:
             if len(extra["global_extra"]) >= HIER_GLOBAL_EXTRA:
                 break
@@ -1079,10 +1361,22 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
                 known_ids.add(aid)
         return hits, [], c_partial, extra
 
-    # HIER_FUSION == "rrf": weighted RRF over three paper-level rankings
-    # instead of the mix blend + tail splice above.
-    l_dense = [chunk["payload"]["arxiv_id"] for _, _, chunk in merged]
+    # HIER_FUSION == "rrf": weighted RRF over paper-level rankings instead
+    # of the mix blend + tail splice above. The optional rank-channel path
+    # keeps coarse-paper and small-chunk cosine scales separate.
     l_lex = [aid for aid in lexical_ids if aid in best_chunk]
+    rank_channels = HIER_RANK_CHANNELS
+    if rank_channels:
+        l_paper_dense = [aid for aid in paper_dense_ids if aid in best_chunk]
+        l_chunk = sorted(best_chunk,
+                         key=lambda aid: (-(best_chunk[aid].get("score") or 0), aid))
+        l_dense = l_paper_dense
+        base_lists = [l_paper_dense, l_chunk, l_lex]
+        base_weights = [HIER_W_DENSE / 2, HIER_W_DENSE / 2, HIER_W_LEX]
+    else:
+        l_dense = [chunk["payload"]["arxiv_id"] for _, _, chunk in merged]
+        base_lists = [l_dense, l_lex]
+        base_weights = [HIER_W_DENSE, HIER_W_LEX]
     global_chunk = {}
     l_global = []
     for h in c_hits:
@@ -1091,19 +1385,32 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
             continue
         if aid not in l_global:
             l_global.append(aid)
-        if aid not in best_chunk and aid not in global_chunk:
+        if rank_channels:
+            if aid in best_chunk:
+                if (h.get("score") or 0) > (best_chunk[aid].get("score") or 0):
+                    best_chunk[aid] = h
+            elif (aid not in global_chunk
+                  or (h.get("score") or 0) > (global_chunk[aid].get("score") or 0)):
+                global_chunk[aid] = h
+        elif aid not in best_chunk and aid not in global_chunk:
             global_chunk[aid] = h
 
-    fused = reciprocal_rank_fusion(
-        l_dense, l_lex, l_global,
-        weights=[HIER_W_DENSE, HIER_W_LEX, HIER_W_GLOBAL])
+    rank_lists = [*base_lists, l_global]
+    rank_weights = [*base_weights, HIER_W_GLOBAL]
+    fused = reciprocal_rank_fusion(*rank_lists, weights=rank_weights)
 
     l_graph = []
     graph_chunk = {}
     graph_counts = {}
     graph_pool = 0
     if HIER_GRAPH:
-        pre = sorted(set(l_dense) | set(l_lex) | set(l_global), key=lambda a: -fused.get(a, 0.0))
+        pre_candidates = list(dict.fromkeys(a for ranked in rank_lists for a in ranked))
+        if rank_channels:
+            pre_order = {aid: i for i, aid in enumerate(pre_candidates)}
+            pre = sorted(pre_candidates,
+                         key=lambda aid: (-fused.get(aid, 0.0), pre_order[aid]))
+        else:
+            pre = sorted(set(pre_candidates), key=lambda aid: -fused.get(aid, 0.0))
         have = set(best_chunk) | set(global_chunk)
         pre = [a for a in pre if a in have]
         graph_counts = {}
@@ -1114,10 +1421,11 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
         graph_pool = min(len(pre), HIER_GRAPH_POOL)
         if l_graph:
             fused = reciprocal_rank_fusion(
-                l_dense, l_lex, l_global, l_graph,
-                weights=[HIER_W_DENSE, HIER_W_LEX, HIER_W_GLOBAL, HIER_W_GRAPH])
+                *rank_lists, l_graph, weights=[*rank_weights, HIER_W_GRAPH])
 
     dense_rank = {aid: i + 1 for i, aid in enumerate(l_dense)}
+    chunk_rank = ({aid: i + 1 for i, aid in enumerate(l_chunk)}
+                  if rank_channels else {})
     lex_rank = {aid: i + 1 for i, aid in enumerate(l_lex)}
     global_rank = {aid: i + 1 for i, aid in enumerate(l_global)}
 
@@ -1127,15 +1435,23 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
     for aid, h in graph_chunk.items():
         chunk_by_id.setdefault(aid, h)
 
-    all_ids = set(l_dense) | set(l_lex) | set(l_global) | set(l_graph)
-    ordered_ids = sorted(all_ids, key=lambda aid: -fused.get(aid, 0.0))
+    if rank_channels:
+        final_lists = [*rank_lists, *([l_graph] if l_graph else [])]
+        all_ids = list(dict.fromkeys(aid for ranked in final_lists for aid in ranked))
+        tie_order = {aid: i for i, aid in enumerate(all_ids)}
+        ordered_ids = sorted(all_ids,
+                             key=lambda aid: (-fused.get(aid, 0.0), tie_order[aid]))
+    else:
+        all_ids = set(l_dense) | set(l_lex) | set(l_global) | set(l_graph)
+        ordered_ids = sorted(all_ids, key=lambda aid: -fused.get(aid, 0.0))
     quota_ids = _select_graph_quota(l_graph, graph_counts, graph_pool, set(chunk_by_id))
 
     lex_exempt = {aid for aid in l_lex if lex_rank[aid] <= 3}
     found_via = {aid: ("paper lexical" if aid in lex_exempt else "paper")
                 for aid in ordered_ids}
     fusion_ranks = {aid: {"dense": dense_rank.get(aid), "lex": lex_rank.get(aid),
-                          "global": global_rank.get(aid)}
+                          "global": global_rank.get(aid),
+                          **({"chunk": chunk_rank.get(aid)} if rank_channels else {})}
                     for aid in ordered_ids}
     if HIER_GRAPH:
         graph_rank = {aid: i + 1 for i, aid in enumerate(l_graph)}
@@ -1149,14 +1465,18 @@ def _hier_run(vector, qfilter, must, body, limit, dense_limit, dense_timeout, la
     hits = [chunk_by_id[aid] for aid in ordered_ids if aid in chunk_by_id]
     extra = {
         "paper_scores": paper_scores,
+        "paper_lexical_used": bool(lexical_ids),
+        "paper_lexical_skipped": paper_lexical_skipped,
         "global_channel": global_channel,
         "global_extra": [],
         "fusion_ranks": fusion_ranks,
+        "fusion_scores": {aid: round(score, 6) for aid, score in fused.items()},
         "lex_exempt": lex_exempt,
         "found_via": found_via,
         "graph_quota": graph_quota,
         "quota_chunks": {aid: chunk_by_id[aid] for aid in graph_quota},
         "graph_channel": "skipped" if "graph" in c_partial else None,
+        "stage_b_trace": stage_b_trace,
     }
     return hits, [], c_partial, extra
 
@@ -1199,6 +1519,9 @@ def qdrant_scroll_by_arxiv(arxiv_id: str, limit=1000, page=200, payload_fields=N
     keys (the outline needs no text); default is the whole payload."""
     qfilter = {"must": [{"key": "arxiv_id", "match": {"value": arxiv_id}}]}
     points = []
+    raw_seen = 0
+    if payload_fields:
+        payload_fields = list(dict.fromkeys(list(payload_fields) + ["arxiv_id", "publication_revision"]))
     offset = None
     scroll_deadline = min(deadline, time.monotonic() + timeout) if deadline is not None else None
     while True:
@@ -1207,7 +1530,7 @@ def qdrant_scroll_by_arxiv(arxiv_id: str, limit=1000, page=200, payload_fields=N
             request_timeout = min(timeout, scroll_deadline - time.monotonic())
             if request_timeout <= 0:
                 raise TimeoutError("paper retrieval time budget exhausted")
-        body = {"filter": qfilter, "limit": min(limit, page), "with_vector": False,
+        body = {"filter": qfilter, "limit": min(max(limit - raw_seen, 0), page), "with_vector": False,
                 "with_payload": {"include": payload_fields} if payload_fields else True}
         if offset:
             body["offset"] = offset
@@ -1217,9 +1540,11 @@ def qdrant_scroll_by_arxiv(arxiv_id: str, limit=1000, page=200, payload_fields=N
         except requests.RequestException as e:
             raise HTTPException(status_code=502, detail=f"qdrant error: {e}")
         result = resp.json()["result"]
-        points.extend(result["points"])
+        raw_points = result["points"]
+        raw_seen += len(raw_points)
+        points.extend(_filter_publication_points(raw_points))
         offset = result.get("next_page_offset")
-        if not offset or len(points) >= limit:
+        if not offset or raw_seen >= limit:
             break
     return points
 
@@ -1255,6 +1580,7 @@ TABLE_MIN_DENSITY = 0.08
 SOURCE_LABELS = {
     "acl": "ACL Anthology",
     "iacr": "IACR ePrint",
+    "author": "Author / institutional copy",
     "eip": "Ethereum EIP",
     "simd": "Solana SIMD",
     "wp": "Industry whitepaper",
@@ -1301,15 +1627,23 @@ def _source_url_for_id(pid, has_payload):
         return None if has_payload else f"https://hal.science/hal-{pid.split(':', 1)[1]}"
     if pid.startswith("gh:"):
         return None
-    return f"https://arxiv.org/abs/{pid}"
+    if re.fullmatch(r"(?:\d{4}\.\d{4,5}|[a-zA-Z][a-zA-Z.-]*/\d{7})(?:v\d+)?", pid):
+        return f"https://arxiv.org/abs/{pid}"
+    return None
 
 
 def source_url(paper_id, payload=None):
     """Canonical public URL for a document, by source."""
     pid = str(paper_id or "")
+    if pid.startswith("author:"):
+        return stored_source_url(payload)
     # a whitepaper carries its own origin: it was fetched from a project site
-    if payload and (payload.get("source_url") or payload.get("url")):
-        return payload.get("source_url") or payload["url"]
+    stored = stored_source_url(payload)
+    if stored:
+        return stored
+    curated = curated_source(pid, (payload or {}).get("title"))
+    if curated:
+        return curated["url"]
     return _source_url_for_id(pid, payload is not None)
 
 
@@ -1351,6 +1685,11 @@ LICENSE_INFO = {
         "terms": "IACR ePrint: authors retain copyright; acquisition may include "
                  "an abstract or PDF text. Check the linked paper for reuse terms.",
         "redistribution": "quote briefly with attribution",
+    },
+    "author": {
+        "spdx": None,
+        "terms": "Author or institutional PDF copy; licence is unknown unless stated on the linked document.",
+        "redistribution": "quote briefly with attribution; verify the document's licence",
     },
     "arxiv": {
         "spdx": None,
@@ -1533,7 +1872,7 @@ def _lexical_fallback_results(query, paper_ids, limit):
     for row in rows:
         best.setdefault(row[1], row)
     meta_sql = (f"SELECT arxiv_id,title,citation_count,venue,niche_score,matched_terms,source_url "
-               f"FROM papers WHERE arxiv_id IN ({marks})")
+               f"FROM papers WHERE status='done' AND arxiv_id IN ({marks})")
     try:
         state = _ro_conn(STATE_DB_PATH)
         meta = {row[0]: row[1:] for row in state.execute(meta_sql, ids).fetchall()}
@@ -1542,16 +1881,15 @@ def _lexical_fallback_results(query, paper_ids, limit):
         try:
             meta = {row[0]: row[1:] for row in _ro_conn(STATE_DB_PATH).execute(meta_sql, ids).fetchall()}
         except sqlite3.Error:
-            meta = {}
+            return []
     except sqlite3.Error:
-        meta = {}
+        return []
     results = []
     for paper_id in ids:
         row = best.get(paper_id)
-        if not row:
+        if not row or paper_id not in meta:
             continue
-        title, citations, venue, niche, matched, stored_url = meta.get(
-            paper_id, (None, None, None, None, None, None))
+        title, citations, venue, niche, matched, stored_url = meta[paper_id]
         try:
             terms = json.loads(matched) if matched else []
         except (TypeError, json.JSONDecodeError):
@@ -1586,13 +1924,36 @@ def _lexical_fallback_results(query, paper_ids, limit):
     return results
 
 
-def _scored_results_for_audit(payload):
+def _scored_results_for_audit(payload, incomplete=None):
     scored = [hit for hit in payload.get("results", [])
-              if isinstance(hit.get("score"), (int, float))]
+              if type(hit.get("score")) in (int, float) and math.isfinite(hit["score"])
+              and hit.get("evidence_state") != "not_read" and hit.get("retrieval_role") != "discovery_only"]
     if payload.get("partial"):
         raise HTTPException(
             status_code=503,
             detail="retrieval incomplete; refusing to infer absence from a partial search")
+    if payload.get("source_generation"):
+        unqualified = [hit for hit in [*payload.get("results", []), *payload.get("source_candidates", [])]
+                       if hit.get("evidence_state") == "not_read" or hit.get("retrieval_role") == "discovery_only"
+                       or type(hit.get("score")) not in (int, float) or not math.isfinite(hit["score"])]
+        summary = payload.get("retrieval_summary", {})
+        count = max(summary.get("discovery_only_count", 0), len({hit["arxiv_id"] for hit in unqualified}))
+        if count:
+            if incomplete is None:
+                raise HTTPException(status_code=503,
+                                    detail="discovered candidate accounting includes unread originals; audit incomplete")
+            unread = {canonical_id(hit["arxiv_id"]) for hit in unqualified
+                      if hit.get("evidence_state") == "not_read" or type(hit.get("score")) not in (int, float)
+                      or not math.isfinite(hit["score"])}
+            incomplete["incomplete_evidence"] = True
+            incomplete["unread_count"] = max(incomplete["unread_count"],
+                                             summary.get("unread_original_count", 0), len(unread))
+            incomplete["unqualified_count"] = max(incomplete["unqualified_count"], count)
+            for hit in unqualified:
+                incomplete["sources"].setdefault(canonical_id(hit["arxiv_id"]), {
+                    "id": hit["arxiv_id"], "title": hit.get("title"),
+                    "evidence_state": hit.get("evidence_state", "not_read"),
+                    "retrieval_role": "discovery_only", "verification_required": True})
     return scored
 
 
@@ -1675,23 +2036,65 @@ def search(body: SearchBody, x_api_key: Optional[str] = Header(default=None)):
     auth_and_limit(x_api_key)
     payload = _run_search(body, x_api_key)
     # a copy: `payload` may be the cached object, and scope has its own cache
-    return {**payload, "scope": _query_scope(body.query)}
+    scoped = dict(payload)
+    scope = _query_scope(body.query)
+    if scope.get("in_scope") is False:
+        scoped.pop("source_candidates", None)
+        scoped.pop("source_candidate_count", None)
+        scoped.pop("discovery_note", None)
+        summary = scoped.get("retrieval_summary")
+        if isinstance(summary, dict):
+            summary = dict(summary)
+            summary["auxiliary_candidate_count"] = 0
+            summary["source_candidates_returned_count"] = 0
+            scoped["retrieval_summary"] = summary
+    elif scope.get("in_scope") is None and scoped.get("source_candidates"):
+        scoped["discovery_note"] = (
+            (scoped.get("discovery_note", "") + " ").strip()
+            + "Query scope is uncertain; verify topical fit before using these leads.")
+    return {**scoped, "scope": scope}
 
 
 def _compact_search(full):
     """Copy of a search payload without the per-hit license and arxiv_url;
     the licenses go once at the root, keyed by source label. Never mutates
     `full`, which may be the cached object."""
-    licenses, results = {}, []
-    for r in full.get("results", []):
-        r = dict(r)
-        lic = r.pop("license", None)
-        if lic is not None:
-            licenses[r.get("source")] = lic
-        r.pop("arxiv_url", None)
-        results.append(r)
+    licenses = {}
+
+    candidate_fields = {
+        "arxiv_id", "title", "url", "source", "year", "section_type",
+        "provenance_missing", "source_url_origin", "source_url_status", "legacy_id_alias",
+        "section_title", "element_type", "fulltext", "evidence", "score",
+        "paper_score", "found_via", "channels", "fusion_ranks",
+        "retrieval_role", "candidate_reason", "relevance_floor",
+        "passes_relevance_floor", "verification_required", "candidate_channel",
+        "candidate_channel_note",
+        "retrieval_score", "evidence_state", "source_representations", "source_generation",
+    }
+
+    def compact_rows(rows, candidates=False):
+        compacted = []
+        for row in rows:
+            row = dict(row)
+            lic = row.pop("license", None)
+            if lic is not None:
+                licenses[row.get("source")] = lic
+            row.pop("arxiv_url", None)
+            if candidates:
+                row = {key: value for key, value in row.items()
+                       if key in candidate_fields}
+                if isinstance(row.get("evidence"), dict):
+                    row["evidence"] = dict(row["evidence"])
+                    row["evidence"]["returned_chars"] = 0
+            compacted.append(row)
+        return compacted
+
+    results = compact_rows(full.get("results", []))
     out = dict(full)
     out["results"] = results
+    if "source_candidates" in full:
+        out["source_candidates"] = compact_rows(
+            full.get("source_candidates", []), candidates=True)
     out["licenses"] = licenses
     return out
 
@@ -1883,7 +2286,8 @@ def _build_title_index():
     try:
         rows = _ro_conn(STATE_DB_PATH).execute(
             "SELECT arxiv_id, title, citation_count FROM papers WHERE status='done'").fetchall()
-        built = TitleIndex(rows)
+        built = (TitleIndex(rows, checkpoint=_yield_title_build)
+                 if TITLE_BUILD_PRIORITY else TitleIndex(rows))
     except Exception:
         _ro_conn_drop(STATE_DB_PATH)
         built = None
@@ -1936,6 +2340,25 @@ def _exact_matches(query):
     return out[:EXACT_MAX]
 
 
+def _audit_named_source_ids(claim, phrasings, idea, allow_idea_fallback=False):
+    """Explicit document IDs belong to their claim, not to sibling claims."""
+    ids = []
+    for query in [claim] + list(phrasings):
+        ids.extend(extract_ids(query))
+    if not ids and allow_idea_fallback:
+        idea_ids = extract_ids(idea)
+        if len({canonical_id(paper_id) for paper_id in idea_ids}) == 1:
+            ids = idea_ids
+    out, seen = [], set()
+    for paper_id in ids:
+        head = canonical_id(paper_id)
+        if head in seen:
+            continue
+        seen.add(head)
+        out.append(paper_id)
+    return out[:EXACT_MAX]
+
+
 TITLE_MATCH_SLOT = 2  # a title match may be a coincidence of wording: third place at best
 
 
@@ -1956,7 +2379,7 @@ def _place_named(named_items, rest):
     return out
 
 
-def _inject_exact(results, query, constraints, limit, timeout):
+def _inject_exact(results, query, constraints, limit, timeout, _deadline=None):
     """Put the documents the query names at the top, whatever else was found.
 
     Identifiers and titles are not subject queries: EIP-7702 came back outside
@@ -1970,8 +2393,9 @@ def _inject_exact(results, query, constraints, limit, timeout):
     missing = [d for d, _ in named if canonical_id(d) not in by_head]
     fresh = {}
     if missing:
+        budget = {"_deadline": _deadline} if _deadline is not None else {}
         for item in _score_specific_papers(query, missing, None, timeout=timeout,
-                                           constraints=constraints):
+                                           constraints=constraints, **budget):
             fresh[item["arxiv_id"]] = item
     front = []
     for doc_id, via in named:
@@ -2033,10 +2457,594 @@ def _merge_soft_layers(primary, partner_payload, limit):
     return _collapse_twins([pool[a] for a in order])[:limit]
 
 
+def _candidate_matches_active_filters(row, body, terms):
+    if body.layer is not None:
+        layers = row.get("layers")
+        if not isinstance(layers, (list, tuple, set)) or body.layer not in layers:
+            return False
+    if body.year_from is not None or body.year_to is not None:
+        year = row.get("year")
+        if isinstance(year, bool) or not isinstance(year, int):
+            return False
+        if body.year_from is not None and year < body.year_from:
+            return False
+        if body.year_to is not None and year > body.year_to:
+            return False
+    if body.section_type is not None and row.get("section_type") != body.section_type:
+        return False
+    if body.element_type is not None and row.get("element_type") != body.element_type:
+        return False
+    if terms:
+        row_terms = row.get("terms")
+        if not isinstance(row_terms, (list, tuple, set)):
+            return False
+        available = {str(term).casefold() for term in row_terms}
+        if not any(term.casefold() in available for term in terms):
+            return False
+    return True
+
+
+def _empty_primary_source_candidates(rows, limit, floor, body, terms):
+    """Return a small, explicitly unverified lead list from the observed pool only."""
+    eligible = []
+    for row in rows:
+        score = row.get("score")
+        if isinstance(score, bool) or not isinstance(score, (int, float)):
+            continue
+        try:
+            if not math.isfinite(score):
+                continue
+        except (OverflowError, TypeError, ValueError):
+            continue
+        if not _candidate_matches_active_filters(row, body, terms):
+            continue
+        hit = {"score": score, "payload": row}
+        if _hit_is_boilerplate(hit):
+            continue
+        eligible.append(row)
+    pool_hits = rows_as_hits(eligible)
+    pool_ranks = {row.get("arxiv_id"): row.get("fusion_ranks")
+                  for row in eligible if row.get("fusion_ranks")}
+    candidates = select_source_candidates(
+        pool_hits, [], min(limit, 3), floor, canonical_id, _result_from_hit,
+        _hit_is_boilerplate, pool_ranks)
+    rows_by_key = {canonical_id(row.get("arxiv_id")): row for row in eligible
+                   if row.get("arxiv_id")}
+    for candidate in candidates:
+        provenance_row = rows_by_key.get(canonical_id(candidate.get("arxiv_id")), {})
+        for name in ("found_via", "fusion_ranks", "fusion_score", "paper_score", "channels"):
+            if name in provenance_row:
+                candidate[name] = copy.deepcopy(provenance_row[name])
+        candidate["candidate_reason"] = "related_source_after_empty_primary"
+    return candidates
+
+
+_SOURCE_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="source-api")
+_SOURCE_SLOTS = threading.BoundedSemaphore(4)
+_SOURCE_WORKER = threading.local()
+
+
+class _SourceBusy(RuntimeError):
+    pass
+
+
+def _source_remaining(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("source retrieval deadline")
+    return remaining
+
+
+def _source_call(deadline, function, *args, **kwargs):
+    remaining = _source_remaining(deadline)
+    if getattr(_SOURCE_WORKER, "active", False):
+        result = function(*args, **kwargs)
+        _source_remaining(deadline)
+        return result
+    if not _SOURCE_SLOTS.acquire(blocking=False):
+        raise _SourceBusy("source retrieval capacity exhausted")
+    def run():
+        _SOURCE_WORKER.active = True
+        try:
+            _source_remaining(deadline)
+            return function(*args, **kwargs)
+        finally:
+            try:
+                for conn in getattr(_ro_conn_local, "conns", {}).values():
+                    conn.close()
+            finally:
+                _ro_conn_local.conns = {}
+                _SOURCE_WORKER.active = False
+    try:
+        future = _SOURCE_POOL.submit(run)
+    except BaseException:
+        _SOURCE_SLOTS.release()
+        raise
+    future.add_done_callback(lambda finished: _SOURCE_SLOTS.release())
+    try:
+        result = future.result(timeout=remaining)
+        _source_remaining(deadline)
+        return result
+    finally:
+        future.cancel()
+
+
+def _source_visible(records, timeout):
+    deadline = time.monotonic() + timeout
+
+    def read():
+        records_by_id = {row["source_id"]: row for row in records if row.get("status") == "done"}
+        current = _paper_rows(list(records_by_id))
+        jobs = {}
+        ids = list(current)
+        conn = _ro_conn(STATE_DB_PATH, timeout=max(0.001, _source_remaining(deadline)))
+        for start in range(0, len(ids), 200):
+            _source_remaining(deadline)
+            batch = ids[start:start + 200]
+            for sid, revision, state in conn.execute(
+                    "SELECT arxiv_id,revision,state FROM paper_publications WHERE kind='snapshot' "
+                    "AND state!='superseded' "
+                    f"AND arxiv_id IN ({','.join('?' * len(batch))})", batch):
+                jobs.setdefault(sid, []).append((revision, state))
+        points = []
+        for sid in ids:
+            record = records_by_id[sid]
+            revision, snapshots = record.get("publication_revision"), jobs.get(sid, [])
+            if ((revision is None and not snapshots)
+                    or (revision is not None and snapshots == [(revision, "published")])):
+                points.append({"id": sid, "payload": {"arxiv_id": sid,
+                    **({"publication_revision": revision} if revision is not None else {})}})
+        visible = _filter_publication_points(points)
+        return {point["id"]: records_by_id[point["id"]].get("publication_revision") for point in visible}
+
+    return _source_call(deadline, read)
+
+
+def _source_embed(text, timeout):
+    if not COARSE_EMBED_URL:
+        raise HTTPException(status_code=503, detail="approved source embedding endpoint unavailable")
+    response = requests.post(COARSE_EMBED_URL, json={"text": text, "query": True}, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+def _source_health(manifest, timeout):
+    if not COARSE_EMBED_URL.endswith("/embed"):
+        raise ValueError("approved source embedding endpoint unavailable")
+    key = (manifest["generation"], manifest["cache_identity"], COARSE_EMBED_URL,
+           json.dumps(manifest["embedding"], sort_keys=True))
+    cached = source_health_cache.get(key)
+    if cached is not None:
+        return copy.deepcopy(cached)
+    response = requests.get(COARSE_EMBED_URL[:-6] + "/healthz", timeout=min(timeout, 1.0))
+    response.raise_for_status()
+    health = response.json()
+    if (health.get("status") != "ok" or health.get("model") != manifest["model_id"]
+            or health.get("embedding") != manifest["embedding"]):
+        raise ValueError("source embedding model/hash/contract mismatch")
+    source_health_cache.set(key, copy.deepcopy(health))
+    return health
+
+
+def _source_dense(vector, collection, filters, limit, timeout):
+    response = requests.post(
+        f"{QDRANT_URL}/collections/{collection}/points/search/groups",
+        json={"vector": vector, "filter": filters, "group_by": "source_id",
+              "group_size": 1, "limit": limit,
+              "with_payload": ["representation_id", "generation"]}, timeout=timeout)
+    response.raise_for_status()
+    return response.json()["result"]
+
+
+def _source_chunk_must(filters):
+    must = []
+    for field in ("layer", "section_type", "element_type"):
+        value = filters.get(field)
+        if value is not None:
+            must.append({"key": "layers" if field == "layer" else field,
+                         "match": {"any": [value]} if field == "layer" else {"value": value}})
+    if filters.get("terms"):
+        must.append({"key": "terms", "match": {"any": filters["terms"]}})
+    bounds = {key: filters[field] for field, key in (("year_from", "gte"), ("year_to", "lte"))
+              if filters.get(field) is not None}
+    if bounds:
+        must.append({"key": "year", "range": bounds})
+    return must
+
+
+def _source_owned(query, filters, limit, timeout, get_vector):
+    deadline = time.monotonic() + timeout
+    vector = get_vector(query, _source_remaining(deadline))
+    qfilter = filters if "must" in filters else {"must": _source_chunk_must(filters)}
+    hits = grouped_hits(requests.post, QDRANT_URL, COLLECTION, vector, qfilter,
+                        limit=limit, timeout=_source_remaining(deadline), group_size=1)
+    hits = _source_call(deadline, _filter_publication_points, hits)
+    records = [{"source_id": hit["payload"]["arxiv_id"], "status": "done",
+                "publication_revision": hit["payload"].get("publication_revision")} for hit in hits]
+    live = _source_visible(records, _source_remaining(deadline))
+    return [{**hit, "payload": {**hit["payload"], "publication_revision": live[hit["payload"]["arxiv_id"]]}}
+            for hit in hits if hit["payload"]["arxiv_id"] in live]
+
+
+def discover_sources(manifest_path, query, *, hybrid=True, limit=50, **kwargs):
+    try:
+        from . import source_generation
+    except ImportError:
+        import source_generation
+    discover = source_generation.discover_sources
+    if not isinstance(query, str) or len(query) > 65536:
+        raise ValueError("invalid query")
+    deadline = time.monotonic() + kwargs["timeout"]
+    try:
+        manifest = source_generation.load_manifest(manifest_path)
+    except (OSError, ValueError, TypeError, KeyError):
+        return discover(manifest_path, query, hybrid=hybrid, limit=limit, **kwargs)
+    try:
+        health = _source_health(manifest, _source_remaining(deadline))
+    except (ValueError, HTTPException, requests.RequestException):
+        return {"status": "unavailable", "generation": manifest["generation"], "sources": [],
+                "partial": True, "embedding": manifest["embedding"],
+                "diagnostics": {"cache_identity": manifest["cache_identity"],
+                                "reasons": ["query_embedding_contract_unavailable"]}}
+    embed = kwargs["embed_query"]
+    embedding_mismatch = threading.Event()
+    def verified_embed(text, timeout):
+        key = (manifest["generation"], manifest["cache_identity"], COARSE_EMBED_URL, text)
+        vector = source_embedding_cache.get(key)
+        if vector is None:
+            response = embed(text, min(timeout, _source_remaining(deadline)))
+            if not isinstance(response, dict) or response.get("embedding") != manifest["embedding"]:
+                embedding_mismatch.set()
+                raise ValueError("source query vector embedding identity mismatch")
+            vector = response.get("vector")
+            if (not isinstance(vector, (list, tuple)) or len(vector) != manifest["dimension"]
+                    or any(type(value) not in (int, float) or not math.isfinite(value) for value in vector)):
+                raise ValueError("invalid source query vector")
+            source_embedding_cache.set(key, vector)
+        return vector
+    kwargs["embed_query"] = verified_embed
+    kwargs["runtime_descriptor"] = lambda timeout: health
+    kwargs["timeout"] = _source_remaining(deadline)
+    report = discover(manifest_path, query, hybrid=hybrid, limit=limit, **kwargs)
+    if embedding_mismatch.is_set():
+        report.update(status="unavailable", partial=True, sources=[])
+        report["diagnostics"]["reasons"].append("query_vector_embedding_contract_unavailable")
+    report["embedding"] = manifest["embedding"]
+    return report
+
+
+def _source_exact_metadata(ids, generation, identity, deadline):
+    try:
+        from . import source_generation, source_representations
+    except ImportError:
+        import source_generation
+        import source_representations
+    manifest = source_generation.load_manifest(SOURCE_GENERATION_MANIFEST)
+    if (manifest["generation"], manifest["cache_identity"]) != (generation, identity):
+        raise ValueError("source generation changed during exact lookup")
+    with source_representations.CatalogReader(manifest["catalog_path"], generation, deadline=deadline,
+                                              canonical_id=canonical_id) as reader:
+        return {canonical_id(pid): reader.source(canonical_id(pid)) for pid in ids}
+
+
+def _run_source_search(body, query, terms, unknown_terms, x_api_key, dense_timeout,
+                       embed_wait_timeout, embed_http_timeout, top, defer_hydration, deadline):
+    payload = {"results": [], "count": 0, "usage": USAGE_NOTICE}
+    reports, sources, reasons = [], {}, []
+    partner = _soft_partner(body.layer, query) if top and not body.strict else None
+    layers = [body.layer] + ([partner] if partner else [])
+    small_vectors = {}
+    def get_vector(text, timeout):
+        if text not in small_vectors:
+            remaining = min(timeout, _source_remaining(deadline))
+            small_vectors[text] = embed_query(text, wait_timeout=min(embed_wait_timeout, remaining / 2),
+                                             request_timeout=min(embed_http_timeout, remaining / 2))
+        return small_vectors[text]
+    def query_owned(text, filters, limit, timeout):
+        return _source_owned(text, filters, limit, min(timeout, _source_remaining(deadline)), get_vector)
+    try:
+        for layer in layers:
+            report = _source_call(
+                deadline, discover_sources, SOURCE_GENERATION_MANIFEST, query,
+                embed_query=_source_embed, query_dense=_source_dense,
+                timeout=_source_remaining(deadline), layer=layer, year_from=body.year_from,
+                year_to=body.year_to, section_type=body.section_type,
+                element_type=body.element_type, terms=terms, canonical_id=canonical_id,
+                visible_sources=_source_visible, query_owned=query_owned, hybrid=body.hybrid, limit=50)
+            reports.append(report)
+            reasons.extend(report.get("diagnostics", {}).get("reasons", []))
+            if report.get("status") != "ready" or not report.get("generation"):
+                reasons.append("generation_not_ready")
+                break
+            for row in report.get("sources", []):
+                source_id = canonical_id(row["source_id"])
+                if source_id not in sources:
+                    sources[source_id] = copy.deepcopy(row)
+                    continue
+                slot = sources[source_id]
+                for channel in ("dense", "lexical"):
+                    if channel in row["channel_ranks"]:
+                        slot["channel_ranks"][channel] = min(
+                            slot["channel_ranks"].get(channel, row["channel_ranks"][channel]), row["channel_ranks"][channel])
+                representations = {rep["representation_id"]: rep for rep in slot["representations"]}
+                for rep in row["representations"]:
+                    representations.setdefault(rep["representation_id"], copy.deepcopy(rep))
+                slot["representations"] = list(representations.values())
+        identities = {(report.get("generation"), report.get("diagnostics", {}).get("cache_identity"))
+                      for report in reports}
+        if len(identities) > 1:
+            sources.clear()
+            reasons.append("generation_changed_between_passes")
+        if any(report.get("status") != "ready" for report in reports):
+            sources.clear()
+        generation, identity = next(iter(identities), (None, None))
+        diagnostics = [{**copy.deepcopy(report.get("diagnostics", {})), "layer": layer}
+                       for layer, report in zip(layers, reports)]
+        payload["source_generation"] = {
+            "generation": generation, "cache_identity": identity,
+            "metadata_authority": "frozen_source_catalog",
+            "embedding": reports[0].get("embedding") if reports else None,
+            "status": next((r.get("status", "unavailable") for r in reports if r.get("status") != "ready"),
+                           "ready" if reports and len(identities) == 1 else "invalid"),
+            "diagnostics": {
+                "reasons": reasons,
+                "limits": sorted({limit for item in diagnostics for limit in item.get("limits", [])}),
+                "retrieval_bounded": bool(diagnostics) and all(item.get("retrieval_bounded", False)
+                                                               for item in diagnostics),
+                "exhaustive": bool(diagnostics) and all(item.get("exhaustive", False) for item in diagnostics),
+                "details_truncated": sum(item.get("details_truncated", 0) for item in diagnostics),
+                "native_outside_generation": sum(item.get("native_outside_generation", 0) for item in diagnostics),
+                "counting": "sum_per_layer_not_unique",
+                "by_layer": diagnostics}}
+        if len(reports) > 1 and sources:
+            for row in sources.values():
+                row["rrf_score"] = sum(1.0 / (RRF_K + rank) for channel, rank in row["channel_ranks"].items()
+                                       if channel in ("dense", "lexical"))
+                def priority(rep):
+                    qualifying = (rep["kind"] != "citation_context"
+                        and (body.section_type is None or rep.get("section_type") == body.section_type)
+                        and (body.element_type is None or rep.get("element_type") == body.element_type)
+                        and (not terms or set(terms).intersection(rep.get("terms", []))))
+                    return (not qualifying, rep["kind"] == "citation_context", rep["representation_id"])
+                merged, origins = [], set()
+                for rep in sorted(row["representations"], key=priority):
+                    foreign = rep["kind"] == "citation_context"
+                    owner = canonical_id(rep["origin_source_id"])
+                    if len(merged) >= _SOURCE_MAX_CONTEXTS or (foreign and owner not in origins
+                                                             and len(origins) >= _SOURCE_MAX_ORIGINS):
+                        continue
+                    merged.append(rep)
+                    if foreign:
+                        origins.add(owner)
+                row["representations"] = merged
+            sources = dict(sorted(sources.items(), key=lambda item: (-item[1]["rrf_score"], item[0])))
+            payload["layer_expanded"] = {"requested": body.layer, "also_searched": partner,
+                                         "note": "Best ranks across layers are fused once per dense/lexical channel."}
+        partial = bool(reasons) or any(report.get("partial") for report in reports)
+        fingerprint = tuple((sid, row.get("publication_revision"), row.get("rrf_score"),
+                             tuple(sorted(row.get("channel_ranks", {}).items())),
+                             tuple((rep.get("representation_id"), rep.get("origin_publication_revision"))
+                                   for rep in row.get("representations", [])))
+                            for sid, row in sources.items())
+        cache_key = ("source_generation", generation, identity, fingerprint,
+                     body.model_dump_json(), top, defer_hydration)
+        cached = search_cache.get(cache_key) if not partial and identity else None
+        if cached is not None:
+            cached = copy.deepcopy(cached)
+            cached["source_generation"] = payload["source_generation"]
+            return cached
+        must = _source_chunk_must({"layer": body.layer, "section_type": body.section_type,
+                                  "element_type": body.element_type, "terms": terms,
+                                  "year_from": body.year_from, "year_to": body.year_to})
+        if partner:
+            for condition in must:
+                if condition["key"] == "layers":
+                    condition["match"]["any"].append(partner)
+        own = []
+        if sources:
+            try:
+                remaining = _source_remaining(deadline)
+                vector = _source_call(deadline, get_vector, query, remaining)
+                if body.dedupe:
+                    own = _source_call(deadline, _score_specific_papers, query, list(sources),
+                                       vector=vector, timeout=_source_remaining(deadline),
+                                       constraints=must, _deadline=deadline)
+                else:
+                    filt = {"must": [*must, {"key": "arxiv_id", "match": {"any": list(sources)}}]}
+                    hits = _source_call(deadline, grouped_hits, requests.post, QDRANT_URL, COLLECTION,
+                                        vector, filt, limit=len(sources), timeout=_source_remaining(deadline),
+                                        group_size=8)
+                    hits = _source_call(deadline, _filter_publication_points, hits)
+                    hits = _source_call(deadline, _hydrate_hits, hits, _source_remaining(deadline))
+                    own = [dict(_result_from_hit(hit),
+                                publication_revision=(hit.get("payload") or {}).get("publication_revision"))
+                           for hit in hits]
+            except (HTTPException, requests.RequestException, TimeoutError):
+                reasons.append("original_evidence_unavailable")
+                partial = True
+        by_source = {}
+        for row in own:
+            source_id = canonical_id(row.get("arxiv_id"))
+            target = sources.get(source_id)
+            if (target is None or not row.get("text") or _hit_is_boilerplate({"payload": row})
+                    or target.get("publication_revision") != row.get("publication_revision")):
+                continue
+            if body.section_type is not None and row.get("section_type") != body.section_type:
+                continue
+            if body.element_type is not None and row.get("element_type") != body.element_type:
+                continue
+            if terms and not set(map(str.casefold, terms)).intersection(
+                    str(term).casefold() for term in row.get("terms", [])):
+                continue
+            by_source.setdefault(source_id, []).append(row)
+        results = []
+        for source_id, source in sources.items():
+            fragments = by_source.get(source_id) or [{"arxiv_id": source_id, "text": "", "score": None}]
+            for fragment in fragments:
+                row = {**fragment, "title": source.get("title"), "year": source.get("year"),
+                       "layers": source.get("layers"), "url": source.get("source_url"),
+                       "source_url": source.get("source_url"), "metadata_authority": "frozen_source_catalog"}
+                readable = (bool(row.get("text")) and type(row.get("score")) in (int, float)
+                            and math.isfinite(row["score"]))
+                row.update(retrieval_score=source.get("rrf_score"),
+                           source_generation=generation,
+                           source_representations=copy.deepcopy(source.get("representations", [])),
+                           channels=list(source.get("channel_ranks", {})),
+                           evidence_state="original_passage_retrieved" if readable else "not_read",
+                           retrieval_role="source" if readable else "discovery_only",
+                           verification_required=True)
+                if not readable:
+                    row.update(text="", score=None, fulltext=None)
+                results.append(row)
+        if not body.dedupe:
+            buckets = {}
+            for row in results:
+                buckets.setdefault(canonical_id(row["arxiv_id"]), []).append(row)
+            results = [rows[index] for index in range(8) for rows in buckets.values() if index < len(rows)]
+        if (top and reports and all(r.get("status") == "ready" for r in reports)
+                and len(identities) == 1 and time.monotonic() < deadline):
+            constraints = must if body.strict else [item for item in must if item["key"] != "layers"]
+            results = _source_call(deadline, _inject_exact, results, query, constraints,
+                                   max(50, len(results)), _source_remaining(deadline), _deadline=deadline)
+            fresh = [{"source_id": row["arxiv_id"], "status": "done",
+                      "publication_revision": row.get("publication_revision")} for row in results
+                     if canonical_id(row["arxiv_id"]) not in sources]
+            if fresh:
+                live = _source_visible(fresh, _source_remaining(deadline))
+                results = [row for row in results if canonical_id(row["arxiv_id"]) in sources
+                           or row["arxiv_id"] in live]
+            exact_metadata = (_source_call(deadline, _source_exact_metadata,
+                              [row["arxiv_id"] for row in results if canonical_id(row["arxiv_id"]) not in sources],
+                              generation, identity, deadline) if fresh else {})
+            qualified_results = []
+            for row in results:
+                metadata = sources.get(canonical_id(row["arxiv_id"])) or exact_metadata.get(canonical_id(row["arxiv_id"]))
+                if metadata is None:
+                    reasons.append("exact_source_outside_generation")
+                    partial = True
+                    continue
+                year = metadata.get("year")
+                if ((body.strict and body.layer and body.layer not in metadata["layers"])
+                        or (body.year_from is not None and (year is None or year < body.year_from))
+                        or (body.year_to is not None and (year is None or year > body.year_to))):
+                    continue
+                row.update(title=metadata.get("title"), year=year, layers=metadata.get("layers"),
+                           source_url=metadata.get("source_url"), url=metadata.get("source_url"),
+                           metadata_authority="frozen_source_catalog")
+                if "evidence_state" not in row:
+                    readable = (bool(row.get("text")) and type(row.get("score")) in (int, float)
+                                and math.isfinite(row["score"]))
+                    row.update(retrieval_score=None, source_generation=generation,
+                               evidence_state="original_passage_retrieved" if readable else "not_read",
+                               retrieval_role="source" if readable else "discovery_only",
+                               verification_required=True)
+                qualified_results.append(row)
+            results = qualified_results
+        scored_sources = {canonical_id(row["arxiv_id"]) for row in results
+                          if row.get("evidence_state") == "original_passage_retrieved"}
+        below_score = []
+        if body.min_score is not None:
+            default_floor = (MIN_RELEVANCE_BY_LAYER.get(body.layer, MIN_RELEVANCE_SCORE) if body.layer else
+                             min([MIN_RELEVANCE_SCORE] + list(MIN_RELEVANCE_BY_LAYER.values())))
+            floor = body.min_score if body.strict else min(body.min_score, default_floor + MIN_SCORE_MAX_RAISE)
+            if body.min_score > floor + 1e-9:
+                payload["min_score_note"] = {
+                    "requested": body.min_score, "applied": round(floor, 3),
+                    "note": "Original chunk cosine threshold capped at the calibrated layer floor + 0.03."}
+                for row in results:
+                    if type(row.get("score")) in (int, float) and row["score"] < body.min_score:
+                        row["below_min_score"] = True
+            below_score = [dict(row, retrieval_role="discovery_only",
+                                candidate_reason="original_evidence_below_requested_score") for row in results
+                           if type(row.get("score")) not in (int, float) or row["score"] < floor]
+            results = [row for row in results if type(row.get("score")) in (int, float)
+                       and row["score"] >= floor]
+            if below_score:
+                payload["source_candidates"] = below_score[:body.limit]
+                payload["source_candidate_count"] = len(payload["source_candidates"])
+        if body.dedupe:
+            results = _collapse_twins(results)
+        observed = set(sources) | {canonical_id(row["arxiv_id"]) for row in results}
+        results = results[:body.limit]
+        payload.update(results=results, count=len(results))
+        if partial:
+            payload.update(partial=True, retrieval_warning="source generation retrieval incomplete")
+        active = [name for name, enabled in (
+            ("terms", bool(terms)), ("section_type", body.section_type is not None),
+            ("element_type", body.element_type is not None),
+            ("year", body.year_from is not None or body.year_to is not None)) if enabled]
+        relax = not body.strict and (AUTO_RELAX if body.auto_relax is None else body.auto_relax)
+        if relax and active and len(results) < AUTO_RELAX_MIN and not partial:
+            plans = [active[:1]] + ([active] if len(active) > 1 else [])
+            for dropped in plans[:AUTO_RELAX_MAX_EXTRA]:
+                update = {"auto_relax": False, "diagnose": False, "compact": False}
+                for name in dropped:
+                    update.update({field: None for field in _RELAX_FIELDS[name]})
+                other = _run_search(body.model_copy(update=update), x_api_key, dense_timeout,
+                                    embed_wait_timeout, embed_http_timeout, False, True, _deadline=deadline)
+                if other.get("partial") or other.get("source_generation", {}).get("cache_identity") != identity:
+                    continue
+                extras = [dict(row, matches_filters=False) for row in other["results"]
+                          if canonical_id(row["arxiv_id"]) not in observed]
+                if extras:
+                    results = ([dict(row, matches_filters=True) for row in results] + extras)[:body.limit]
+                    payload.update(results=results, count=len(results), relaxed={
+                        "dropped": dropped, "exact_matches": len(payload["results"]),
+                        "note": "Additional source leads do not match the dropped filters."})
+                    observed.update(canonical_id(row["arxiv_id"]) for row in extras)
+                    scored_sources.update(canonical_id(row["arxiv_id"]) for row in extras
+                                          if row.get("evidence_state") == "original_passage_retrieved")
+                    break
+        applied = {key: getattr(body, key) for key in ("layer", "section_type", "element_type",
+                   "terms", "year_from", "year_to", "min_score") if getattr(body, key) is not None}
+        if applied:
+            payload["filters_applied"] = applied
+        if top:
+            lookup = _source_call(deadline, _lookup_note, query, results)
+            if lookup:
+                payload["title_lookup"] = lookup
+        if unknown_terms:
+            payload["terms_resolution"] = {"unknown": unknown_terms, "matched": terms,
+                                            "note": "Only recognised terms were used."}
+        if not results and applied and body.diagnose and not body.strict and not partial:
+            probes = []
+            for name in applied:
+                other = _run_search(body.model_copy(update={name: None, "diagnose": False,
+                                    "auto_relax": False, "limit": 3}), x_api_key, dense_timeout,
+                                    embed_wait_timeout, embed_http_timeout, False, True, _deadline=deadline)
+                if other.get("results") and not other.get("partial"):
+                    probes.append({"drop": name, "would_return": other["count"],
+                                   "example": (other["results"][0].get("title") or "")[:80]})
+            payload["why_empty"] = {"relax_one_of": probes}
+        payload["retrieval_summary"] = {
+            "scope": "observed_local", "ordering_policy": "canonical source before result cut",
+            "observed_candidate_count": len(observed),
+            "returned_unique_count": len({canonical_id(row["arxiv_id"]) for row in results}),
+            "scored_candidate_count": len(scored_sources),
+            "unread_original_count": len(set(sources) - scored_sources),
+            "discovery_only_count": len((set(sources) - scored_sources)
+                                        | {canonical_id(row["arxiv_id"]) for row in below_score})}
+        if not defer_hydration:
+            _source_call(deadline, _hydrate_search_payload, payload)
+        if (not payload.get("partial") and identity
+                and all(canonical_id(row["arxiv_id"]) in sources for row in
+                        [*results, *payload.get("source_candidates", [])])):
+            search_cache.set(cache_key, copy.deepcopy(payload))
+    except Exception as error:
+        log.warning("source generation retrieval incomplete: %s", type(error).__name__)
+        payload.update(partial=True, retrieval_warning="source generation retrieval incomplete")
+        payload.setdefault("source_generation", {"generation": None, "status": "unavailable"})
+        payload["source_generation"].setdefault("diagnostics", {}).setdefault("reasons", []).append(
+            "source_capacity" if isinstance(error, _SourceBusy) else
+            "deadline" if isinstance(error, TimeoutError) else "source_adapter_failed:" + type(error).__name__)
+    return payload
+
+
 def _run_search(body: SearchBody, x_api_key=None,
                 dense_timeout=SEARCH_QDRANT_TIMEOUT,
                 embed_wait_timeout=SEARCH_EMBED_WAIT_TIMEOUT,
-                embed_http_timeout=SEARCH_EMBED_HTTP_TIMEOUT, _top=True):
+                embed_http_timeout=SEARCH_EMBED_HTTP_TIMEOUT, _top=True,
+                _defer_hydration=False, _deadline=None):
     """The search itself, without the rate limiter.
 
     /v1/validate runs several searches per claim (each phrasing, the corpus
@@ -2049,7 +3057,8 @@ def _run_search(body: SearchBody, x_api_key=None,
         # the cache holds the full shape; compacting a copy afterwards keeps
         # both shapes correct without a second cache entry per query
         full = _run_search(body.model_copy(update={"compact": False}), x_api_key,
-                           dense_timeout, embed_wait_timeout, embed_http_timeout, _top)
+                           dense_timeout, embed_wait_timeout, embed_http_timeout, _top,
+                           _defer_hydration, _deadline)
         return _compact_search(full)
 
     query = (body.query or "").strip()
@@ -2059,17 +3068,36 @@ def _run_search(body: SearchBody, x_api_key=None,
         raise HTTPException(status_code=400, detail=f"layer must be one of {sorted(ALLOWED_LAYERS)}")
     limit = min(max(body.limit, 1), 50)
 
-    terms, unknown_terms = _resolve_terms(body.terms)
+    if SOURCE_GENERATION_MANIFEST:
+        _deadline = _deadline if _deadline is not None else (
+            time.monotonic() + dense_timeout + embed_wait_timeout + embed_http_timeout)
+        try:
+            terms, unknown_terms = _source_call(_deadline, _resolve_terms, body.terms)
+        except (_SourceBusy, TimeoutError) as error:
+            detail = ("source retrieval capacity exhausted" if isinstance(error, _SourceBusy) else
+                      "source retrieval deadline during term resolution")
+            raise HTTPException(status_code=503, detail=detail) from error
+    else:
+        terms, unknown_terms = _resolve_terms(body.terms)
     if body.strict and unknown_terms:
         raise HTTPException(status_code=400, detail={"unknown_terms": unknown_terms,
                                                     "note": "strict search cannot drop unknown terms"})
+    if SOURCE_GENERATION_MANIFEST:
+        deadline = _deadline if _deadline is not None else (
+            time.monotonic() + dense_timeout + embed_wait_timeout + embed_http_timeout)
+        return _run_source_search(body.model_copy(update={"limit": limit}), query, terms, unknown_terms, x_api_key, dense_timeout,
+                                  embed_wait_timeout, embed_http_timeout, _top, _defer_hydration, deadline)
     relax_on = not body.strict and (AUTO_RELAX if body.auto_relax is None else bool(body.auto_relax))
     tm = {"t0": time.monotonic()} if SEARCH_TIMING else None
     cache_key = (query, body.layer, body.section_type, body.element_type,
                  tuple(sorted(terms)), tuple(unknown_terms), body.dedupe, body.min_score,
                  body.year_from, body.year_to, limit, body.hybrid, relax_on, body.strict)
+    if SOURCE_DISCOVERY:
+        cache_key += ("source_discovery",)
     if not _top:
         cache_key += ("inner",)
+    if _defer_hydration:
+        cache_key += ("defer_hydration",)
     cached = search_cache.get(cache_key)
     if cached is not None:
         return cached
@@ -2099,9 +3127,11 @@ def _run_search(body: SearchBody, x_api_key=None,
                                                "auto_relax": False, "limit": limit})
         with ThreadPoolExecutor(max_workers=1) as side:
             side_future = side.submit(_run_search, sibling_body, x_api_key, dense_timeout,
-                                      embed_wait_timeout, embed_http_timeout, False)
+                                      embed_wait_timeout, embed_http_timeout, False,
+                                      _defer_hydration=bool(SOURCE_DISCOVERY))
             payload = dict(_run_search(body, x_api_key, dense_timeout, embed_wait_timeout,
-                                       embed_http_timeout, False))
+                                       embed_http_timeout, False,
+                                       _defer_hydration=bool(SOURCE_DISCOVERY)))
             try:
                 other = side_future.result(timeout=dense_timeout + 5)
             except (HTTPException, FuturesTimeoutError):
@@ -2119,7 +3149,41 @@ def _run_search(body: SearchBody, x_api_key=None,
             payload["retrieval_warning"] = "soft partner retrieval incomplete"
         payload["results"] = _inject_exact(payload["results"], query, constraints, limit, dense_timeout)
         payload["count"] = len(payload["results"])
-        payload["results"] = _hydrate_evidence(payload["results"])
+        if (isinstance(payload.get("retrieval_summary"), dict)
+                or isinstance((other or {}).get("retrieval_summary"), dict)):
+            final_ids = {canonical_id(row.get("arxiv_id")) for row in payload["results"]
+                         if row.get("arxiv_id")}
+            payload["retrieval_summary"] = {
+                "scope": "observed_local",
+                "ordering_policy": "per-pass summaries; no cross-pass candidate-count sum",
+                "passes": {
+                    "requested": payload.get("retrieval_summary"),
+                    "partner": (other or {}).get("retrieval_summary"),
+                },
+                "returned_unique_count": len(final_ids),
+            }
+        if (SOURCE_DISCOVERY and body.hybrid and body.dedupe and not body.strict
+                and body.min_score is None
+                and (isinstance(payload.get("source_candidates"), list)
+                     or isinstance((other or {}).get("source_candidates"), list))):
+            payload["source_candidates"] = merge_source_candidates(
+                payload.get("source_candidates", []),
+                (other or {}).get("source_candidates", []), payload["results"], limit,
+                canonical_id, reciprocal_rank_fusion)
+            payload["source_candidate_count"] = len(payload["source_candidates"])
+            payload["discovery_note"] = (
+                "Candidates may be weakly relevant or merely related. Read the source and "
+                "specific section before using it as evidence; a candidate is never proof "
+                "of novelty. Citation-graph ranking is an evidence lead, never corroboration.")
+        if not SOURCE_DISCOVERY and (payload["results"] or payload.get("partial")):
+            payload.pop("source_candidates", None)
+            payload.pop("source_candidate_count", None)
+            payload.pop("discovery_note", None)
+            summary = payload.get("retrieval_summary")
+            if isinstance(summary, dict):
+                summary["auxiliary_candidate_count"] = 0
+                summary["source_candidates_returned_count"] = 0
+        _hydrate_search_payload(payload)
         if payload.get("title_lookup") and payload["count"]:
             named = _lookup_note(query, payload["results"])
             if named is None:
@@ -2159,7 +3223,7 @@ def _run_search(body: SearchBody, x_api_key=None,
         if HIER_SEARCH:
             hits, leftover_pool, dense_partial, hier_extra = _hier_run(
                 vector, qfilter, must, body, limit, dense_limit, dense_timeout, layers,
-                query=query)
+                query=query, paper_lexical_future=paper_lexical_future)
         else:
             hits, _hydrated_slice, leftover_pool, dense_partial = two_phase_dense_search(
                 vector, qfilter, dense_limit, limit, dense_timeout, layers=layers)
@@ -2189,7 +3253,8 @@ def _run_search(body: SearchBody, x_api_key=None,
     # papers_fts.db is small enough to live in page cache and is meant to
     # survive exactly the case above -- give it its own timeout rather than
     # letting it inherit whatever time _bm25_candidates already burned.
-    paper_lexical, paper_lexical_skipped = [], False
+    paper_lexical, paper_lexical_skipped = [], bool(
+        (hier_extra or {}).get("paper_lexical_skipped"))
     try:
         paper_lexical = (paper_lexical_future.result(timeout=LEXICAL_QUERY_TIMEOUT)
                          if paper_lexical_future else [])
@@ -2205,6 +3270,9 @@ def _run_search(body: SearchBody, x_api_key=None,
     # deliberately never fired above (not merely timed out), so it must not
     # be reported as available even though lexical_skipped is False here.
     chunk_lexical_skipped_intentionally = skip_chunk_lexical and hier_used
+    hier_lexical_already_fused = (
+        hier_extra is not None and HIER_FUSION == "rrf"
+        and chunk_lexical_skipped_intentionally)
 
     # PAPER_LEXICAL off (default): `lexical` is untouched, exactly the old
     # chunk-only BM25 list -- no behavior change below this point.
@@ -2254,12 +3322,17 @@ def _run_search(body: SearchBody, x_api_key=None,
     # below even when its best chunk scores under it. Empty (thus a no-op)
     # for every other path, including HIER_FUSION="mix".
     lex_exempt_ids = set() if body.strict else ((hier_extra or {}).get("lex_exempt") or set())
+    # Bound fusion candidates from the initial dense batch; a single leftover
+    # hydration may add hits but does not enlarge this cap or issue a new search.
+    candidate_limit = (max(limit, min(len(hits), 120))
+                       if body.hybrid and lexical else limit)
 
     def _filter_and_dedupe(candidate_hits):
         picked = []
         seen = set()
         if BOILERPLATE_FILTER and body.dedupe:
-            return _dedupe_preferring_content(candidate_hits, floor, lex_exempt_ids, limit)
+            return _dedupe_preferring_content(candidate_hits, floor, lex_exempt_ids,
+                                              candidate_limit)
         for h in candidate_hits:
             p = h["payload"]
             aid = p.get("arxiv_id")
@@ -2270,7 +3343,7 @@ def _run_search(body: SearchBody, x_api_key=None,
                 if key in seen:
                     continue
                 seen.add(key)
-            if len(picked) >= limit:
+            if len(picked) >= candidate_limit:
                 break
             picked.append(_result_from_hit(h))
         return picked
@@ -2321,7 +3394,15 @@ def _run_search(body: SearchBody, x_api_key=None,
 
     # lexical candidates the vectors missed, scored by the same vector search so
     # the two halves stay comparable, then fused by rank rather than by score
-    if body.hybrid and lexical:
+    if hier_lexical_already_fused:
+        fusion_scores = hier_extra.get("fusion_scores") or {}
+        for r in results:
+            base = ("paper" if r.get("found_via") in
+                    ("paper", "paper graph", "paper lexical") else "dense")
+            ranks = r.get("fusion_ranks") or {}
+            r["channels"] = [base, "lexical"] if ranks.get("lex") is not None else [base]
+            r["fusion_score"] = fusion_scores.get(r["arxiv_id"], 0)
+    elif body.hybrid and lexical:
         known = {r["arxiv_id"] for r in results}
         # label every result, not only the runs that gained a lexical extra:
         # otherwise the channel is invisible exactly when the two agree
@@ -2390,6 +3471,7 @@ def _run_search(body: SearchBody, x_api_key=None,
     # back into the middle of it.
     if not any("fusion_score" in result for result in results) and not hier_extra:
         results.sort(key=lambda r: -r["rank_score"])
+    precut_results = copy.deepcopy(results)
     if _top:
         results = _inject_exact(results, query, constraints, limit, dense_timeout)
     if body.strict:
@@ -2399,6 +3481,8 @@ def _run_search(body: SearchBody, x_api_key=None,
         for result in results:
             if result.get("found_via") == "exact id":
                 result["relevance_kind"] = "identifier"
+    if hier_lexical_already_fused:
+        results = results[:limit]
     if min_score_note:
         for r in results:
             if r.get("score") is not None and r["score"] < body.min_score:
@@ -2416,6 +3500,9 @@ def _run_search(body: SearchBody, x_api_key=None,
         # dense results are complete on their own -- this is not "partial",
         # only missing the exact-term channel hybrid search adds on top
         payload["lexical_channel"] = "skipped"
+    if (PAPER_LEXICAL_SOURCE_BALANCE and body.layer == "web3"
+            and (paper_lexical or (hier_extra or {}).get("paper_lexical_used"))):
+        payload["lexical_ranking"] = "source_balanced"
     if dense_error:
         payload["partial"] = True
         payload["retrieval_warning"] = (
@@ -2459,6 +3546,55 @@ def _run_search(body: SearchBody, x_api_key=None,
                 tm["pre_relax"] = time.monotonic()
             _auto_relax(body, payload, results, active, terms, limit, x_api_key)
             results = payload["results"]
+    if tried_relax:
+        precut_results = copy.deepcopy(results)
+    use_raw_pool = not body.strict and body.min_score is None and hier_used
+    rows, retrieval_summary = build_candidate_pool(
+        results, precut_results if use_raw_pool else [],
+        ([*hits, *(hier_extra or {}).get("quota_chunks", {}).values()]
+         if use_raw_pool else []),
+        canonical_id, _result_from_hit,
+        found_via=(hier_extra or {}).get("found_via"),
+        fusion_ranks=(hier_extra or {}).get("fusion_ranks"),
+        fusion_scores=(hier_extra or {}).get("fusion_scores"),
+        paper_scores=(hier_extra or {}).get("paper_scores"))
+    payload["retrieval_summary"] = retrieval_summary
+    if (SOURCE_DISCOVERY and hier_used and body.hybrid and body.dedupe
+            and not body.strict and body.min_score is None):
+        pool_hits = rows_as_hits(rows)
+        pool_ranks = {row.get("arxiv_id"): row.get("fusion_ranks")
+                      for row in rows if row.get("fusion_ranks")}
+        source_candidates = select_source_candidates(
+            pool_hits, results, limit, floor, canonical_id, _result_from_hit,
+            _hit_is_boilerplate, pool_ranks)
+        rows_by_key = {canonical_id(row.get("arxiv_id")): row for row in rows
+                       if row.get("arxiv_id")}
+        for candidate in source_candidates:
+            provenance_row = rows_by_key.get(canonical_id(candidate.get("arxiv_id")), {})
+            for name in ("found_via", "fusion_ranks", "fusion_score", "paper_score", "channels"):
+                if name in provenance_row:
+                    candidate[name] = copy.deepcopy(provenance_row[name])
+        payload["source_candidates"] = source_candidates
+        payload["source_candidate_count"] = len(source_candidates)
+        retrieval_summary["source_candidates_returned_count"] = len(source_candidates)
+        payload["discovery_note"] = (
+            "Candidates may be weakly relevant or merely related. Read the source and "
+            "specific section before using it as evidence; a candidate is never proof "
+            "of novelty. Citation-graph ranking is an evidence lead, never corroboration.")
+    elif (not results and not payload.get("partial") and hier_used and body.hybrid
+          and body.dedupe and not body.strict and body.min_score is None):
+        retrieval_summary["auxiliary_candidate_count"] = 0
+        source_candidates = _empty_primary_source_candidates(rows, limit, floor, body, terms)
+        if source_candidates:
+            payload["source_candidates"] = source_candidates
+            payload["source_candidate_count"] = len(source_candidates)
+            retrieval_summary["source_candidates_returned_count"] = len(source_candidates)
+            retrieval_summary["auxiliary_candidate_count"] = len(source_candidates)
+            payload["discovery_note"] = (
+                "Primary results are empty. These are bounded related-source leads from "
+                "already retrieved candidates, not relevance-verified evidence; inspect "
+                "the source and section before use. Citation-graph links are leads, not "
+                "corroboration.")
     if not results and applied and body.diagnose and not body.strict and not payload.get("partial"):
         # after a relax attempt every relaxable filter is already known not to
         # be the culprit; only layer / min_score are left to blame
@@ -2483,6 +3619,12 @@ def _run_search(body: SearchBody, x_api_key=None,
             {"relax_one_of": relaxations} if relaxations else
             {"relax_one_of": [], "note": "no single filter explains it: the query itself "
                                          "has no match above the relevance floor"})
+        if payload.get("source_candidates"):
+            payload["why_empty"] = {
+                "relax_one_of": payload["why_empty"].get("relax_one_of", []),
+                "note": ("The primary results are empty above the relevance floor; "
+                         "related source candidates are listed separately and are not "
+                         "primary matches.")}
     if tm is not None:
         end = time.monotonic()
         prev, parts = tm["t0"], []
@@ -2496,7 +3638,8 @@ def _run_search(body: SearchBody, x_api_key=None,
     # a hier search that silently fell back to the old path (coarse stage
     # hiccup under load) is a degraded answer: caching it pinned the worse
     # ranking for the whole TTL
-    payload["results"] = _hydrate_evidence(payload["results"])
+    if not _defer_hydration:
+        _hydrate_search_payload(payload)
     if not payload.get("partial") and (hier_used or not HIER_SEARCH):
         search_cache.set(cache_key, payload)
     return payload
@@ -2508,6 +3651,25 @@ def _run_search(body: SearchBody, x_api_key=None,
 SPEC_ELEMENT_TYPES = ("algorithm", "equation", "code", "table")
 SPEC_PRIORITY = {"algorithm": 0, "equation": 1, "code": 2, "prose": 3, "table": 4}
 SPEC_MAX_CHARS = 12000
+SPEC_SECONDS = 30
+
+
+def _trusted_alias_ids(paper_id, twins=None, limit=2):
+    """Return only ids explicitly grouped with this id by the twins index."""
+    twins = _twins() if twins is None else twins
+    if isinstance(twins, tuple):
+        canonical_map, members_map = twins
+        canonical = canonical_map.get(paper_id, paper_id)
+        members = members_map.get(canonical, [])
+        return [pid for pid in dict.fromkeys([canonical, *members]) if pid != paper_id][:limit]
+    canonical = twins.get("canonical", {}).get(paper_id, paper_id)
+    members = twins.get("members", {}).get(canonical, [])
+    return [pid for pid in dict.fromkeys([canonical, *members]) if pid != paper_id][:limit]
+
+
+def _payloads_for_id(points, paper_id):
+    return [(point.get("payload") or {}) for point in points
+            if (point.get("payload") or {}).get("arxiv_id") in (None, paper_id)]
 
 
 @app.get("/v1/paper/{arxiv_id:path}/spec")
@@ -2517,6 +3679,7 @@ def paper_spec(
     include_prose: bool = False,
     max_chars: int = SPEC_MAX_CHARS,
     x_api_key: Optional[str] = Header(default=None),
+    cursor: Optional[str] = None,
 ):
     """Structured spec of a paper: math, pseudocode and architecture.
 
@@ -2526,6 +3689,11 @@ def paper_spec(
                      can budget context.
     """
     auth_and_limit(x_api_key)
+    if type(max_chars) is not int or max_chars <= 0:
+        raise HTTPException(status_code=400, detail="max_chars must be a positive integer")
+    if cursor is not None and (not isinstance(cursor, (str, dict))
+                               or isinstance(cursor, str) and (not cursor or len(cursor) > 1024)):
+        raise HTTPException(status_code=400, detail="invalid continuation cursor")
 
     wanted = SPEC_ELEMENT_TYPES
     if target_elements:
@@ -2534,61 +3702,94 @@ def paper_spec(
         if bad:
             raise HTTPException(status_code=400, detail=f"unknown element types: {bad}")
 
-    points = qdrant_scroll_by_arxiv(arxiv_id)
-    if not points:
+    deadline = time.monotonic() + SPEC_SECONDS
+    points = qdrant_scroll_by_arxiv(arxiv_id, limit=1000, page=200, timeout=SPEC_SECONDS,
+                                    deadline=deadline)
+    chunk_limit = len(points) >= 1000
+    requested_payloads = _payloads_for_id(points, arxiv_id)
+    requested_types = {(p.get("element_type") or "").lower() for p in requested_payloads if p.get("text")}
+    missing = set(wanted) - requested_types
+    tried = [arxiv_id]
+    twins = None
+    sources = [(arxiv_id, requested_payloads)] if requested_payloads else []
+    aliases = []
+    budget_exhausted = False
+    resolution_errors = []
+    if not requested_payloads or missing:
+        twins = _twins()
+        aliases = _trusted_alias_ids(arxiv_id, twins)
+    for alias in aliases:
+        if requested_payloads and not missing:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            budget_exhausted = True
+            break
+        tried.append(alias)
+        try:
+            alias_points = qdrant_scroll_by_arxiv(alias, limit=1000, page=200,
+                                                 timeout=remaining, deadline=deadline)
+        except Exception as error:
+            resolution_errors.append({"source_id": alias, "error": type(error).__name__})
+            if time.monotonic() >= deadline:
+                budget_exhausted = True
+            continue
+        chunk_limit = chunk_limit or len(alias_points) >= 1000
+        alias_payloads = _payloads_for_id(alias_points, alias)
+        if not alias_payloads:
+            continue
+        accepted = [p for p in alias_payloads if p.get("text") and
+                    (p.get("element_type") or "").lower() in missing]
+        if accepted:
+            sources.append((alias, accepted))
+            missing -= {(p.get("element_type") or "").lower() for p in accepted}
+    if not requested_payloads and not sources:
         raise HTTPException(status_code=404, detail="paper not found")
+
+    payload_sources = [(source_id, payload) for source_id, group in sources for payload in group]
+    payloads = [payload for _, payload in payload_sources]
 
     def is_spec(p):
         st = (p.get("section_type") or "").lower()
         title = (p.get("section_title") or "").lower()
         return st in SPEC_SECTION_TYPES or any(kw in title for kw in SPEC_TITLE_KEYWORDS)
 
-    payloads = [pt["payload"] for pt in points]
-    rows = _evidence_rows([arxiv_id])
-    passport = _paper_passport(arxiv_id, payloads[0], rows)
+    actual_ids = list(dict.fromkeys([source_id for source_id, _ in sources]))
+    rows = _evidence_rows(actual_ids)
+    top_source = arxiv_id if requested_payloads else actual_ids[0]
+    top_payload = requested_payloads[0] if requested_payloads else sources[0][1][0]
+    passport = _paper_passport(top_source, top_payload, rows)
     elements = [p for p in payloads if (p.get("element_type") or "").lower() in wanted]
     if include_prose:
         elements += [p for p in payloads
                      if (p.get("element_type") or "").lower() == "prose" and is_spec(p)]
-    if not elements:
-        # the paper is in the database, it simply has no math or pseudocode:
-        # a distinct answer from "unknown paper", so an automated review can
-        # note the absence and carry on instead of breaking on a 404
-        return {
-            "arxiv_id": arxiv_id,
-            **passport,
-            "title": (payloads[0].get("title") if payloads else None),
-            "repos": [],
-            "sections": [],
-            "returned": 0,
-            "available": 0,
-            "chars": 0,
-            "truncated": False,
-            "note": "no algorithm/equation/code/table elements found in retrieved indexed chunks"
-                    " (try include_prose=true for its method prose)",
-        }
-
     # Implementable objects first, results tables last: DeepSeekMath's benchmark
     # tables precede its method, and in paper order they filled the whole
     # character budget before the GRPO objective was ever reached.
     elements.sort(key=lambda p: (SPEC_PRIORITY.get((p.get("element_type") or "").lower(), 3),
                                  p.get("chunk_index", 0)))
-    title = elements[0].get("title")
+    title = elements[0].get("title") if elements else (payloads[0].get("title") if payloads else None)
 
-    sections, used, truncated = [], 0, False
+    fragments = []
     for p in elements:
+        source_id = next(sid for sid, payload in payload_sources if payload is p)
         text = p.get("text") or ""
-        if used + len(text) > max_chars:
-            truncated = True
-            break
-        used += len(text)
-        sections.append({
+        evidence = provenance(source_id, p, _passport_source_metadata(source_id, rows,
+                              _paper_passport(source_id, p, rows)),
+                              source_url(source_id, rows.get(source_id, {})), scope="indexed_chunk")
+        evidence["source_paper_id"] = source_id
+        fragments.append({
             "element_type": p.get("element_type"),
             "section_type": p.get("section_type"),
             "section_title": p.get("section_title"),
             "text": text,
-            "evidence": provenance(arxiv_id, p, rows.get(arxiv_id), passport["url"], scope="indexed_chunk"),
+            "source_paper_id": source_id,
+            "evidence": evidence,
         })
+    try:
+        page = bounded_evidence_page(fragments, max_chars, cursor)
+    except ValueError as error:
+        raise HTTPException(status_code=getattr(error, "status_code", 400), detail=str(error)) from error
 
     repos = []
     for p in elements:
@@ -2596,16 +3797,28 @@ def paper_spec(
             if r not in repos:
                 repos.append(r)
 
+    reasons = resolution_reasons(missing_elements=missing, errors=resolution_errors,
+                                 time_budget_exhausted=budget_exhausted, chunk_limit=chunk_limit)
+    page["partial_reasons"] = sorted(set(page["partial_reasons"]) | set(reasons))
     return {
         "arxiv_id": arxiv_id,
         **passport,
         "title": title,
         "repos": repos,
-        "sections": sections,
-        "returned": len(sections),
-        "available": len(elements),
-        "chars": used,
-        "truncated": truncated,
+        **page,
+        "source_resolution": {"requested_id": arxiv_id, "source_ids": actual_ids,
+                              "attempted_ids": tried,
+                              "partial": bool(missing or budget_exhausted or resolution_errors or chunk_limit),
+                              "time_budget_exhausted": budget_exhausted,
+                              "errors": resolution_errors,
+                              "missing": {element: "not_found_in_retrieved_chunks" for element in sorted(missing)},
+                              "missing_scope": "retrieved_indexed_chunks",
+                              "source_wide_absence": "unknown",
+                              "caveat": "Missing element types are unknown outside the retrieved indexed chunks.",
+                              "reasons": reasons,
+                              "partial_reasons": reasons},
+        **({"note": "no algorithm/equation/code/table elements found in retrieved indexed chunks"
+                    " (try include_prose=true for its method prose)"} if not elements else {}),
     }
 
 
@@ -2672,7 +3885,7 @@ def compare(
                         "section_title": p.get("section_title"),
                         "text": text[:max_chars],
                         "clipped": True,
-                        "evidence": dict(provenance(arxiv_id, p, rows.get(arxiv_id), passport["url"],
+                        "evidence": dict(provenance(arxiv_id, p, _passport_source_metadata(arxiv_id, rows, passport), passport["url"],
                                                     scope="indexed_chunk"), returned_chars=max_chars),
                     })
                     used = max_chars
@@ -2683,7 +3896,8 @@ def compare(
                 "section_type": p.get("section_type"),
                 "section_title": p.get("section_title"),
                 "text": text,
-                "evidence": provenance(arxiv_id, p, rows.get(arxiv_id), passport["url"], scope="indexed_chunk"),
+                "evidence": provenance(arxiv_id, p, _passport_source_metadata(arxiv_id, rows, passport),
+                                       passport["url"], scope="indexed_chunk"),
             })
         return {
             "arxiv_id": arxiv_id,
@@ -3055,6 +4269,8 @@ def _bands_for(layer):
 
 
 def _score_band(score, layer=None, corroborated=False):
+    if type(score) not in (int, float) or not math.isfinite(score):
+        return "weak"
     direct, adjacent = _bands_for(layer)
     if corroborated:
         direct -= BAND_EPSILON   # no coin tosses on the edge
@@ -3117,36 +4333,28 @@ def _title_supports(hit, claim_words):
 # hit within this margin of the band is treated as being at it.
 BAND_EPSILON = 0.006
 
-# Cross-encoder reranking, off unless switched on.
-#
-# It is the only mechanism that can tell "does this" from "writes about this",
-# because it reads the claim and the passage together instead of scoring them
-# apart. It is also expensive: 400 ms per pair on this host, no AVX512 for the
-# quantised model, and the embedder it shares a container with is the ingestion
-# bottleneck. So it fires only where the cheap signals are genuinely undecided
-# -- nobody has read this claim, and the best hit sits in the grey zone around
-# the band -- and never on the ordinary case that the bands already settle.
+# Optional cross-encoder passage relevance ranking; it does not verify claims.
 RERANK_URL = os.getenv("RERANK_URL", "http://127.0.0.1:8006/rerank")
 RERANK_ENABLED = os.getenv("RERANK_ENABLED", "0") == "1"
 RERANK_UNCERTAINTY = 0.02   # distance from the direct band that counts as grey
 RERANK_TOP_N = 8
-CROSS_POSITIVE = 0.0        # ms-marco logits: above zero is a relevant pair
-RERANK_TIMEOUT = 30
+CROSS_POSITIVE = 0.0
+RERANK_TIMEOUT = 3
+_rerank_runtime = RerankRuntime(max_pairs=8, timeout=3, cooldown=60,
+                                cache_size=128, cache_ttl=300)
+
+
+def _rerank_request(query, passages, timeout):
+    resp = requests.post(RERANK_URL, json={"query": query, "passages": passages},
+                         timeout=timeout)
+    resp.raise_for_status()
+    return resp.json().get("scores")
 
 
 def _rerank(query, hits):
-    """Cross-encoder scores for the passages of these hits, or None."""
+    """Bounded cross-encoder passage relevance scores, or None on fallback."""
     passages = [(h.get("text") or "")[:1200] for h in hits]
-    if not passages:
-        return None
-    try:
-        resp = requests.post(RERANK_URL, json={"query": query, "passages": passages},
-                             timeout=RERANK_TIMEOUT)
-        resp.raise_for_status()
-        scores = resp.json().get("scores") or []
-    except (requests.RequestException, ValueError):
-        return None
-    return scores if len(scores) == len(hits) else None
+    return _rerank_runtime.score(query, passages, _rerank_request)
 
 
 def _needs_rerank(hits, layer, registry):
@@ -3162,11 +4370,10 @@ DIRECT_SECTIONS = {"method", "experiments"}
 
 
 def _corroborated(hit, claim_words=None):
-    # cross_top only meant "survived the reranked set"; a negative logit is the
-    # model saying the passage does not answer the claim, and it was being
-    # reported as support
+    if hit.get("evidence_state") == "not_read" or hit.get("retrieval_role") == "discovery_only":
+        return None
     if hit.get("cross_top") and (hit.get("cross_score") or 0) > CROSS_POSITIVE:
-        return "a cross-encoder read the claim and this passage together and agreed"
+        return "cross-encoder ranked this passage as relevant; this is not claim verification"
     if _title_supports(hit, claim_words):
         return "the paper's own title names the claim"
     if (hit.get("niche_score") or 0) >= DIRECT_NICHE_CORROBORATION:
@@ -3179,6 +4386,8 @@ def _corroborated(hit, claim_words=None):
 
 
 def _evidence_band(hit, requested_layer=None, claim_words=None):
+    if hit.get("evidence_state") == "not_read" or hit.get("retrieval_role") == "discovery_only":
+        return "weak"
     # a paper someone has already read against this claim does not have to earn
     # its place again through a score: that is the entire point of keeping the
     # record. It enters the evidence in its own band, so nothing is smuggled
@@ -3640,7 +4849,7 @@ def _citation_neighbours(paper_ids):
 
 
 def _score_specific_papers(query, paper_ids, layer=None, vector=None, timeout=45,
-                           constraints=None):
+                           constraints=None, _deadline=None):
     """Best chunk of each named paper against the query, scored the usual way,
     so a paper reached through the graph is comparable to one found by search.
 
@@ -3659,10 +4868,21 @@ def _score_specific_papers(query, paper_ids, layer=None, vector=None, timeout=45
     if layer and not any(item.get("key") == "layers" for item in must):
         must.append({"key": "layers", "match": {"any": [layer]}})
     try:
-        query_vector = vector or embed_query(query)
-        hits = qdrant_search(query_vector, {"must": must}, len(paper_ids) * 8,
-                             timeout=timeout,
-                             with_payload=["arxiv_id", "section_type"])
+        if _deadline is not None:
+            timeout = min(timeout, _source_remaining(_deadline))
+        query_vector = vector or (embed_query(query, wait_timeout=timeout / 2,
+                                             request_timeout=timeout / 2)
+                                  if _deadline is not None else embed_query(query))
+        if _deadline is not None:
+            timeout = min(timeout, _source_remaining(_deadline))
+        if _deadline is not None:
+            hits = grouped_hits(requests.post, QDRANT_URL, COLLECTION, query_vector, {"must": must},
+                                limit=len(paper_ids), timeout=timeout, group_size=8)
+            hits = _source_call(_deadline, _filter_publication_points, hits)
+        else:
+            hits = qdrant_search(query_vector, {"must": must}, len(paper_ids) * 8,
+                                 timeout=timeout,
+                                 with_payload=["arxiv_id", "section_type"])
     except HTTPException:
         return []
     best = {}
@@ -3678,10 +4898,14 @@ def _score_specific_papers(query, paper_ids, layer=None, vector=None, timeout=45
     if not best:
         return []
     winner_ids = [h["id"] for _, h in best.values()]
+    if _deadline is not None:
+        timeout = min(timeout, _source_remaining(_deadline))
     full_payloads = qdrant_fetch_payloads(winner_ids, timeout=timeout)
     results = []
     for pid, (_, h) in best.items():
         pay = full_payloads.get(h.get("id")) or {}
+        if not pay or pay.get("arxiv_id") != pid:
+            continue
         results.append({
             "arxiv_id": pid,
             "source": SOURCE_LABELS[source_of(pid)],
@@ -3700,6 +4924,7 @@ def _score_specific_papers(query, paper_ids, layer=None, vector=None, timeout=45
             "citation_count": pay.get("citation_count"),
             "fulltext": None,
             "evidence": provenance(pid, pay, scope="indexed_chunk"),
+            **({"publication_revision": pay.get("publication_revision")} if _deadline is not None else {}),
         })
     return results
 
@@ -4721,7 +5946,7 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
         [idea] + [text for text, _ in claim_specs] +
         [phrasing for _, phrasings in claim_specs for phrasing in phrasings]
     )
-    if not fast_mode:
+    if not fast_mode and not SOURCE_GENERATION_MANIFEST:
         prime_qdrant_searches(
             [idea] + [text for text, _ in claim_specs] +
             [phrasing for _, phrasings in claim_specs for phrasing in phrasings],
@@ -4736,17 +5961,55 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
     # plenty -- "parimutuel market on Solana settled by an oracle" peaked at
     # 0.703 while the same subject as a claim reached 180 papers.
     coverage_cache, coverage_details = {}, {}
+    source_scope_identity = None
+
+    def _check_source_scope(payload):
+        nonlocal source_scope_identity
+        generation = payload.get("source_generation", {})
+        identity = (generation.get("generation"), generation.get("cache_identity"))
+        if payload.get("partial") or generation.get("status") != "ready" or not all(identity):
+            raise HTTPException(status_code=503, detail="source-generation scope/evidence retrieval unavailable; activation blocked")
+        if source_scope_identity is not None and source_scope_identity != identity:
+            raise HTTPException(status_code=503, detail="source generation changed during audit; retry against one generation")
+        source_scope_identity = identity
 
     def _coverage_of(text, strict=False):
         key = (text, strict)
         if key not in coverage_cache:
             coverage_details[key] = {}
-            coverage_cache[key] = _topic_coverage(
-                text, body.layer, strict,
-                FAST_COVERAGE_PROBE_LIMIT if fast_mode else COVERAGE_PROBE_LIMIT,
-                timeout=audit_qdrant_timeout,
-                details=coverage_details[key],
-            )
+            if SOURCE_GENERATION_MANIFEST:
+                payload = _run_search(SearchBody(query=text, layer=body.layer, limit=50, dedupe=False,
+                                      auto_relax=False, diagnose=False), x_api_key,
+                                      dense_timeout=audit_qdrant_timeout, embed_wait_timeout=audit_embed_wait,
+                                      embed_http_timeout=audit_embed_http, _top=False, _defer_hydration=True)
+                _check_source_scope(payload)
+                qualified, best = {}, 0
+                for hit in payload["results"]:
+                    score = hit.get("score")
+                    if (hit.get("evidence_state") != "original_passage_retrieved"
+                            or type(score) not in (int, float) or not math.isfinite(score)):
+                        continue
+                    best = max(best, score)
+                    for layer in ([body.layer] if body.layer else hit.get("layers") or []):
+                        floor = MIN_RELEVANCE_BY_LAYER.get(layer, MIN_RELEVANCE_SCORE)
+                        if score >= floor and (not strict or _score_band(score, layer) != "weak"):
+                            qualified.setdefault(layer, set()).add(canonical_id(hit["arxiv_id"]))
+                by_layer = {layer: len(ids) for layer, ids in qualified.items()}
+                coverage_cache[key] = (max(by_layer.values(), default=0), by_layer, best)
+                coverage_details[key] = {
+                    "metric": "qualified_original_sources_from_source_generation",
+                    "generation": source_scope_identity[0], "cache_identity": source_scope_identity[1],
+                    "scope": "observed_local", "probe_cap": 50,
+                    "by_layer": {layer: {"canonical_papers": count, "is_lower_bound": True,
+                        "relevance_floor": MIN_RELEVANCE_BY_LAYER.get(layer, MIN_RELEVANCE_SCORE)}
+                        for layer, count in by_layer.items()}}
+            else:
+                coverage_cache[key] = _topic_coverage(
+                    text, body.layer, strict,
+                    FAST_COVERAGE_PROBE_LIMIT if fast_mode else COVERAGE_PROBE_LIMIT,
+                    timeout=audit_qdrant_timeout,
+                    details=coverage_details[key],
+                )
         return coverage_cache[key]
 
     idea_coverage, idea_by_layer, idea_best = _coverage_of(idea)
@@ -4771,7 +6034,8 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
             status_code=503,
             detail="scope could not be measured because retrieval is temporarily unavailable",
         )
-    if scope_best < IN_SCOPE_MIN_PAPERS:
+    scope_unverified = bool(SOURCE_GENERATION_MANIFEST and scope_best < IN_SCOPE_MIN_PAPERS)
+    if scope_best < IN_SCOPE_MIN_PAPERS and not SOURCE_GENERATION_MANIFEST:
         return {
             "idea": idea,
             "in_scope": False,
@@ -4801,10 +6065,12 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
         b = SearchBody(query=query, layer=body.layer, limit=min(50, limit * 3),
                        min_score=0.60, dedupe=False, diagnose=False,
                        auto_relax=False, **extra)
-        hits = _scored_results_for_audit(
-            _run_search(b, x_api_key, dense_timeout=audit_qdrant_timeout,
+        payload = _run_search(b, x_api_key, dense_timeout=audit_qdrant_timeout,
                         embed_wait_timeout=audit_embed_wait,
-                        embed_http_timeout=audit_embed_http, _top=False))
+                        embed_http_timeout=audit_embed_http, _top=False)
+        if SOURCE_GENERATION_MANIFEST:
+            _check_source_scope(payload)
+        hits = _scored_results_for_audit(payload, incomplete=claim_evidence)
         best = {}
         for h in hits:
             pid = h["arxiv_id"]
@@ -4878,6 +6144,8 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
 
     claim_reports = []
     for claim, phrasings in claim_specs:
+        claim_evidence = {"incomplete_evidence": scope_unverified, "unread_count": 0,
+                          "unqualified_count": 0, "sources": {}}
         # coverage has to be measured over the same wordings the evidence was
         # found with, or a claim can show three solid papers and "thin" beside
         # them: the narrow phrasing that finds little is exactly the one a
@@ -4894,6 +6162,33 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
                 _link_conn.close()
         found, queries_used = _search_union(claim, phrasings)
         retrieved_today_ids = {h["arxiv_id"] for h in found}
+        named_source_ids = _audit_named_source_ids(
+            claim, phrasings, idea, allow_idea_fallback=len(claim_specs) == 1)
+        found_by_head = {canonical_id(h["arxiv_id"]): h for h in found}
+        named_source_hits = [found_by_head[canonical_id(pid)] for pid in named_source_ids
+                             if canonical_id(pid) in found_by_head]
+        named_source_paths = {canonical_id(h["arxiv_id"]): "ordinary_claim_retrieval"
+                              for h in named_source_hits}
+        lookup_ids = [pid for pid in named_source_ids
+                      if canonical_id(pid) not in found_by_head]
+        named_lookup_error = False
+        if lookup_ids:
+            try:
+                explicit_hits = _score_specific_papers(
+                    claim, lookup_ids, body.layer, timeout=audit_qdrant_timeout)
+                named_source_hits.extend(explicit_hits)
+                named_source_paths.update({canonical_id(h["arxiv_id"]):
+                                           "bounded_explicit_id_lookup"
+                                           for h in explicit_hits})
+            except Exception as error:
+                log.warning("named source lookup unavailable: %s", type(error).__name__)
+                named_lookup_error = True
+        for hit in named_source_hits:
+            hit["found_via"] = "explicitly named ID"
+            hit["explicitly_named"] = True
+            if not any(canonical_id(h["arxiv_id"]) == canonical_id(hit["arxiv_id"])
+                       for h in found):
+                found.append(hit)
         # papers today's wording failed to retrieve are fetched by id, so a
         # verdict resting on the record is backed by a citable item rather than
         # by a bare identifier in a side block
@@ -4966,6 +6261,42 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
             if h["arxiv_id"] in registry:
                 h["from_registry"] = True
         found = _hydrate_evidence(found)
+        named_source_by_head = {canonical_id(h["arxiv_id"]): h for h in found}
+        named_sources = []
+        for paper_id in named_source_ids:
+            hit = named_source_by_head.get(canonical_id(paper_id))
+            if hit is None:
+                named_sources.append({
+                    "id": paper_id,
+                    "found": False,
+                    "status": ("lookup_unavailable" if named_lookup_error
+                               else "not_returned_by_indexed_lookup"),
+                    "why_returned": "The claim or its phrasing explicitly names this document ID.",
+                    "note": ("The bounded indexed lookup did not return a matching chunk. "
+                             "The source may be absent from this index or the lookup may be "
+                             "unavailable; this is not evidence of novelty."),
+                    "verification_required": True,
+                })
+                continue
+            named_sources.append({
+                "id": hit["arxiv_id"],
+                "found": True,
+                "status": "found_by_indexed_lookup",
+                "title": hit.get("title"),
+                "year": hit.get("year"),
+                "score": round(hit["score"], 3),
+                "band": _evidence_band(hit, body.layer,
+                                       _distinctive_words(claim, body.layer)),
+                "why_returned": "The claim or its phrasing explicitly names this document ID.",
+                "retrieval_path": named_source_paths.get(canonical_id(hit["arxiv_id"]),
+                                                         "ordinary_claim_retrieval"),
+                "note": "A named source is not proof that the paper makes the claim.",
+                "url": hit.get("url") or hit.get("arxiv_url"),
+                "provenance": hit.get("evidence"),
+                "section": hit.get("section_type"),
+                "snippet": _clip(hit.get("text"), 320),
+                "verification_required": True,
+            })
         seen_nodes = {c["claim_id"] for c in same_question}
         same_question = same_question + [c for c in overlap_nodes
                                          if c["claim_id"] not in seen_nodes]
@@ -5012,19 +6343,17 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
             ce_scores = _rerank(claim, candidates)
             if ce_scores:
                 order = sorted(range(len(candidates)), key=lambda i: -ce_scores[i])
-                # relative, not absolute: the raw logit scale means nothing on
-                # its own, but the ordering is what the bi-encoder got wrong
+                # Scores rank passage relevance; they do not establish entailment.
                 top_ids = {candidates[i]["arxiv_id"] for i in order[:3]
                            if ce_scores[i] > CROSS_POSITIVE}
                 for h, sc in zip(candidates, ce_scores):
                     h["cross_score"] = round(float(sc), 3)
                     h["cross_top"] = h["arxiv_id"] in top_ids
-                # the reranked order is the answer, not a note beside it: the
-                # evidence was still being sorted by cosine while the model that
-                # actually read the passages sat in a field nobody acts on
+                # Apply relative passage-relevance ordering; this is not claim entailment.
                 rerank_order = {candidates[i]["arxiv_id"]: n for n, i in enumerate(order)}
                 rerank_report = {
                     "ran": True,
+                    "score_semantics": "relative passage relevance, not claim entailment",
                     "reason": ("no reading on record and the best hits sit within "
                                f"{RERANK_UNCERTAINTY} of the band"),
                     "order": [candidates[i]["arxiv_id"] for i in order],
@@ -5166,7 +6495,9 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
         # and start_here stayed empty while the section existed all along.
         found_limits, limitations, formulas = [], [], []
         if not fast_mode:
-            for pid in list(cited_ids)[:4]:
+            named_ids_found = [h["arxiv_id"] for h in named_source_hits]
+            limitation_scan_ids = list(dict.fromkeys(named_ids_found + list(cited_ids)))[:4]
+            for pid in limitation_scan_ids:
                 try:
                     points = qdrant_scroll_by_arxiv(pid, limit=200)
                 except HTTPException:
@@ -5177,11 +6508,24 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
                             and (pay.get("element_type") or "prose") == "prose"
                             and pay.get("text")):
                         found_limits.append({"arxiv_id": pid, "title": pay.get("title"),
-                                             "year": pay.get("year"), "text": pay.get("text")})
+                                             "year": pay.get("year"), "text": pay.get("text"),
+                                             "found_via": ("explicitly named ID" if pid in named_ids_found
+                                                           else "cited evidence")})
                         break
-            found_limits += _search(claim, section_type="limitations")
-            limitations = ([l for l in found_limits if l["arxiv_id"] in cited_ids]
-                           + [l for l in found_limits if l["arxiv_id"] not in cited_ids])[:3]
+            searched_limits = _search(claim, section_type="limitations")
+            found_limits += [dict(l, found_via="claim wording") for l in searched_limits]
+            ordered_limits = ([l for l in found_limits if l["arxiv_id"] in cited_ids]
+                              + [l for l in found_limits if l["arxiv_id"] not in cited_ids])
+            seen_limit_ids = set()
+            limitations = []
+            for limit_item in ordered_limits:
+                head = canonical_id(limit_item["arxiv_id"])
+                if head in seen_limit_ids:
+                    continue
+                seen_limit_ids.add(head)
+                limitations.append(limit_item)
+                if len(limitations) == 3:
+                    break
             if hits:
                 try:
                     spec = paper_spec(hits[0]["arxiv_id"], target_elements="algorithm,equation",
@@ -5190,9 +6534,32 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
                 except HTTPException:
                     formulas = []
 
+        incomplete_evidence = claim_evidence["incomplete_evidence"]
+        if incomplete_evidence:
+            uncertainty = ("Topic scope is unverified; the bounded qualified-source count does not establish "
+                           "index absence. " if scope_unverified else "")
+            if claim_evidence["unqualified_count"]:
+                uncertainty += "Some discovered sources lack qualified original evidence. "
+            if verdict in {"candidates_ruled_out", "adjacent_work_only", "weak_signal_only", "no_match_in_corpus"}:
+                verdict = "incomplete_evidence"
+                reading = uncertainty + ("Returned readings remain available, but this audit cannot conclude "
+                                         "that matching prior art is absent.")
+            else:
+                reading = ("Returned originals and recorded readings support this verdict. " + uncertainty +
+                           "No absence or exhaustive-reading conclusion follows.")
         years = [h.get("year") for h in hits if h.get("year")]
         claim_reports.append({
             "claim": claim,
+            "incomplete_evidence": incomplete_evidence,
+            "scope_unverified": scope_unverified,
+            "unread_count": claim_evidence["unread_count"],
+            "unqualified_count": claim_evidence["unqualified_count"],
+            "unread_count_is_lower_bound": bool(claim_evidence["unqualified_count"]),
+            "evidence_completeness_note": ("Counts take the maximum across wording/filter searches, not a sum. "
+                                           "Unqualified includes unread originals and evidence below the requested "
+                                           "score. Source leads never establish claim assertions."),
+            "source_candidates": list(claim_evidence["sources"].values())[:50],
+            "absence_verdict_allowed": not incomplete_evidence,
             "depth": body.depth,
             "deferred_sections": (["citation_graph", "cross_encoder", "limitations",
                                    "supporting_math"] if fast_mode else []),
@@ -5200,6 +6567,7 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
             "phrasings_searched": queries_used,
             "claim_id": claim_id,
             "same_question_candidates": same_question,
+            "named_sources": named_sources,
             "registry": [{
                 "id": pid,
                 "status": rec["status"],
@@ -5251,10 +6619,10 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
             },
             "corpus_coverage": {
                 "papers_about_this_claim": coverage,
-                "is_lower_bound": any(lay.get("is_lower_bound", False)
+                "is_lower_bound": bool(SOURCE_GENERATION_MANIFEST) or any(lay.get("is_lower_bound", False)
                                       for probe in coverage_probes
                                       for lay in probe.get("by_layer", {}).values()),
-                "probe_cap": (FAST_COVERAGE_PROBE_LIMIT if fast_mode
+                "probe_cap": (50 if SOURCE_GENERATION_MANIFEST else FAST_COVERAGE_PROBE_LIMIT if fast_mode
                               else COVERAGE_PROBE_LIMIT),
                 "by_layer": coverage_by_layer,
                 "probes": coverage_probes,
@@ -5266,7 +6634,8 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
                                 "chunk cap and may be truncated; it does not imply probe_cap papers. "
                                 "Registry hydration is excluded from these retrieval counts."),
                 "depth": _coverage_grade(coverage),
-                "reading": ("A quiet result over a well-covered subject is a real "
+                "reading": ("Evidence is incomplete; topic coverage cannot establish absence." if incomplete_evidence else
+                            "A quiet result over a well-covered subject is a real "
                             "signal; over a thin one it only shows the index is thin."
                             if coverage is not None else None),
             },
@@ -5299,7 +6668,7 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
                  "current_claim_registry_papers": len(current_registry),
                  "similar_claim_registry_papers": len(similar_registry),
                  "depth": _coverage_grade(coverage)}
-                if (not direct and not adjacent
+                if (not incomplete_evidence and not direct and not adjacent
                     and _coverage_grade(coverage) in ("empty", "thin"))
                 else None),
             "recall_note": (
@@ -5310,8 +6679,9 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
             "confidence": ("high" if len([h for h in direct
                                           if h.get("section_type") in ("method", "experiments")]) >= 2
                            else "medium" if direct or adjacent else "low"),
-            "verification_required": bool(unread_strong or pending_current
-                                          or by_status.get("contested", 0) or similar_registry),
+            "verification_required": bool(incomplete_evidence or unread_strong or pending_current
+                                          or by_status.get("contested", 0) or similar_registry
+                                          or named_sources),
             "settled": settled,
             # was reading hits[0], which after registry hydration can be a
             # paper pinned for its verdict rather than for its score
@@ -5370,6 +6740,7 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
             "known_limitations": [{
                 "id": l["arxiv_id"], "title": l["title"], "year": l.get("year"),
                 "from_cited_paper": l["arxiv_id"] in cited_ids,
+                "found_via": l.get("found_via", "claim wording"),
                 "still_a_candidate": l["arxiv_id"] not in ruled_out_ids,
                 "text": _clip(l.get("text"), 400),
             } for l in limitations],
@@ -5409,12 +6780,31 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
                         "candidates_read_pending_quorum",
                         "candidates_ruled_out", "strong_candidates",
                         "adjacent_work_only", "weak_signal_only",
-                        "no_match_in_corpus")}
+                        "no_match_in_corpus", "incomplete_evidence")}
     return {
         "idea": idea,
         "layer": body.layer,
         "corpus": corpus,
+        **({"in_scope": None if scope_unverified else True,
+            "scope_unverified": scope_unverified,
+            "scope_assessment": {
+                "state": "unverified" if scope_unverified else "verified",
+                "reason": ("insufficient_qualified_original_scope_evidence" if scope_unverified else
+                           "qualified_original_scope_evidence_observed"),
+                "observed_qualified_original_sources": scope_best,
+                "minimum_qualified_sources": IN_SCOPE_MIN_PAPERS,
+                "is_lower_bound": True,
+                "note": "Bounded qualified originals, not nearest-source count or total papers on topic. "
+                        "Scope uncertainty is separate from unread originals and does not establish index absence."}}
+           if SOURCE_GENERATION_MANIFEST else {}),
         "claims_audited": len(claim_reports),
+        "scope_generation": ({"generation": source_scope_identity[0], "cache_identity": source_scope_identity[1],
+                              "metric": "qualified_original_sources_from_source_generation"}
+                             if source_scope_identity else None),
+        "incomplete_evidence": any(c["incomplete_evidence"] for c in claim_reports),
+        "unread_count": sum(c["unread_count"] for c in claim_reports),
+        "unread_count_scope": "claim-source lower bound; a source may count once per claim",
+        "absence_verdict_allowed": not any(c["incomplete_evidence"] for c in claim_reports),
         "verdict_summary": counts,
         "briefing": (
             "What the field already published on this, what those authors admit went "
@@ -5425,7 +6815,9 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
             f"{len(claim_reports)} claims audited: {read_total} papers read against current canonical claims "
             f"({settled_total} settled with trusted model diversity), {unread_total} direct candidates still "
             f"unread; {similar_total} papers reported on similar, unlinked claims require claim verification. "
-            f"{counts['no_match_in_corpus']} claims have no match in this index."
+            f"{counts['no_match_in_corpus']} claims have no match in this index. "
+            f"{sum(c['incomplete_evidence'] for c in claim_reports)} claims have incomplete evidence; "
+            "absence conclusions are withheld for those claims."
         ),
         "scope": {
             "sources": ["arXiv", "IACR ePrint", "Ethereum EIPs", "Solana SIMDs",
@@ -5501,7 +6893,8 @@ FOUNDATIONAL_MIN_CITERS = 3
 EXPLORE_ABSTRACT_CHARS = 420
 SECTION_MAX_CHARS = 8000
 NEIGHBOUR_LIMIT = 25
-PAPER_COLUMNS = "arxiv_id, title, year, venue, citation_count, influential, layers, abstract, fulltext_source, source_url"
+PAPER_COLUMNS = ("arxiv_id, title, year, venue, citation_count, influential, layers, abstract, "
+                 "fulltext_source, source_url, parser_mode, parse_status")
 
 
 def _paper_rows(paper_ids):
@@ -5512,8 +6905,8 @@ def _paper_rows(paper_ids):
     out = {}
     for i in range(0, len(ids), 500):
         part = ids[i:i + 500]
-        sql = (f"SELECT {PAPER_COLUMNS} FROM papers WHERE status='done' "
-               f"AND arxiv_id IN ({','.join('?' * len(part))})")
+        sql = (f"SELECT {PAPER_COLUMNS}, status FROM papers "
+               f"WHERE arxiv_id IN ({','.join('?' * len(part))})")
         try:
             rows = _ro_conn(STATE_DB_PATH).execute(sql, part).fetchall()
         except sqlite3.OperationalError:
@@ -5521,30 +6914,56 @@ def _paper_rows(paper_ids):
             try:
                 conn = _ro_conn(STATE_DB_PATH)
                 columns = {r[1] for r in conn.execute("PRAGMA table_info(papers)").fetchall()}
-                compatible = ", ".join(c if c.strip() in columns else f"NULL AS {c.strip()}"
-                                       for c in PAPER_COLUMNS.split(","))
-                sql = (f"SELECT {compatible} FROM papers WHERE status='done' "
-                       f"AND arxiv_id IN ({','.join('?' * len(part))})")
+                requested = [c.strip() for c in PAPER_COLUMNS.split(",")] + ["status"]
+                compatible = ", ".join(
+                    c if c in columns else f"NULL AS {c}" for c in requested)
+                sql = (f"SELECT {compatible} FROM papers "
+                       f"WHERE arxiv_id IN ({','.join('?' * len(part))})")
                 rows = conn.execute(sql, part).fetchall()
             except sqlite3.Error:
                 rows = []
         except sqlite3.Error:
             rows = []
         for r in rows:
+            if r[-1] != "done":
+                continue
             out[r[0]] = {"arxiv_id": r[0], "title": r[1], "year": r[2], "venue": r[3],
                          "citation_count": r[4], "influential_citations": r[5],
                          "layers": [l for l in (r[6] or "").split(",") if l],
                          "abstract": r[7],
                          "fulltext_source": r[8] if len(r) > 8 else None,
-                         "source_url": r[9] if len(r) > 9 else None}
+                         "source_url": r[9] if len(r) > 9 else None,
+                         "parser_mode": r[10] if len(r) > 10 else None,
+                         "parse_status": r[11] if len(r) > 11 else None,
+                         "link": None, "pdf_url": None, "landing_page_url": None}
     return out
 
 
 def _hydrate_evidence(results, rows=None):
     if rows is None:
         rows = _evidence_rows([r.get("arxiv_id") or r.get("id") for r in results])
+    if any(row.get("metadata_authority") == "frozen_source_catalog" for row in results):
+        rows = dict(rows)
+        for row in results:
+            if row.get("metadata_authority") == "frozen_source_catalog":
+                pid = row.get("arxiv_id") or row.get("id")
+                rows[pid] = {**rows.get(pid, {}), **{field: row.get(field)
+                             for field in ("title", "year", "layers", "source_url")}}
     return hydrate_results(results, rows, source_url, license_of,
                            lambda pid: SOURCE_LABELS[source_of(pid)])
+
+
+def _hydrate_search_payload(payload):
+    candidates = payload.get("source_candidates")
+    if candidates is None:
+        payload["results"] = _hydrate_evidence(payload["results"])
+        return payload
+    ids = [row.get("arxiv_id") or row.get("id")
+           for row in [*payload.get("results", []), *candidates]]
+    rows = _evidence_rows(ids)
+    payload["results"] = _hydrate_evidence(payload.get("results", []), rows)
+    payload["source_candidates"] = _hydrate_evidence(candidates, rows)
+    return payload
 
 
 def _evidence_rows(ids):
@@ -5557,7 +6976,17 @@ def _evidence_rows(ids):
 
 def _paper_passport(pid, fragment, rows):
     item = _hydrate_evidence([dict(fragment, arxiv_id=pid, url=source_url(pid, fragment))], rows)[0]
-    return {key: item[key] for key in ("source", "url", "license", "fulltext", "completeness", "evidence")}
+    return {key: item[key] for key in ("source", "url", "license", "fulltext", "completeness",
+                                       "evidence", "provenance_missing", "source_url_origin",
+                                       "source_url_status", "legacy_id_alias") if key in item}
+
+
+def _passport_source_metadata(pid, rows, passport):
+    metadata = dict(rows.get(pid) or {})
+    metadata["_source_url_origin"] = passport.get("source_url_origin")
+    metadata["_source_url_status"] = passport.get("source_url_status")
+    metadata["_legacy_id_alias"] = passport.get("legacy_id_alias")
+    return metadata
 
 
 @app.post("/v1/research/bundle")
@@ -5576,10 +7005,96 @@ def research_bundle(body: ResearchBundleBody, x_api_key: Optional[str] = Header(
             break
     if any("evidence" not in hit for hit in selected):
         selected = _hydrate_evidence(selected)
-    retrieve = BoundedRetriever(
+    bounded = BoundedRetriever(
         lambda pid, timeout: qdrant_scroll_by_arxiv(pid, limit=BUNDLE_CHUNK_LIMIT,
                                                    page=BUNDLE_CHUNK_LIMIT, timeout=timeout, deadline=deadline),
         deadline, time.monotonic)
+    class AliasAwareRetriever:
+        @property
+        def calls(self):
+            return bounded.calls
+
+        def __call__(self, pid):
+            requested_points = bounded(pid)
+            requested_payloads = _payloads_for_id(requested_points, pid)
+            covered = {"equations": False, "algorithms": False, "tables": False,
+                       "limitations": False, "code": False}
+
+            def mark(payloads):
+                for payload in payloads:
+                    if not payload.get("text"):
+                        continue
+                    category = {"equation": "equations", "algorithm": "algorithms",
+                                "table": "tables", "code": "code"}.get(
+                                    (payload.get("element_type") or "").lower())
+                    if category:
+                        covered[category] = True
+                    if ((payload.get("section_type") or "").lower() == "limitations" or
+                            "limitation" in (payload.get("section_title") or "").lower()):
+                        covered["limitations"] = True
+            mark(requested_payloads)
+            if all(covered.values()):
+                return requested_points
+
+            aliases = _trusted_alias_ids(pid)
+            if not aliases:
+                return requested_points
+            attempted, sources, errors = [pid], [], []
+
+            def add_source(source_id, points, only_missing):
+                payloads = _payloads_for_id(points, source_id)
+                def fills_missing(p):
+                    category = {"equation": "equations", "algorithm": "algorithms",
+                                "table": "tables", "code": "code"}.get(
+                                    (p.get("element_type") or "").lower())
+                    section = (p.get("section_type") or "").lower()
+                    title = (p.get("section_title") or "").lower()
+                    return category in only_missing or (
+                        "limitations" in only_missing and
+                        (section == "limitations" or "limitation" in title))
+                accepted = payloads if source_id == pid else [p for p in payloads if fills_missing(p)]
+                if not accepted:
+                    return []
+                rows = _evidence_rows([source_id])
+                sources.append({"id": source_id, "points": [point for point in points
+                    if (point.get("payload") or {}) in accepted],
+                    "metadata": rows.get(source_id) or {},
+                    "passport": _paper_passport(source_id, accepted[0], rows)})
+                return accepted
+
+            exhausted = False
+            if requested_payloads:
+                valid_requested = [point for point in requested_points
+                                   if (point.get("payload") or {}).get("arxiv_id") in (None, pid)]
+                if valid_requested:
+                    rows = _evidence_rows([pid])
+                    sources.append({"id": pid, "points": valid_requested,
+                                    "metadata": rows.get(pid) or {},
+                                    "passport": _paper_passport(pid, requested_payloads[0], rows)})
+            for alias in aliases:
+                if all(covered.values()):
+                    break
+                if time.monotonic() >= deadline:
+                    exhausted = True
+                    break
+                attempted.append(alias)
+                need = {category for category, present in covered.items() if not present}
+                try:
+                    alias_points = bounded(alias)
+                except Exception as error:
+                    errors.append({"source_id": alias, "error": type(error).__name__})
+                    if isinstance(error, TimeoutError) or time.monotonic() >= deadline:
+                        exhausted = True
+                    continue
+                alias_payloads = add_source(alias, alias_points, need)
+                mark(alias_payloads)
+            resolution = {"requested_id": pid, "source_ids": [s["id"] for s in sources],
+                          "attempted_ids": attempted,
+                          "partial": bool(exhausted or errors or not all(covered.values())),
+                          "time_budget_exhausted": exhausted, "errors": errors}
+            return {"sources": sources, "resolution": resolution}
+
+    retrieve = AliasAwareRetriever()
     return build_bundle(body, search_result, selected, retrieve)
 
 
@@ -5609,16 +7124,25 @@ def _check_layer(layer):
 def _rank_papers(query, layer, year_from, year_to, pool_size):
     """The pool_size most relevant papers for a query, best first, one row per
     paper (twins folded into the best ranked copy), each with relevance_rank.
-    Returns (rows, dense_error); dense_error is set when the paper index was
-    down and only title/abstract terms ranked the pool."""
-    vector = None if COARSE_EMBED_URL else embed_query(query)
-    dense_error = None
+    Returns (rows, channel_diagnostics); diagnostics is None when both ranking
+    channels completed successfully."""
+    channel_diagnostics = {
+        "dense": {"status": "ok", "error": None},
+        "lexical": {"status": "ok", "error": None},
+    }
     try:
+        vector = None if COARSE_EMBED_URL else embed_query(query)
         dense = _coarse_paper_search(vector, layer, year_from, year_to,
                                      pool_size, timeout=10, query=query)
     except HTTPException as e:
         dense, dense_error = [], str(e.detail)
-    lexical = _paper_bm25(query, layer, year_from, year_to, limit=pool_size)
+        channel_diagnostics["dense"] = {"status": "failed", "error": dense_error}
+    try:
+        lexical = _paper_bm25(query, layer, year_from, year_to, limit=pool_size)
+    except (FuturesTimeoutError, sqlite3.Error) as e:
+        lexical = []
+        lexical_error = str(e) or type(e).__name__
+        channel_diagnostics["lexical"] = {"status": "failed", "error": lexical_error}
     scores = reciprocal_rank_fusion([p["arxiv_id"] for p in dense], lexical,
                                     weights=[HIER_W_DENSE, HIER_W_LEX])
     fused = sorted(scores, key=lambda p: -scores[p])
@@ -5637,7 +7161,17 @@ def _rank_papers(query, layer, year_from, year_to, pool_size):
     pool = _put_named_first(pool, query, year_from, year_to, pool_size)
     for n, row in enumerate(pool, start=1):
         row["relevance_rank"] = n
-    return pool, dense_error
+    if all(channel["status"] == "failed" for channel in channel_diagnostics.values()):
+        if not pool:
+            raise HTTPException(
+                status_code=503,
+                detail={"message": "paper ranking unavailable: dense and lexical channels failed",
+                        "channels": channel_diagnostics},
+            )
+    diagnostics = (channel_diagnostics
+                   if any(channel["status"] == "failed"
+                          for channel in channel_diagnostics.values()) else None)
+    return pool, diagnostics
 
 
 def _put_named_first(pool, query, year_from, year_to, pool_size):
@@ -5681,8 +7215,8 @@ def find_papers(body: PapersBody, x_api_key: Optional[str] = Header(default=None
     _check_layer(body.layer)
     if body.sort not in EXPLORE_SORTS:
         raise HTTPException(status_code=400, detail=f"sort must be one of {list(EXPLORE_SORTS)}")
-    pool, dense_error = _rank_papers(body.query, body.layer, body.year_from, body.year_to,
-                                     EXPLORE_POOL)
+    pool, channel_diagnostics = _rank_papers(body.query, body.layer, body.year_from, body.year_to,
+                                             EXPLORE_POOL)
     if body.sort != "relevance":
         pool = pool[:EXPLORE_RESORT_POOL]
     if body.sort == "citations":
@@ -5704,9 +7238,19 @@ def find_papers(body: PapersBody, x_api_key: Optional[str] = Header(default=None
         papers.append(card)
     out = {"papers": papers, "count": len(papers), "sort": body.sort,
            "pool": len(pool), "scope": _query_scope(body.query), "usage": USAGE_NOTICE}
-    if dense_error:
+    if channel_diagnostics:
         out["partial"] = True
-        out["note"] = f"paper index unavailable ({dense_error}); ranked by title/abstract terms only"
+        out["channel_diagnostics"] = channel_diagnostics
+        dense = channel_diagnostics["dense"]
+        lexical = channel_diagnostics["lexical"]
+        if dense["status"] == "failed" and lexical["status"] == "failed":
+            out["note"] = "dense and lexical ranking unavailable; returning exact named-source matches only"
+        elif dense["status"] == "failed":
+            out["note"] = (f"dense paper index unavailable ({dense['error']}); "
+                           "ranked by title/abstract terms only")
+        else:
+            out["note"] = (f"title/abstract paper index unavailable ({lexical['error']}); "
+                           "ranked by dense similarity only")
     if body.sort in ("citations", "recent"):
         out["note_sort"] = (f"re-sorted from the {EXPLORE_RESORT_POOL} most relevant papers; "
                             "relevance_rank shows where each stood before")
@@ -5893,16 +7437,26 @@ def paper_facets(body: FacetsBody, x_api_key: Optional[str] = Header(default=Non
     _check_layer(body.layer)
     out, top = {}, []
     if body.query:
-        pool, dense_error = _rank_papers(body.query, body.layer, body.year_from, body.year_to,
-                                         FACET_POOL)
+        pool, channel_diagnostics = _rank_papers(body.query, body.layer, body.year_from, body.year_to,
+                                                  FACET_POOL)
         rows = _facet_source(body, [r["arxiv_id"] for r in pool])
         top = [_paper_card(r) for r in pool[:5]]
         out["counted_over"] = (f"the {FACET_POOL} papers most relevant to the query"
                                if len(pool) >= FACET_POOL else "every paper the query reached")
         out["scope"] = _query_scope(body.query)
-        if dense_error:
+        if channel_diagnostics:
             out["partial"] = True
-            out["note"] = f"paper index unavailable ({dense_error}); ranked by title/abstract terms only"
+            out["channel_diagnostics"] = channel_diagnostics
+            dense = channel_diagnostics["dense"]
+            lexical = channel_diagnostics["lexical"]
+            if dense["status"] == "failed" and lexical["status"] == "failed":
+                out["note"] = "dense and lexical ranking unavailable; returning exact named-source matches only"
+            elif dense["status"] == "failed":
+                out["note"] = (f"dense paper index unavailable ({dense['error']}); "
+                               "ranked by title/abstract terms only")
+            else:
+                out["note"] = (f"title/abstract paper index unavailable ({lexical['error']}); "
+                               "ranked by dense similarity only")
     else:
         rows = _facet_source(body, None)
         out["counted_over"] = "every paper in the filter"
@@ -6008,11 +7562,50 @@ def similar_papers(paper_id: str, limit: int = 10, layer: Optional[str] = None,
     return {"id": paper_id, "papers": papers, "count": len(papers), "usage": USAGE_NOTICE}
 
 
+def _load_canonical_section_manifest(paper_id):
+    try:
+        try:
+            from pipeline.document_cache import load_section_manifest
+        except ModuleNotFoundError:
+            from document_cache import load_section_manifest
+        state = _ro_conn(STATE_DB_PATH)
+        row = state.execute("SELECT status FROM papers WHERE arxiv_id=?", (paper_id,)).fetchone()
+        if not row or row[0] != "done":
+            return None, "paper_not_done"
+        root = Path(os.getenv("DTOX_DATA_DIR") or Path(STATE_DB_PATH).parent)
+        cache_paths = {name: os.environ[setting] for name, setting in (
+            ("cache_dir", "DTOX_CHUNK_CACHE_DIR"),
+            ("section_cache_dir", "DTOX_SECTION_CACHE_DIR")) if os.getenv(setting)}
+        manifest = load_section_manifest(root, paper_id, **cache_paths)
+        row = state.execute("SELECT status FROM papers WHERE arxiv_id=?", (paper_id,)).fetchone()
+        if not row or row[0] != "done":
+            return None, "paper_not_done"
+        return manifest, None
+    except (ImportError, OSError, ValueError, TypeError, sqlite3.Error):
+        return None, "canonical_manifest_unavailable_or_invalid"
+
+
+def _canonical_section_view(paper_id, payloads, title, section_type):
+    manifest, reason = _load_canonical_section_manifest(paper_id)
+    if manifest is None:
+        return None, None, reason
+    sections = manifest["sections"]
+    selected = [section for section in sections if (
+        section["section_title"] == title if title else section["section_type"] == section_type)]
+    if manifest["coverage"] == "examined_sections":
+        covered = {(section["section_title"], section["section_type"]) for section in selected}
+        requested = {(p.get("section_title") or "", p.get("section_type") or "other") for p in payloads
+                     if (p.get("section_title") == title if title else p.get("section_type") == section_type)}
+        if not selected or not requested.issubset(covered):
+            return None, None, "section_not_fully_examined"
+    return selected, manifest, None
+
+
 @app.get("/v1/paper/{paper_id:path}/section")
 def paper_section(paper_id: str, title: Optional[str] = None, section_type: Optional[str] = None,
                   offset: Annotated[int, Query(ge=0)] = 0, max_chars: int = SECTION_MAX_CHARS,
                   x_api_key: Optional[str] = Header(default=None)):
-    """Text of one section, in paper order, paged by characters. Pick the
+    """Text of one section, with explicit order verification, paged by characters. Pick the
     section by its exact title from /v1/paper/{id}, or by section_type
     (method, experiments, limitations, ...) for every section of that kind."""
     auth_and_limit(x_api_key)
@@ -6023,12 +7616,28 @@ def paper_section(paper_id: str, title: Optional[str] = None, section_type: Opti
     if not points:
         raise HTTPException(status_code=404, detail="paper not found")
     payloads = sorted((pt["payload"] for pt in points), key=lambda p: p.get("chunk_index", 0))
+    all_sections = _outline(payloads)
+    available_sections = all_sections[:50]
     if title:
         chosen = [p for p in payloads if (p.get("section_title") or "") == title]
     else:
         chosen = [p for p in payloads if (p.get("section_type") or "") == section_type]
+    canonical, manifest, order_reason = _canonical_section_view(paper_id, payloads, title, section_type)
+    if canonical is not None:
+        chosen = [dict(section, title=payloads[0].get("title")) for section in canonical]
     if not chosen:
-        raise HTTPException(status_code=404, detail="no such section; see outline in /v1/paper/{id}")
+        raise HTTPException(status_code=404, detail={
+            "message": "no exact section match; no semantic substitution was made",
+            "requested": {"title": title, "section_type": section_type},
+            "available_sections": available_sections,
+            "available_sections_total": len(all_sections),
+            "available_sections_truncated": len(all_sections) > len(available_sections),
+            "selection_hints": {
+                "exact_title": "Pass one section_title exactly as listed in available_sections.",
+                "section_type": "Pass an exact section_type from available_sections; all sections of that type are returned.",
+                "outline": f"GET /v1/paper/{paper_id} for the paper outline.",
+            },
+        })
     text = "\n\n".join(p.get("text") or "" for p in chosen)
     piece = text[offset:offset + max_chars]
     end = offset + len(piece)
@@ -6036,11 +7645,18 @@ def paper_section(paper_id: str, title: Optional[str] = None, section_type: Opti
     passport = _paper_passport(paper_id, fragment, _evidence_rows([paper_id]))
     passport["evidence"]["fragment_scope"] = "returned_section_page"
     passport["evidence"]["offset"] = offset
+    passport["evidence"]["order_verified"] = canonical is not None
+    order = {"verified": canonical is not None, "scope": manifest["coverage"] if manifest else "legacy_chunk_index"}
+    if manifest:
+        order.update(source_sha256=manifest["source_sha256"], cache_sha256=manifest["cache_sha256"],
+                     parser_revision=manifest["parser_revision"])
+    else:
+        order["reason"] = order_reason
     return {"id": paper_id, "title": chosen[0].get("title"),
             **passport,
             "section_title": title, "section_type": section_type,
             "text": piece, "offset": offset, "next_offset": end if end < len(text) else None,
-            "total_chars": len(text), "usage": USAGE_NOTICE}
+            "total_chars": len(text), "section_order": order, "usage": USAGE_NOTICE}
 
 
 @app.get("/v1/paper/{paper_id:path}")
@@ -6083,6 +7699,7 @@ def health():
     samples = list(search_latencies)
     return {
         "status": "ok",
+        "optional_reranker": {"enabled": RERANK_ENABLED, **_rerank_runtime.snapshot()},
         "search_latency_seconds": {
             "samples": len(samples),
             "p50": _latency_percentile(samples, 0.50),

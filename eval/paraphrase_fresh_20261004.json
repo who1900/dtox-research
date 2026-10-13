@@ -1,0 +1,253 @@
+{
+  "dataset": "paraphrase-fresh-20261004",
+  "scope_notes": [
+    "Authored before any run of this fixture; no empirical tuning or live search was used.",
+    "This is a frozen fresh retrieval test, not an exhaustive bibliography or a precision estimate. Targets are known primary-source anchors; a hit does not establish precision or completeness.",
+    "Builder-tech targets describe plausible indexed sources, but their corpus coverage is UNKNOWN. Preserve and report missing-source outcomes; do not remove or silently exclude them later.",
+    "Aliases are empty where no stable additional canonical alias was confirmed. Hard negatives are optional focal-mechanism contrasts, not judgments that the work is wholly irrelevant.",
+    "Each group has three distinct English formulations of the same mechanism, including one plain-language formulation. Queries contain no paper names or identifiers.",
+    "The cryptographic target is a primary arXiv paper constructing a concrete succinct non-interactive zero-knowledge proof and explaining its use in a privacy-preserving ledger; it is not the original Groth16 construction."
+  ],
+  "groups": [
+    {
+      "id": "web3-signed-token-approval",
+      "layer": "web3",
+      "mechanism": "A token holder authorizes a spender by signing typed data off-chain, allowing a relayer to submit the approval on-chain.",
+      "targets": [{"canonical_id": "eip:2612", "aliases": [], "source_url": "https://eips.ethereum.org/EIPS/eip-2612"}],
+      "hard_negatives": [{"id": "eip:721", "reason": "Tracks unique non-fungible ownership and transfers, rather than fungible token allowance authorization.", "source_url": "https://eips.ethereum.org/EIPS/eip-721"}],
+      "phrases": [
+        {"id": "permit-signature", "query": "Fungible-token allowance update authorized with a typed-data signature and nonce"},
+        {"id": "relayed-approval", "query": "How can a wallet approve a token spender without sending the approval transaction itself?"},
+        {"id": "gasless-token-authorization", "query": "Token delegation via a signed message with deadline and replay protection, submitted by any caller"}
+      ]
+    },
+    {
+      "id": "web3-dynamic-base-fee-burn",
+      "layer": "web3",
+      "mechanism": "A congestion-responsive per-block base fee changes with gas usage, is burned, and is separate from a user-set priority fee.",
+      "targets": [{"canonical_id": "eip:1559", "aliases": [], "source_url": "https://eips.ethereum.org/EIPS/eip-1559"}],
+      "hard_negatives": [{"id": "eip:4844", "reason": "Defines blob data transactions and their separate fee market, not congestion-adjusted execution base-fee pricing.", "source_url": "https://eips.ethereum.org/EIPS/eip-4844"}],
+      "phrases": [
+        {"id": "elastic-fee-market", "query": "Transaction pricing with an algorithmically adjusted base fee, burned protocol fee, and optional priority tip"},
+        {"id": "congestion-responsive-cost", "query": "Which fee design raises its network charge after above-target blocks and lowers it when blocks are quiet?"},
+        {"id": "predictable-transaction-fees", "query": "Replace bidding where users pay their bid with a congestion-linked block charge plus a miner tip"}
+      ]
+    },
+    {
+      "id": "web3-blob-data-availability",
+      "layer": "web3",
+      "mechanism": "A transaction type carries blobs whose data is committed for temporary data availability, separately from ordinary execution calldata.",
+      "targets": [{"canonical_id": "eip:4844", "aliases": [], "source_url": "https://eips.ethereum.org/EIPS/eip-4844"}],
+      "hard_negatives": [{"id": "eip:1559", "reason": "Changes execution transaction fee pricing, but does not introduce temporary data blobs for rollup availability.", "source_url": "https://eips.ethereum.org/EIPS/eip-1559"}],
+      "phrases": [
+        {"id": "blob-carrying-transaction", "query": "Ethereum transaction format for rollup data blobs with a separate blob fee market"},
+        {"id": "temporary-bulk-data", "query": "How can a rollup publish lots of data for temporary network availability without putting it in normal contract calldata?"},
+        {"id": "commitment-backed-blobs", "query": "A transaction references polynomial-commitment-backed data chunks that nodes retain for a limited period"}
+      ]
+    },
+    {
+      "id": "web3-account-abstraction-alt-mempool",
+      "layer": "web3",
+      "mechanism": "Smart-account operations are validated and bundled through a separate mempool and entry-point contract without requiring a consensus-layer transaction change.",
+      "targets": [{"canonical_id": "eip:4337", "aliases": [], "source_url": "https://eips.ethereum.org/EIPS/eip-4337"}],
+      "hard_negatives": [{"id": "eip:2612", "reason": "Relays signed token approvals but does not define smart-account operations, validation, or bundling.", "source_url": "https://eips.ethereum.org/EIPS/eip-2612"}],
+      "phrases": [
+        {"id": "user-operation-bundling", "query": "Account abstraction using UserOperations, bundlers, a dedicated mempool, and an EntryPoint"},
+        {"id": "smart-wallet-submission", "query": "Let a smart wallet check its own authorization and have an intermediary package its request into a chain transaction"},
+        {"id": "protocol-compatible-aa", "query": "How can programmable accounts get batching and sponsored gas without changing the base transaction protocol?"}
+      ]
+    },
+    {
+      "id": "web3-tokenized-vault-interface",
+      "layer": "web3",
+      "mechanism": "A common fungible-share interface standardizes deposits, withdrawals, and conversions between shares and underlying assets in a vault.",
+      "targets": [{"canonical_id": "eip:4626", "aliases": [], "source_url": "https://eips.ethereum.org/EIPS/eip-4626"}],
+      "hard_negatives": [{"id": "eip:20", "reason": "Generic fungible balances and transfers, not vault-share deposits, withdrawals, and asset conversion accounting.", "source_url": "https://eips.ethereum.org/EIPS/eip-20"}],
+      "phrases": [
+        {"id": "vault-share-standard", "query": "Standard fungible vault-share API with deposit, mint, withdraw, and redeem operations"},
+        {"id": "asset-to-share-accounting", "query": "A common way for apps to calculate how many ownership tokens a user receives for putting assets into a vault"},
+        {"id": "composable-yield-vault", "query": "Which tokenized-vault interface exposes previews and conversions between underlying assets and transferable shares?"}
+      ]
+    },
+    {
+      "id": "web3-transaction-scoped-transient-storage",
+      "layer": "web3",
+      "mechanism": "Smart contracts access temporary storage that persists across calls within one transaction but is cleared afterward.",
+      "targets": [{"canonical_id": "eip:1153", "aliases": [], "source_url": "https://eips.ethereum.org/EIPS/eip-1153"}],
+      "hard_negatives": [{"id": "eip:2200", "reason": "Net gas metering for persistent storage writes, rather than temporary transaction-lifetime storage opcodes.", "source_url": "https://eips.ethereum.org/EIPS/eip-2200"}],
+      "phrases": [
+        {"id": "transient-opcodes", "query": "EVM TLOAD and TSTORE opcodes for transaction-lifetime state"},
+        {"id": "temporary-cross-call-state", "query": "How can contracts pass a small temporary value between calls and have it disappear automatically at transaction end?"},
+        {"id": "reentrancy-lock-storage", "query": "Use cheap ephemeral contract storage for a lock shared during execution but not persisted to the next transaction"}
+      ]
+    },
+    {
+      "id": "web3-solana-durable-nonce-replay-handling",
+      "layer": "web3",
+      "mechanism": "Solana block replay handles durable-nonce transactions with account-state validation failures as recorded no-fee failures without state changes or rejection of the whole block.",
+      "targets": [{"canonical_id": "simd:0297", "aliases": [], "source_url": "https://github.com/solana-foundation/solana-improvement-documents/blob/main/proposals/0297-relax-invalid-nonce.md"}],
+      "hard_negatives": [],
+      "phrases": [
+        {"id": "invalid-nonce-soft-failure", "query": "Durable-nonce replay where invalid account state records a failed no-fee transaction instead of rejecting the block"},
+        {"id": "keep-block-continue", "query": "If an old offline transaction has a stale nonce, can the ledger keep its block and simply mark that transaction failed?"},
+        {"id": "no-state-no-fee", "query": "Relax replay rules so account-invalid nonce transactions make no state changes or fee payment while valid neighboring transactions remain committable"}
+      ]
+    },
+    {
+      "id": "web3-zcash-succinct-proof-verification",
+      "layer": "web3",
+      "mechanism": "A succinct non-interactive zero-knowledge proof lets a verifier check a statement used by a privacy-preserving cryptocurrency without learning the secret witness.",
+      "targets": [{"canonical_id": "2008.00881", "aliases": [], "source_url": "https://arxiv.org/abs/2008.00881"}],
+      "hard_negatives": [],
+      "phrases": [
+        {"id": "succinct-argument-verifier", "query": "A verifier checks a compact non-interactive proof of computation while the prover's secret witness stays hidden"},
+        {"id": "private-payment-correctness", "query": "How can a cryptocurrency confirm a payment obeys its rules without revealing private amounts and inputs?"},
+        {"id": "proof-system-in-ledger", "query": "Construct a concrete zero-knowledge argument of knowledge and explain how verification supports ledger privacy"}
+      ]
+    },
+    {
+      "id": "llm-qlora-four-bit-adaptation",
+      "layer": "llm-slm",
+      "mechanism": "A quantized frozen language model is adapted with trainable low-rank updates, using memory-saving quantization techniques for fine-tuning.",
+      "targets": [{"canonical_id": "2305.14314", "aliases": [], "source_url": "https://arxiv.org/abs/2305.14314"}],
+      "hard_negatives": [{"id": "2101.00190", "reason": "Learns continuous prefix vectors while the backbone is frozen; it does not use quantized model weights with trainable low-rank adapters.", "source_url": "https://arxiv.org/abs/2101.00190"}],
+      "phrases": [
+        {"id": "nf4-low-rank-finetuning", "query": "4-bit NF4 quantization with double quantization and trainable low-rank adapters for LLM fine-tuning"},
+        {"id": "single-gpu-adaptation", "query": "Can a researcher tune a very large language model on one GPU by keeping its quantized weights fixed and learning small update matrices?"},
+        {"id": "paged-optimizer-quantized-base", "query": "Parameter-efficient adaptation combines a frozen 4-bit backbone, rank-decomposed updates, and paged optimizers"}
+      ]
+    },
+    {
+      "id": "llm-grouped-query-attention",
+      "layer": "llm-slm",
+      "mechanism": "Multiple query heads share a smaller number of key-value heads, reducing autoregressive decoding cache and bandwidth costs.",
+      "targets": [{"canonical_id": "2305.13245", "aliases": [], "source_url": "https://arxiv.org/abs/2305.13245"}],
+      "hard_negatives": [{"id": "2309.06180", "reason": "Pages the inference KV cache for memory management but does not reduce key-value head count through grouped-query attention.", "source_url": "https://arxiv.org/abs/2309.06180"}],
+      "phrases": [
+        {"id": "shared-kv-heads", "query": "Attention architecture between multi-head and multi-query attention where groups of query heads share KV heads"},
+        {"id": "smaller-decoding-cache", "query": "How can a decoder keep many query heads but store fewer key and value projections to speed generation?"},
+        {"id": "checkpoint-uptraining", "query": "Convert existing multi-head attention checkpoints to grouped key-value heads using an uptraining procedure"}
+      ]
+    },
+    {
+      "id": "llm-direct-preference-optimization",
+      "layer": "llm-slm",
+      "mechanism": "A language model is optimized directly from chosen-versus-rejected preference pairs using a classification-style objective, without a separately sampled RL loop.",
+      "targets": [{"canonical_id": "2305.18290", "aliases": [], "source_url": "https://arxiv.org/abs/2305.18290"}],
+      "hard_negatives": [{"id": "2402.03300", "reason": "Uses group-relative policy optimization and sampled-response advantages rather than direct preference classification.", "source_url": "https://arxiv.org/abs/2402.03300"}],
+      "phrases": [
+        {"id": "preference-pair-objective", "query": "Fine-tune a policy on preferred and dispreferred responses with a direct logistic preference objective"},
+        {"id": "skip-reward-model-loop", "query": "Can human comparisons align a chatbot without separately training a reward model and running online reinforcement learning?"},
+        {"id": "implicit-reward-policy", "query": "An offline language-model alignment method derives the policy from pairwise feedback through a simple classification loss"}
+      ]
+    },
+    {
+      "id": "llm-retrieval-augmented-parametric-memory",
+      "layer": "llm-slm",
+      "mechanism": "A pretrained sequence-to-sequence generator combines parametric memory with retrieved passages from a dense non-parametric index, optionally conditioning each generated token on different passages.",
+      "targets": [{"canonical_id": "2005.11401", "aliases": [], "source_url": "https://arxiv.org/abs/2005.11401"}],
+      "hard_negatives": [{"id": "2203.11171", "reason": "Aggregates sampled reasoning paths at inference, rather than retrieving external documents to augment parametric memory.", "source_url": "https://arxiv.org/abs/2203.11171"}],
+      "phrases": [
+        {"id": "retrieved-nonparametric-memory", "query": "Combine a pretrained text generator's stored knowledge with passages retrieved from a dense external index"},
+        {"id": "look-up-then-answer", "query": "How can a language model search a collection of documents first and use what it finds to answer questions?"},
+        {"id": "tokenwise-passage-conditioning", "query": "Compare a generator conditioned on one retrieved context throughout with one able to attend to different passages per output token"}
+      ]
+    },
+    {
+      "id": "llm-tree-search-reasoning",
+      "layer": "llm-slm",
+      "mechanism": "Problem solving explores and evaluates multiple intermediate thought branches as a search tree instead of generating one uninterrupted reasoning chain.",
+      "targets": [{"canonical_id": "2305.10601", "aliases": [], "source_url": "https://arxiv.org/abs/2305.10601"}],
+      "hard_negatives": [{"id": "2203.11171", "reason": "Aggregates complete sampled reasoning paths instead of branching, evaluating, and searching partial thought states.", "source_url": "https://arxiv.org/abs/2203.11171"}],
+      "phrases": [
+        {"id": "branch-prune-thoughts", "query": "Language-model reasoning that generates candidate intermediate steps, evaluates branches, and searches over a tree"},
+        {"id": "backtrack-on-dead-ends", "query": "Rather than follow its first line of reasoning, let a model try several partial solutions and backtrack when one stalls"},
+        {"id": "deliberate-state-space-search", "query": "Use breadth-first or depth-first exploration over coherent thought states with self-evaluation to solve a task"}
+      ]
+    },
+    {
+      "id": "ai-agents-lifelong-executable-skill-library",
+      "layer": "ai-agents",
+      "mechanism": "An embodied agent accumulates executable skills, retrieves them for later tasks, and uses environment feedback to improve without weight updates.",
+      "targets": [{"canonical_id": "2305.16291", "aliases": [], "source_url": "https://arxiv.org/abs/2305.16291"}],
+      "hard_negatives": [{"id": "2210.03629", "reason": "Interleaves reasoning with actions in a task loop but does not center on accumulating and retrieving an executable lifelong skill library.", "source_url": "https://arxiv.org/abs/2210.03629"}],
+      "phrases": [
+        {"id": "reusable-code-skills", "query": "Lifelong embodied agent with an expanding library of executable behaviors retrieved to solve new tasks"},
+        {"id": "learn-once-reuse-later", "query": "A game-playing assistant writes successful procedures as reusable code so it can handle unfamiliar goals later"},
+        {"id": "environment-feedback-curriculum", "query": "Open-ended agent uses automatic exploration curriculum, stored skills, and execution feedback rather than fine-tuning"}
+      ]
+    },
+    {
+      "id": "ai-agents-multi-agent-conversation-orchestration",
+      "layer": "ai-agents",
+      "mechanism": "Conversable agents coordinate through customizable message exchanges and can combine language-model reasoning with tools and human input.",
+      "targets": [{"canonical_id": "2308.08155", "aliases": [], "source_url": "https://arxiv.org/abs/2308.08155"}],
+      "hard_negatives": [{"id": "2210.03629", "reason": "A single-agent reasoning/action loop, not customizable multi-agent conversation orchestration.", "source_url": "https://arxiv.org/abs/2210.03629"}],
+      "phrases": [
+        {"id": "conversable-agent-framework", "query": "Framework for LLM applications built from customizable agents that exchange messages and invoke tools"},
+        {"id": "agents-talk-to-finish-work", "query": "How can several AI assistants talk to one another, hand off work, and ask a person for input when needed?"},
+        {"id": "programmable-conversation-patterns", "query": "Orchestrate task-solving through configurable multi-agent dialogue, tool use, and human feedback"}
+      ]
+    },
+    {
+      "id": "ai-agents-generative-memory-reflection-planning",
+      "layer": "ai-agents",
+      "mechanism": "Agents maintain natural-language experience memories, synthesize reflections, and retrieve them to plan believable future actions.",
+      "targets": [{"canonical_id": "2304.03442", "aliases": [], "source_url": "https://arxiv.org/abs/2304.03442"}],
+      "hard_negatives": [{"id": "2305.16291", "reason": "Builds and retrieves executable game skills for lifelong exploration, not a human-behavior simulation memory/reflection/planning architecture.", "source_url": "https://arxiv.org/abs/2305.16291"}],
+      "phrases": [
+        {"id": "memory-reflection-planning", "query": "Generative agent architecture combines memory stream, reflection, and planning for consistent behavior"},
+        {"id": "remember-and-make-plans", "query": "Give simulated characters a record of past events, let them summarize what matters, and use that to decide what to do next"},
+        {"id": "retrieved-experience-ranking", "query": "Retrieve relevant episodic observations by recency, importance, and relevance, then synthesize higher-level reflections"}
+      ]
+    },
+    {
+      "id": "ai-agents-swe-agent-computer-interface",
+      "layer": "ai-agents",
+      "mechanism": "An agent solves software issues through an interface designed around shell and editor actions with structured observations and feedback.",
+      "targets": [{"canonical_id": "2405.15793", "aliases": [], "source_url": "https://arxiv.org/abs/2405.15793"}],
+      "hard_negatives": [{"id": "2210.03629", "reason": "General reasoning/action interaction pattern rather than a repository-focused software engineering computer interface.", "source_url": "https://arxiv.org/abs/2210.03629"}],
+      "phrases": [
+        {"id": "agent-computer-interface", "query": "Software-engineering agent gains capability from an interface that exposes shell and file editing actions effectively"},
+        {"id": "coding-agent-operating-loop", "query": "What interaction design helps an AI inspect a repository, edit code, run commands, and repair a reported bug?"},
+        {"id": "structured-observation-actions", "query": "A coding assistant acts through a purpose-built computer interface with concise observations and controlled tool commands"}
+      ]
+    },
+    {
+      "id": "builder-tech-api-retrieval-selection",
+      "layer": "builder-tech",
+      "mechanism": "A language model selects and generates calls to a large API catalog using retrieval augmented by documentation and API-specific tuning.",
+      "targets": [{"canonical_id": "2305.15334", "aliases": [], "source_url": "https://arxiv.org/abs/2305.15334"}],
+      "hard_negatives": [{"id": "2302.04761", "reason": "Self-supervised discovery of when to invoke tools, rather than API catalog retrieval and documentation-grounded call selection.", "source_url": "https://arxiv.org/abs/2302.04761"}],
+      "phrases": [
+        {"id": "api-doc-retrieval", "query": "Ground LLM-generated API calls in retrieved documentation using an API-focused benchmark and retriever"},
+        {"id": "find-right-software-function", "query": "Help a language model choose the correct function from thousands of changing software services by looking up their docs"},
+        {"id": "catalog-aware-call-generation", "query": "API selection and invocation improves through documentation retrieval, tool descriptions, and targeted adaptation"}
+      ]
+    },
+    {
+      "id": "builder-tech-self-supervised-tool-use",
+      "layer": "builder-tech",
+      "mechanism": "A model learns when and how to call external tools by self-supervising on text where inserted tool results improve its prediction objective.",
+      "targets": [{"canonical_id": "2302.04761", "aliases": [], "source_url": "https://arxiv.org/abs/2302.04761"}],
+      "hard_negatives": [{"id": "2305.15334", "reason": "Retrieval and ranking over API documentation, rather than self-supervised insertion of helpful tool calls into text.", "source_url": "https://arxiv.org/abs/2305.15334"}],
+      "phrases": [
+        {"id": "self-supervised-tool-insertion", "query": "Teach a language model tool use by inserting API calls into text when they reduce perplexity"},
+        {"id": "learn-to-call-when-useful", "query": "Can a model learn for itself when to ask a calculator or search engine, using ordinary text as training material?"},
+        {"id": "tool-augmented-lm-training", "query": "Self-training identifies useful external operations, executes them, and trains the model to predict resulting augmented sequences"}
+      ]
+    },
+    {
+      "id": "builder-tech-large-scale-real-api-benchmark",
+      "layer": "builder-tech",
+      "mechanism": "Tool-use training combines a large real-world API collection, instruction-following data, and an execution environment for testing multi-step calls.",
+      "targets": [{"canonical_id": "2307.16789", "aliases": [], "source_url": "https://arxiv.org/abs/2307.16789"}],
+      "hard_negatives": [{"id": "2305.15334", "reason": "Focuses on retrieval-grounded API selection, not broad instruction tuning and execution evaluation over a large real-world API collection.", "source_url": "https://arxiv.org/abs/2305.15334"}],
+      "phrases": [
+        {"id": "real-api-tool-use-dataset", "query": "Instruction tuning and an execution environment for language models using a 16K real-world API collection"},
+        {"id": "agent-uses-public-endpoints", "query": "Build a benchmark where an assistant discovers and chains public service endpoints to complete everyday requests"},
+        {"id": "multi-step-api-execution", "query": "Train and evaluate tool-using models on real API documentation, generated instructions, and executable multi-call tasks"}
+      ]
+    }
+  ]
+}

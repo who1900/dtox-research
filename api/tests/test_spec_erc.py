@@ -1,4 +1,6 @@
 import os
+import hashlib
+import json
 import pathlib
 import sqlite3
 import sys
@@ -160,6 +162,11 @@ class RefreshScriptTests(unittest.TestCase):
         self.d = self.tmp.name
         for sub in ("fulltext_cache", "chunk_cache", "latex_cache"):
             os.makedirs(os.path.join(self.d, sub))
+        fts = sqlite3.connect(os.path.join(self.d, "no.db"))
+        fts.execute("CREATE VIRTUAL TABLE chunks USING fts5(text, point_id UNINDEXED, arxiv_id UNINDEXED)")
+        fts.execute("INSERT INTO chunks VALUES ('published indexed body','old-point','eip:4337')")
+        fts.commit()
+        fts.close()
         self.conn = make_conn()
         self._add("eip:4337", "EIP-4337", STUB)
         self._add("eip:1559", "Fee market", "---\nstatus: Final\n---\n" + "real " * 200)
@@ -192,7 +199,11 @@ class RefreshScriptTests(unittest.TestCase):
         self.assertEqual([c["arxiv_id"] for c in rme.find_candidates(self.conn, self.d)], ["eip:4337"])
 
     def test_candidate_found_even_after_latex_cache_was_overwritten(self):
-        rme.write_cache(self.d, "eip:4337", ERC)  # erc@all harvest got there first
+        source_path = os.path.join(self.d, "latex_cache", "eip_4337", "source.tex")
+        os.makedirs(os.path.dirname(source_path), exist_ok=True)
+        with open(source_path,
+                  "w", encoding="utf-8") as f:
+            f.write(ERC)  # erc@all harvest got there first
         self.assertEqual([c["arxiv_id"] for c in rme.find_candidates(self.conn, self.d)], ["eip:4337"])
 
     def test_usable_rules(self):
@@ -210,23 +221,47 @@ class RefreshScriptTests(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.d, "fulltext_cache", "eip_4337.tex")))
         self.assertFalse(os.path.exists(os.path.join(self.d, "p.jsonl")))
 
-    def test_apply_resets_only_the_stub(self):
+    def test_apply_stages_exact_erc_and_preserves_published_state(self):
         s = self._session()
+        row_before = tuple(self.conn.execute("SELECT * FROM papers WHERE arxiv_id='eip:4337'").fetchone())
+        totals_before = tuple(self.conn.execute("SELECT * FROM completion_totals").fetchone())
+        history_before = [tuple(row) for row in self.conn.execute(
+            "SELECT * FROM completion_history ORDER BY arxiv_id").fetchall()]
+        fulltext_before = read_file(os.path.join(self.d, "fulltext_cache", "eip_4337.tex"))
+        chunk_before = read_file(os.path.join(self.d, "chunk_cache", "eip_4337.json"))
+        fts = sqlite3.connect(os.path.join(self.d, "no.db"))
+        fts_before = fts.execute("SELECT text,point_id,arxiv_id FROM chunks ORDER BY rowid").fetchall()
+        fts.close()
         self.assertEqual(rme.run(self.conn, s, self._args(True), log=lambda *a: None), 1)
-        row = self.conn.execute("SELECT title, year, status, extractor_version, fulltext_source "
-                                "FROM papers WHERE arxiv_id='eip:4337'").fetchone()
-        self.assertEqual(row["status"], "quality_checked")
-        self.assertEqual(row["title"], "Account Abstraction Using Alt Mempool")
-        self.assertEqual(row["year"], 2021)
-        self.assertIsNone(row["fulltext_source"])
-        self.assertEqual(self.conn.execute("SELECT status FROM papers WHERE arxiv_id='eip:1559'").fetchone()[0], "done")
-        self.assertFalse(os.path.exists(os.path.join(self.d, "fulltext_cache", "eip_4337.tex")))
-        self.assertFalse(os.path.exists(os.path.join(self.d, "chunk_cache", "eip_4337.json")))
-        self.assertTrue(os.path.exists(os.path.join(self.d, "fulltext_cache", "eip_1559.tex")))
-        self.assertEqual(read_file(os.path.join(self.d, "latex_cache", "eip_4337", "source.tex")), ERC)
-        self.assertTrue(s.post.call_args[0][0].endswith("/points/delete"))
-        self.assertEqual(s.post.call_args[1]["params"], {"wait": "true"})
-        self.assertEqual(rme.run(self.conn, self._session(), self._args(True), log=lambda *a: None), 0)
+        self.assertEqual(tuple(self.conn.execute(
+            "SELECT * FROM papers WHERE arxiv_id='eip:4337'").fetchone()), row_before)
+        self.assertEqual(tuple(self.conn.execute("SELECT * FROM completion_totals").fetchone()), totals_before)
+        self.assertEqual([tuple(row) for row in self.conn.execute(
+            "SELECT * FROM completion_history ORDER BY arxiv_id").fetchall()], history_before)
+        self.assertEqual(read_file(os.path.join(self.d, "fulltext_cache", "eip_4337.tex")), fulltext_before)
+        self.assertEqual(read_file(os.path.join(self.d, "chunk_cache", "eip_4337.json")), chunk_before)
+        self.assertEqual(read_file(os.path.join(self.d, "fulltext_cache", "eip_1559.tex")),
+                         "---\nstatus: Final\n---\n" + "real " * 200)
+        fts = sqlite3.connect(os.path.join(self.d, "no.db"))
+        self.assertEqual(fts.execute("SELECT text,point_id,arxiv_id FROM chunks ORDER BY rowid").fetchall(),
+                         fts_before)
+        fts.close()
+        artifact = self.conn.execute(
+            "SELECT revision,artifact_path,cache_sha256,state FROM paper_publications "
+            "WHERE arxiv_id='eip:4337'").fetchone()
+        metadata = {**rme.erc_fields(ERC), "source": "erc@all"}
+        source_bytes = ERC.encode("utf-8")
+        revision = hashlib.sha256(
+            source_bytes + b"\0" + json.dumps(metadata, sort_keys=True, separators=(",", ":"),
+                                                 ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+        self.assertEqual((artifact[0], artifact[2], artifact[3]),
+                         (revision, hashlib.sha256(source_bytes).hexdigest(), "staged"))
+        with open(artifact[1], encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"source": ERC, "metadata": metadata})
+        s.post.assert_not_called()
+        finished, pending = rme.load_state(os.path.join(self.d, "p.jsonl"))
+        self.assertEqual(finished, set())
+        self.assertEqual(pending, {"eip:4337"})
 
     def test_unfetchable_erc_is_left_alone(self):
         s = self._session("", 404)

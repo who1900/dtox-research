@@ -79,7 +79,7 @@ def _head(title):
 class TitleIndex:
     """Normalised title phrases -> document ids, built once from the corpus."""
 
-    def __init__(self, rows):
+    def __init__(self, rows, *, checkpoint=None):
         # rows: (id, title, citation_count)
         self.heads = {}
         self.fulls = {}
@@ -87,7 +87,11 @@ class TitleIndex:
         self.cites = {}
         self.df = Counter()
         prepared = []
-        for doc_id, title, cites in rows:
+        if checkpoint is not None:
+            checkpoint()
+        for row_number, (doc_id, title, cites) in enumerate(rows):
+            if checkpoint is not None and row_number and row_number % 128 == 0:
+                checkpoint()
             if not title:
                 continue
             toks = tokens(title)
@@ -96,7 +100,11 @@ class TitleIndex:
             self.df.update(set(toks))
             self.cites[doc_id] = cites or 0
             prepared.append((doc_id, title, toks))
-        for doc_id, title, toks in prepared:
+        if checkpoint is not None:
+            checkpoint()
+        for row_number, (doc_id, title, toks) in enumerate(prepared):
+            if checkpoint is not None and row_number and row_number % 128 == 0:
+                checkpoint()
             if doc_id.startswith("wp:"):
                 self._add_wp(doc_id, title, toks)
                 continue
@@ -126,7 +134,7 @@ class TitleIndex:
         # a copy with real text and its own record before an OpenAlex stub
         return sorted(ids, key=lambda d: (d.startswith("oa:"), -self.cites.get(d, 0)))
 
-    def _head_ok(self, key, ids, originals, content_count):
+    def _head_ok(self, key, ids, originals):
         """Is this title head a name, or just words that happen to open a title?"""
         if len(ids) > MAX_HEAD_DOCS:
             return False
@@ -142,9 +150,9 @@ class TitleIndex:
         if min(self.df.get(t, 0) for t in key) <= MAX_RARE_TOKEN_DF:
             return True
         # a phrase made of common words ("Generative Agents") is a name only when
-        # the query writes it as one: capitalised, prominent, and most of the query
+        # the query writes the exact contiguous phrase with its title capitalization
         capitalised = all(w[:1].isupper() or w.lower() in _FTS_SMALL for w in originals)
-        return capitalised and best >= MIN_PHRASE_CITES and len(key) / max(1, content_count) >= 0.5
+        return capitalised and best >= MIN_PHRASE_CITES
 
     def match(self, query, limit=2):
         """[(doc_id, "title match")] for titles or names the query contains."""
@@ -152,7 +160,6 @@ class TitleIndex:
         qt = [w.lower() for w in original]
         if not qt:
             return []
-        content_count = sum(1 for w in qt if w not in _FTS_SMALL and len(w) > 2) or 1
         hits = []  # (span length, doc_id)
         seen = set()
 
@@ -169,7 +176,7 @@ class TitleIndex:
                     take(self.fulls[key], n)
                 if key in self.heads and n <= MAX_HEAD_TOKENS:
                     ids = self.heads[key]
-                    if self._head_ok(key, ids, original[i:i + n], content_count):
+                    if self._head_ok(key, ids, original[i:i + n]):
                         take(ids, n)
         if _WHITEPAPER.search(query or ""):
             for n in range(min(len(qt), 6), 0, -1):

@@ -1,0 +1,161 @@
+{
+  "dataset": "paraphrase-release-20261004-v2",
+  "preregistration": {
+    "status": "frozen_before_live",
+    "query_count": 24,
+    "queries_per_claim": 3,
+    "retrieval_limit": 10,
+    "strict": false,
+    "index_coverage": "unknown_until_read_only_source_lookup",
+    "freeze_policy": "queries_and_anchors_fixed_after_freeze; corrections_after_first_live_query_require_new_dated_fixture"
+  },
+  "scope_notes": [
+    "Frozen v2 before any live query: eight mechanism claims, each with three distinct English formulations authored for this fixture; no paper names or IDs appear in query text.",
+    "Two explicit web3 cohorts cover DAG-based BFT ordering and data availability sampling. These are separate mechanisms, not an assertion that all DAG consensus and data-availability designs are equivalent.",
+    "This is an agent-authored holdout with known-source anchors, not independent expert-labelled data. No blind human relevance judgments are available.",
+    "Targets and comparators were selected from original arXiv records and checked against their primary arXiv pages before any run of this fixture. They are not copied from the existing fresh paraphrase fixture or dev query wording.",
+    "Each claim accepts multiple valid source anchors. A hit of any accepted anchor is a known-source retrieval hit, not precision, exhaustive recall, or proof that other returned work is irrelevant.",
+    "Hard negatives contrast the focal mechanism. A negative ranking above an accepted target is a review flag, not an automatic relevance or scientific-error judgment.",
+    "Corpus/index presence is unverified for every target and negative. Resolve source identity and index coverage read-only before interpreting an absent ID as retrieval loss; retain unknown/unindexed outcomes in the report.",
+    "Layer is the corpus retrieval layer: language-model methods use llm-slm; smart-contract developer/security tooling uses builder-tech. Do not map a builder-facing query to llm-slm merely because it mentions an LLM or is used by a builder.",
+    "No live retrieval, human blinded relevance judgment, paid judging, or source-write operation is part of this preregistration. Independent human relevance has not been established."
+  ],
+  "groups": [
+    {
+      "id": "release-state-space-long-sequences",
+      "layer": "llm-slm",
+      "mechanism": "Structured state-space sequence models that represent long-range dependencies with efficient sequence-length scaling.",
+      "targets": [
+        {"canonical_id": "2312.00752", "aliases": [], "source_url": "https://arxiv.org/abs/2312.00752"},
+        {"canonical_id": "2111.00396", "aliases": [], "source_url": "https://arxiv.org/abs/2111.00396"}
+      ],
+      "hard_negatives": [
+        {"id": "2302.10866", "reason": "Long implicit convolutions with data-controlled gating are a different sequence-mixing mechanism from structured state-space models.", "source_url": "https://arxiv.org/abs/2302.10866"}
+      ],
+      "phrases": [
+        {"id": "structured-dynamics", "query": "Sequence models use a structured dynamical system and a computationally efficient parameterization to preserve long-range dependencies."},
+        {"id": "long-context-question", "query": "Which family models very long token streams with state evolution rather than a full pairwise attention matrix?"},
+        {"id": "sequence-throughput", "query": "Find work on recurrent state-space sequence layers whose cost grows roughly linearly with the number of input positions."}
+      ]
+    },
+    {
+      "id": "release-relative-attention-position-signals",
+      "layer": "llm-slm",
+      "mechanism": "Relative positional information is incorporated into transformer self-attention through position-dependent query/key transformations or attention-score biases.",
+      "targets": [
+        {"canonical_id": "2104.09864", "aliases": [], "source_url": "https://arxiv.org/abs/2104.09864"},
+        {"canonical_id": "2108.12409", "aliases": [], "source_url": "https://arxiv.org/abs/2108.12409"}
+      ],
+      "hard_negatives": [
+        {"id": "1810.04805", "reason": "BERT uses learned absolute position embeddings; this is a different positional signal from relative attention rotation or distance bias.", "source_url": "https://arxiv.org/abs/1810.04805"}
+      ],
+      "phrases": [
+        {"id": "position-in-attention", "query": "Transformer attention can encode token separation by changing query-key interactions instead of adding a learned absolute vector to every token."},
+        {"id": "length-extrapolation-question", "query": "What positional strategy lets self-attention retain distance information when inference sequences exceed training length?"},
+        {"id": "relative-distance-signal", "query": "Locate methods that represent relative token offsets inside attention, including rotations or a distance-scaled score term."}
+      ]
+    },
+    {
+      "id": "release-dag-bft-ordering-and-dissemination",
+      "layer": "web3",
+      "mechanism": "A Byzantine consensus design separates reliable transaction dissemination through a causal DAG from ordering, then derives a total order from DAG structure.",
+      "targets": [
+        {"canonical_id": "2105.11827", "aliases": [], "title": "Narwhal and Tusk: A DAG-based Mempool and Efficient BFT Consensus", "year": 2021, "source_url": "https://arxiv.org/abs/2105.11827"},
+        {"canonical_id": "2201.05677", "aliases": [], "title": "Bullshark: DAG BFT Protocols Made Practical", "year": 2022, "source_url": "https://arxiv.org/abs/2201.05677"}
+      ],
+      "hard_negatives": [
+        {"id": "1809.09044", "reason": "Probabilistic data-availability sampling and fraud proofs address data recoverability and validity, not DAG transaction ordering or BFT consensus.", "source_url": "https://arxiv.org/abs/1809.09044"}
+      ],
+      "phrases": [
+        {"id": "dag-dissemination-separation", "query": "A BFT ledger keeps payload dissemination in a causal graph and decouples that work from deciding transaction order."},
+        {"id": "dag-ordering-question", "query": "How can validators agree on a total transaction order by reading dependencies already present in a directed acyclic graph?"},
+        {"id": "asynchronous-consensus", "query": "Find consensus protocols that combine a high-throughput reliable mempool DAG with low-overhead Byzantine ordering."}
+      ]
+    },
+    {
+      "id": "release-blockchain-data-availability-sampling",
+      "layer": "web3",
+      "mechanism": "Light clients use probabilistic data-availability sampling, often with erasure-coded block data and fraud proofs, to detect withholding without downloading the full block.",
+      "targets": [
+        {"canonical_id": "1905.09274", "aliases": [], "title": "LazyLedger: A Distributed Data Availability Ledger With Client-Side Smart Contracts", "year": 2019, "source_url": "https://arxiv.org/abs/1905.09274"},
+        {"canonical_id": "1809.09044", "aliases": [], "title": "Fraud and Data Availability Proofs: Maximising Light Client Security and Scaling Blockchains with Dishonest Majorities", "year": 2018, "source_url": "https://arxiv.org/abs/1809.09044"}
+      ],
+      "hard_negatives": [
+        {"id": "2105.11827", "reason": "DAG-based BFT dissemination and ordering concern consensus structure, not probabilistic sampling to verify block-data availability.", "source_url": "https://arxiv.org/abs/2105.11827"}
+      ],
+      "phrases": [
+        {"id": "sample-without-full-block", "query": "A light node samples pieces of an erasure-coded block to check that transaction data remains retrievable without fetching everything."},
+        {"id": "withholding-detection-question", "query": "How can a blockchain client detect a producer hiding block contents while downloading only a small random subset?"},
+        {"id": "availability-and-fraud", "query": "Find scaling designs that pair probabilistic data-availability checks with fraud proofs so light clients need not validate or store whole blocks."}
+      ]
+    },
+    {
+      "id": "release-token-level-late-interaction-retrieval",
+      "layer": "llm-slm",
+      "mechanism": "Neural passage retrieval independently encodes query and document tokens, then aggregates fine-grained token-level similarity at scoring time.",
+      "targets": [
+        {"canonical_id": "2004.12832", "aliases": [], "source_url": "https://arxiv.org/abs/2004.12832"},
+        {"canonical_id": "2112.01488", "aliases": [], "source_url": "https://arxiv.org/abs/2112.01488"}
+      ],
+      "hard_negatives": [
+        {"id": "2004.04906", "reason": "Dense Passage Retrieval compares pooled single-vector query and passage representations rather than retaining token-level late interaction.", "source_url": "https://arxiv.org/abs/2004.04906"}
+      ],
+      "phrases": [
+        {"id": "multi-vector-passage-score", "query": "Passage ranking stores contextual token vectors and scores a query through a late fine-grained matching step."},
+        {"id": "retrieval-index-question", "query": "How can a neural search index precompute document representations yet keep token-by-token relevance signals for ranking?"},
+        {"id": "late-matching", "query": "Find a retriever that separately encodes query and document text and aggregates each query token's strongest document-token match."}
+      ]
+    },
+    {
+      "id": "release-long-convolution-sequence-mixers",
+      "layer": "llm-slm",
+      "mechanism": "Long-sequence models replace dense attention with implicit long convolutions and input-controlled gating to obtain subquadratic sequence processing.",
+      "targets": [
+        {"canonical_id": "2302.10866", "aliases": [], "source_url": "https://arxiv.org/abs/2302.10866"},
+        {"canonical_id": "2306.15794", "aliases": [], "source_url": "https://arxiv.org/abs/2306.15794"}
+      ],
+      "hard_negatives": [
+        {"id": "2312.00752", "reason": "Selective state-space recurrence is a different sequence mixer from implicit long convolution with data-controlled gating.", "source_url": "https://arxiv.org/abs/2312.00752"}
+      ],
+      "phrases": [
+        {"id": "implicit-convolution-gating", "query": "A sequence mixer combines long implicit filters with gates conditioned on the current input instead of dense self-attention."},
+        {"id": "genome-context-question", "query": "Which convolution-based architecture can expose global context across very long nucleotide sequences without quadratic attention?"},
+        {"id": "subquadratic-mixer", "query": "Locate long-context neural sequence models built from implicit convolutions and multiplicative data-dependent gating."}
+      ]
+    },
+    {
+      "id": "release-state-aware-contract-call-sequence-analysis",
+      "layer": "builder-tech",
+      "mechanism": "Smart-contract testing searches multi-call transaction sequences using function data dependencies or symbolic constraints to expose depth-n vulnerabilities.",
+      "targets": [
+        {"canonical_id": "2301.03943", "aliases": [], "source_url": "https://arxiv.org/abs/2301.03943"},
+        {"canonical_id": "1911.00570", "aliases": [], "source_url": "https://arxiv.org/abs/1911.00570"}
+      ],
+      "hard_negatives": [
+        {"id": "1807.03932", "reason": "ABI-driven runtime fuzzing with behavioral oracles is the comparator; it does not focus on dependency-guided depth-n call-sequence exploration.", "source_url": "https://arxiv.org/abs/1807.03932"}
+      ],
+      "phrases": [
+        {"id": "dependent-call-sequences", "query": "Smart-contract analysis prunes inter-transaction call sequences using dependencies so bugs that require several state changes become reachable."},
+        {"id": "depth-n-question", "query": "How do testing tools find a contract flaw that only appears after a particular chain of function calls?"},
+        {"id": "symbolic-state-exploration", "query": "Find developer tooling that combines execution constraints with call-order or data-flow guidance for multi-transaction contract testing."}
+      ]
+    },
+    {
+      "id": "release-abi-driven-runtime-contract-fuzzing",
+      "layer": "builder-tech",
+      "mechanism": "Smart-contract fuzzers generate calls from an ABI, execute them in a blockchain VM, and apply runtime-behavior oracles to flag vulnerability patterns.",
+      "targets": [
+        {"canonical_id": "1807.03932", "aliases": [], "source_url": "https://arxiv.org/abs/1807.03932"},
+        {"canonical_id": "2007.14903", "aliases": [], "source_url": "https://arxiv.org/abs/2007.14903"}
+      ],
+      "hard_negatives": [
+        {"id": "2301.03943", "reason": "Dependency- and branch-guided stateful call-sequence exploration is a distinct focal strategy from ABI-generated calls checked with runtime oracles.", "source_url": "https://arxiv.org/abs/2301.03943"}
+      ],
+      "phrases": [
+        {"id": "abi-runtime-oracles", "query": "Generate blockchain contract invocations from interface metadata, run them in a virtual machine, and inspect execution traces with bug oracles."},
+        {"id": "black-box-fuzzing-question", "query": "What testing approach automatically exercises deployed-contract interfaces and detects vulnerability patterns from runtime behavior?"},
+        {"id": "cross-chain-fuzzer", "query": "Find smart-contract fuzzing systems that derive inputs from callable methods and check VM outcomes against security rules."}
+      ]
+    }
+  ]
+}

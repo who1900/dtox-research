@@ -1,0 +1,131 @@
+{
+  "dataset": "heldout-recall-20261003",
+  "status": "final live results recorded; reviewed against supplied final cut data",
+  "run_params": {
+    "final_main_hash": "b89696b05a4da0b574c1afc1b907e976fb4b035a643760807c14c3a41fcdcf88",
+    "final_exact_hash": "d43cfac8c0c771df1378fc96f0f2572b3ff8b1cae29b79416798c2867056a353",
+    "limit": 10,
+    "concurrency": 2,
+    "live_corpus_immutable_snapshot": false
+  },
+  "cases": [
+    {
+      "id": "hold-grpo",
+      "query": "Which paper introduced group-relative policy optimization for improving mathematical reasoning without a critic?",
+      "layer": "llm-slm",
+      "targets": ["2402.03300"],
+      "before": {"rank": 1, "hit_at_3": true, "hit_at_10": true}
+    },
+    {
+      "id": "hold-rl",
+      "query": "What work showed language models can learn reasoning through RL without first being fine-tuned on demonstrations?",
+      "layer": "llm-slm",
+      "targets": ["2501.12948"],
+      "before": {"rank": null, "hit_at_3": false, "hit_at_10": false}
+    },
+    {
+      "id": "hold-speculative",
+      "query": "How can a small proposal model speed up decoding when a larger model checks proposed tokens together?",
+      "layer": "llm-slm",
+      "targets": ["2211.17192"],
+      "before": {"rank": null, "hit_at_3": false, "hit_at_10": false}
+    },
+    {
+      "id": "hold-attention",
+      "query": "Which method introduced exact attention computation organized around tiled, IO-aware GPU kernels?",
+      "layer": "llm-slm",
+      "targets": ["2205.14135"],
+      "before": {"rank": 1, "hit_at_3": true, "hit_at_10": true}
+    },
+    {
+      "id": "hold-lora",
+      "query": "What is the original work on adapting a pretrained model with low-rank trainable matrices instead of updating all weights?",
+      "layer": "llm-slm",
+      "targets": ["2106.09685"],
+      "before": {"rank": 3, "hit_at_3": true, "hit_at_10": true}
+    },
+    {
+      "id": "hold-qlora",
+      "query": "Find the paper on fine-tuning a language model with four-bit quantization while training low-rank adapters.",
+      "layer": "llm-slm",
+      "targets": ["2305.14314"],
+      "before": {"rank": 3, "hit_at_3": true, "hit_at_10": true}
+    },
+    {
+      "id": "hold-self-consistency",
+      "query": "Which study uses multiple sampled reasoning chains and majority voting to improve answer accuracy?",
+      "layer": "llm-slm",
+      "targets": ["2203.11171"],
+      "before": {"rank": null, "hit_at_3": false, "hit_at_10": false}
+    },
+    {
+      "id": "hold-vdf",
+      "query": "a verifiable function that is slow to compute but fast to check",
+      "layer": "web3",
+      "strict": true,
+      "targets": ["iacr:2018/601"],
+      "before": {"rank": null, "hit_at_3": false, "hit_at_10": false}
+    }
+  ],
+  "before_summary": {
+    "cases": 8,
+    "hit_at_10": "4/8",
+    "hit_at_3": "4/8",
+    "errors": 0,
+    "partial": 0
+  },
+  "after_summary": {
+    "cases": 8,
+    "hit_at_10": "4/8",
+    "hit_at_3": "4/8",
+    "mrr_at_10": 0.33333333333333337,
+    "errors": 0,
+    "partial": 0
+  },
+  "discovery_cases": {
+    "status": "exact queries and final live results recorded",
+    "expected_count": 10,
+    "cases": [
+      {"id":"web3-erc20","query":"standard interface for fungible tokens with transfer, approve and allowance","layer":"web3","targets":["eip:20"],"before":{"rank":1,"hit_at_3":true,"hit_at_10":true,"error":null,"partial":false}},
+      {"id":"web3-account-abstraction","query":"account abstraction using user operations, a separate mempool, bundlers and an entry point contract","layer":"web3","targets":["eip:4337"],"before":{"rank":1,"hit_at_3":true,"hit_at_10":true,"error":null,"partial":false}},
+      {"id":"web3-eip7702","query":"let an externally owned account temporarily set contract code by signing an authorization","layer":"web3","targets":["eip:7702"],"before":{"rank":null,"hit_at_3":false,"hit_at_10":false,"error":null,"partial":false},"condition_note":"Search condition was temporary; corresponding spec condition was permanent. Do not force an ID or treat conditions as equivalent."},
+      {"id":"web3-oracle","query":"on-chain oracle validating external real-world event data","layer":"web3","targets":["wp:chainlink-v2"],"before":{"rank":null,"hit_at_3":false,"hit_at_10":false,"error":null,"partial":false}},
+      {"id":"web3-hotstuff","query":"HotStuff BFT consensus linear communication","layer":"web3","targets":["1803.05069"],"before":{"rank":3,"hit_at_3":true,"hit_at_10":true,"error":null,"partial":false,"returned_twin":"oa:W2964159515","canonical_twin_confirmed":true}},
+      {"id":"web3-nonce","query":"durable nonce solana","layer":"web3","targets":["gh:solana-docs:c60d34c3e8b98039","gh:anza-docs:cac3b70fc109ecd0"],"before":{"ranks":[1,2],"hit_at_3":true,"hit_at_10":true,"error":null,"partial":false}},
+      {"id":"agents-reflexion","query":"Reflexion verbal reinforcement learning","layer":"ai-agents","targets":["2303.11366"],"before":{"rank":1,"hit_at_3":true,"hit_at_10":true,"error":null,"partial":false}},
+      {"id":"agents-memory","query":"Generative Agents memory stream reflection planning","layer":"ai-agents","targets":["2304.03442"],"before":{"rank":null,"hit_at_3":false,"hit_at_10":false,"error":null,"partial":false}},
+      {"id":"llm-entropy","query":"attention variance information entropy per-layer KV cache budget allocation","layer":"llm-slm","targets":["2406.13035","2502.17599","2503.12491"],"before":{"target_ranks":{"2406.13035":null,"2502.17599":7,"2503.12491":null},"hit_at_3":false,"hit_at_10":true,"error":null,"partial":false,"returned_twin":"acl:2025.naacl-long.125","canonical_twin_confirmed":true}},
+      {"id":"builder-slither","query":"Slither static analysis framework smart contracts","layer":"builder-tech","targets":["1908.09878"],"before":{"rank":3,"hit_at_3":true,"hit_at_10":true,"error":null,"partial":false}}
+    ]
+  },
+  "final_after": [
+    {"id":"web3-erc20","rank":2,"returned_ids":["eip:1155","eip:20","eip:721","eip:6454","eip:5700","oa:W7134291294","eip:7743","eip:1363","eip:2309","gh:slither:327a9e9e4adf3204"],"ms":6803,"error":null,"partial":false},
+    {"id":"web3-account-abstraction","rank":1,"returned_ids":["eip:4337","gh:openzeppelin-docs:c16c88338b1c1f53","eip:5189","gh:starknet-docs:0a998358f9004c6a","eip:7769","2605.05774","2511.16890","2507.03694"],"ms":10209,"error":null,"partial":false},
+    {"id":"web3-eip7702","rank":null,"returned_ids":["eip:6981","eip:7598","gh:openzeppelin-docs:ae3ae81fc10dfc14","2512.12174","gh:solana-docs:ab439f359d9f9740","eip:1271"],"ms":4218,"error":null,"partial":false},
+    {"id":"web3-oracle","rank":6,"returned_ids":["wp:chainlink-v1","oa:W7207755418","simd:0204","2601.22302","iacr:2025/2106","wp:chainlink-v2","2604.20421","2504.04794","2410.07893","2609.01931"],"ms":8209,"error":null,"partial":false},
+    {"id":"web3-hotstuff","rank":3,"returned_ids":["2010.11454","2605.08132","oa:W2964159515","2408.04728","2411.07622","2105.11827","iacr:2022/551","iacr:2019/270","2503.15380","iacr:2025/845"],"ms":3582,"error":null,"partial":false,"returned_twin":"oa:W2964159515","canonical_twin_confirmed":true},
+    {"id":"web3-nonce","rank":1,"target_ranks":[1,2],"returned_ids":["gh:solana-docs:c60d34c3e8b98039","gh:anza-docs:cac3b70fc109ecd0","simd:0297","gh:solana-docs:122a8c29499d39a9","gh:anza-docs:23287fd2a43ede63","gh:solana-docs:2161474e252aa592","oa:W7167856008"],"ms":6642,"error":null,"partial":false},
+    {"id":"agents-reflexion","rank":1,"returned_ids":["2303.11366","2604.21611","2509.03990","2609.12404","2506.06303","acl:2026.acl-industry.82","2510.10304","2605.29463","acl:2025.emnlp-main.155","acl:2025.acl-long.865"],"ms":4330,"error":null,"partial":false},
+    {"id":"agents-memory","rank":3,"returned_ids":["2607.13591","2402.03610","2304.03442","2303.11366","2511.20857","acl:2025.emnlp-main.659","2509.12810","2402.02716","2604.04503","2508.11120"],"ms":9298,"error":null,"partial":false},
+    {"id":"llm-entropy","rank":7,"returned_ids":["2509.09754","2603.27819","2404.14469","2501.15113","2407.11550","2606.09508","acl:2025.naacl-long.125","2607.29591","2608.08684","2502.17501"],"ms":4064,"error":null,"partial":false,"returned_twin":"acl:2025.naacl-long.125","canonical_twin_confirmed":true},
+    {"id":"builder-slither","rank":3,"returned_ids":["gh:slither:5abadde31c60999e","2410.23766","1908.09878","gh:slither:0f650a7c5578689a","gh:slither:1f307b77b676650d","1911.00570","2504.15948","gh:slither:d41d7ef4bff822de","gh:slither:6d360c47aedae0d9","2007.04771"],"ms":8773,"error":null,"partial":false},
+    {"id":"hold-grpo","rank":1,"returned_ids":["2402.03300","2604.20659","2505.07527","2509.18851","2602.09000","2512.06337","2605.21125","acl:2026.acl-long.1132","acl:2026.acl-short.11","2505.12366"],"ms":5460,"error":null,"partial":false},
+    {"id":"hold-rl","rank":null,"returned_ids":["2509.01363","2505.22334","2511.17852","2504.11468","2503.04548","2508.04848","2510.01857","2602.09305","2506.17211","2507.14683"],"ms":13120,"error":null,"partial":false},
+    {"id":"hold-speculative","rank":null,"returned_ids":["2502.01662","2510.19705","2505.12728","2304.04487","2407.09722","2504.20456","2402.08644","2308.04623","2602.01274","acl:2024.lrec-main.725"],"ms":4996,"error":null,"partial":false},
+    {"id":"hold-attention","rank":1,"returned_ids":["2205.14135","2401.04658","2606.26439","2605.29517","2606.20005","2503.14376","2410.20399","2604.18616","2407.08608","2408.04093"],"ms":8975,"error":null,"partial":false},
+    {"id":"hold-lora","rank":3,"returned_ids":["2405.16528","2406.09044","2106.09685","2505.21289","acl:2025.coling-main.592","2505.23808","acl:2024.lrec-main.141","2504.18735","2106.04647","2609.25058"],"ms":4412,"error":null,"partial":false},
+    {"id":"hold-qlora","rank":3,"returned_ids":["acl:2025.tacl-1.40","2405.16528","2305.14314","acl:2024.emnlp-industry.53","2306.08162","2309.14717","2509.17428","acl:2024.findings-acl.933","2402.04902","2505.06653"],"ms":9337,"error":null,"partial":false},
+    {"id":"hold-vdf","rank":null,"returned_ids":["iacr:2025/1782","iacr:2021/1038","simd:0376","iacr:2023/1197","iacr:2018/639","oa:W4402380465","iacr:2025/2041","iacr:2026/737","iacr:2019/659","iacr:2019/619"],"ms":5299,"error":null,"partial":false},
+    {"id":"hold-self-consistency","rank":null,"returned_ids":["2605.07654","acl:2025.findings-acl.744","2605.14098","2606.15419","2605.25244","2605.28142","2302.00618","2506.08379","2606.24937","2510.10072"],"ms":10218,"error":null,"partial":false}
+  ],
+  "final_summary": {
+    "discovery": {"cases":10,"hit_at_3":"7/10","hit_at_10":"9/10","mrr_at_10":0.4809523809523809,"errors":0,"partial":0},
+    "held": {"cases":8,"hit_at_3":"4/8","hit_at_10":"4/8","mrr_at_10":0.33333333333333337,"errors":0,"partial":0},
+    "combined": {"cases":18,"hit_at_3":"11/18","hit_at_10":"13/18","mrr_at_10":0.4153439153439153,"errors":0,"partial":0}
+  },
+  "scoring_notes": [
+    "A hit is retrieval of an expected target paper; rank and filter compliance are recorded separately.",
+    "Canonical twins count only when the paper identity is confirmed: HotStuff OA:W2964159515 to arXiv 1803.05069, and MEDA ACL alias acl:2025.naacl-long.125 to its confirmed arXiv twin.",
+    "Do not interpret retrieval hits as scientific-claim validation or precision."
+  ]
+}

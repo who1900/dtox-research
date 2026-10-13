@@ -39,14 +39,30 @@ class EvidenceIntegrityTests(unittest.TestCase):
         self.assertEqual(a["completeness"], "metadata_missing")
         self.assertIsNone(a["fulltext"])
 
-    def test_github_legacy_latex_acquisition_is_markdown(self):
+    def test_parser_metadata_classifies_without_fragment_inspection(self):
         metadata = {"fulltext_source": "latex"}
-        gh = provenance("gh:project:readme", {"text": "# Method"}, metadata)
-        tex = provenance("2401.00001", {"text": "x=1"}, metadata)
+        gh = provenance("record:markdown", {"text": "x=1"},
+                        {**metadata, "parser_mode": "markdown"})
+        tex = provenance("record:latex", {"text": "A paragraph with no TeX commands."},
+                         {**metadata, "parser_mode": "pylatexenc"})
+        self.assertEqual(gh["acquisition_type"], "spec-markdown")
+        self.assertEqual(gh["stored_acquisition_type"], "latex")
         self.assertEqual(gh["extraction_type"], "markdown_source")
         self.assertFalse(gh["exact_latex"])
         self.assertTrue(tex["exact_latex"])
         self.assertEqual(tex["extraction_type"], "latex_source")
+
+    def test_legacy_confirmed_latex_prose_keeps_exact_latex(self):
+        evidence = provenance("legacy:paper", {"text": "A plain paragraph."},
+                              {"fulltext_source": "latex"})
+        self.assertEqual(evidence["acquisition_type"], "latex")
+        self.assertEqual(evidence["extraction_type"], "latex_source")
+        self.assertTrue(evidence["exact_latex"])
+
+    def test_unknown_acquisition_stays_unknown(self):
+        evidence = provenance("legacy:paper", {"text": "# Markdown"}, {})
+        self.assertEqual(evidence["extraction_type"], "unknown")
+        self.assertIsNone(evidence["fulltext"])
 
     def test_pmlr_hal_actual_acquisition_and_pdf_parse_unknown(self):
         for pid in ("pmlr:v1/paper", "hal:123"):
@@ -76,8 +92,9 @@ class EvidenceIntegrityTests(unittest.TestCase):
     def test_paper_rows_batched_and_old_tuple_compatible(self):
         conn = Mock()
         conn.execute.return_value.fetchall.return_value = [
-            ("1", "t", 2024, None, 2, 0, "web3", "a", "abstract-fallback", "https://example.test"),
-            ("2", "t2", 2025, None, 0, 0, "llm-slm", "a2")]
+            ("1", "t", 2024, None, 2, 0, "web3", "a", "abstract-fallback",
+             "https://example.test", "done"),
+            ("2", "t2", 2025, None, 0, 0, "llm-slm", "a2", None, None, "done")]
         with patch.object(main, "_ro_conn", return_value=conn):
             rows = main._paper_rows(["1", "2", "1"])
         conn.execute.assert_called_once()

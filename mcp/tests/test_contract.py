@@ -93,6 +93,28 @@ class MCPContractTests(unittest.TestCase):
             "http://internal.invalid/v1/search", headers={"Content-Type": "application/json"},
             json={"query": "consensus", "limit": 8, "compact": True, "strict": False}, timeout=15)
 
+    def test_search_forwards_root_source_candidates_without_changing_results_or_count(self):
+        candidates = [
+            {"id": "paper:fused", "candidate_only": True, "candidate_channel": "fused"},
+            {"id": "paper:graph", "candidate_only": True,
+             "candidate_channel": "citation_graph"},
+        ]
+        payload = {"results": [{"id": "paper:result"}], "count": 1,
+                   "source_candidates": candidates}
+        self.response.json.return_value = payload
+
+        result = self.call("search_research_paper", query="consensus")
+
+        self.assertEqual(result, payload)
+        self.assertEqual(result["source_candidates"], candidates)
+        self.assertEqual([item["candidate_channel"] for item in result["source_candidates"]],
+                         ["fused", "citation_graph"])
+        self.assertEqual(result["results"], [{"id": "paper:result"}])
+        self.assertEqual(result["count"], 1)
+        self.requests.post.assert_called_once_with(
+            "http://internal.invalid/v1/search", headers={"Content-Type": "application/json"},
+            json={"query": "consensus", "limit": 8, "compact": True, "strict": False}, timeout=15)
+
     def test_strict_search_forwards_filters_and_disables_auto_relax(self):
         self.call("search_research_paper", query="consensus", layer="web3", strict=True,
                   terms=["consensus"], section_type="method", element_type="algorithm",

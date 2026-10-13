@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import pathlib
 import sqlite3
@@ -66,11 +67,19 @@ class Env(unittest.TestCase):
                   "status TEXT, abstract TEXT, niche_score REAL, matched_terms TEXT, source_url TEXT, "
                   "fulltext_source TEXT, extractor_version INTEGER, twin_of TEXT, updated_at TEXT)")
         c.execute("CREATE TABLE scheduler_state (key TEXT PRIMARY KEY, value TEXT)")
+        c.execute("CREATE TABLE completion_history (arxiv_id TEXT PRIMARY KEY, first_known INTEGER NOT NULL, "
+                  "completed INTEGER NOT NULL DEFAULT 0)")
         c.commit()
         c.close()
         self.plan = os.path.join(self.dir, "plan.json")
         self.progress = os.path.join(self.dir, "progress.jsonl")
         self.twins = os.path.join(self.dir, "twins.json")
+        self.fts = os.path.join(self.dir, "fts.db")
+        f = sqlite3.connect(self.fts)
+        f.execute("CREATE VIRTUAL TABLE chunks USING fts5(text, point_id UNINDEXED, arxiv_id UNINDEXED)")
+        f.execute("INSERT INTO chunks VALUES ('old indexed body','old-point','iacr:2020/1')")
+        f.commit()
+        f.close()
 
     def conn(self):
         c = io_.rlb.connect(self.db)
@@ -82,6 +91,8 @@ class Env(unittest.TestCase):
         c = sqlite3.connect(self.db)
         c.execute("INSERT INTO papers (arxiv_id,title,year,layers,status,abstract,niche_score,fulltext_source,twin_of)"
                   " VALUES (?,?,?,?,?,?,?,?,?)", (pid, title, year, layers, status, "abs", score, src, twin_of))
+        c.execute("INSERT OR IGNORE INTO completion_history(arxiv_id,first_known,completed) VALUES (?,1,0)",
+                  (pid,))
         c.commit()
         c.close()
 
@@ -93,7 +104,7 @@ class Env(unittest.TestCase):
         return r
 
     def args(self, *extra):
-        return io_.parse_args(["--db", self.db, "--fts", os.path.join(self.dir, "fts.db"),
+        return io_.parse_args(["--db", self.db, "--fts", self.fts,
                                "--data-dir", self.dir, "--twins", self.twins, "--plan", self.plan,
                                "--progress", self.progress, "--lock", os.path.join(self.dir, "x.lock"),
                                "--service-file", os.path.join(self.dir, "nosuch.py"), *extra])
@@ -311,20 +322,54 @@ class Apply(Env):
         self.assertEqual(s.calls, [])
         self.assertFalse(os.path.exists(self.progress))
 
-    def test_apply_pdf_sets_fulltext_and_resets(self):
+    def test_apply_pdf_stages_identical_candidate_without_publishing_or_resetting(self):
         self.paper("iacr:2020/1")
         os.makedirs(os.path.join(self.dir, "chunk_cache"))
         old = os.path.join(self.dir, "chunk_cache", "iacr_2020_1.json")
-        open(old, "w").write("[]")
+        old_cache = b'[{"chunk_index":0,"text":"published old chunk"}]'
+        with open(old, "wb") as f:
+            f.write(old_cache)
+        os.makedirs(os.path.join(self.dir, "fulltext_cache"))
+        old_source = os.path.join(self.dir, "fulltext_cache", "iacr_2020_1.tex")
+        with open(old_source, "wb") as f:
+            f.write(b"old published source")
+        before = dict(self.row("iacr:2020/1"))
+        f = sqlite3.connect(self.fts)
+        fts_before = f.execute("SELECT text,point_id,arxiv_id FROM chunks ORDER BY rowid").fetchall()
+        f.close()
         self.plan_with([self.item("iacr:2020/1")])
         n, s = self.run_apply("--apply")
         r = self.row("iacr:2020/1")
-        self.assertEqual((n, r["status"], r["fulltext_source"], r["source_url"]),
-                         (1, "fulltext_fetched", "oa-mirror-pdf", "https://h.example/a.pdf"))
-        self.assertTrue(os.path.exists(os.path.join(self.dir, "fulltext_cache", "iacr_2020_1.tex")))
-        self.assertFalse(os.path.exists(old))
-        self.assertEqual(s.post.call_args[1]["json"]["filter"]["must"][0]["match"]["value"], "iacr:2020/1")
-        self.assertIn("iacr:2020/1", io_.rlb.load_progress(self.progress))
+        self.assertEqual(n, 1)
+        for field in ("status", "fulltext_source", "source_url", "extractor_version"):
+            self.assertEqual(r[field], before[field], field)
+        with open(old, "rb") as f:
+            self.assertEqual(f.read(), old_cache)
+        with open(old_source, "rb") as f:
+            self.assertEqual(f.read(), b"old published source")
+        self.assertEqual(tuple(self.conn().execute(
+            "SELECT first_known,completed FROM completion_history WHERE arxiv_id='iacr:2020/1'").fetchone()),
+            (1, 0))
+        f = sqlite3.connect(self.fts)
+        self.assertEqual(f.execute("SELECT text,point_id,arxiv_id FROM chunks ORDER BY rowid").fetchall(),
+                         fts_before)
+        f.close()
+
+        publication = self.conn().execute(
+            "SELECT revision,artifact_path,cache_sha256,state FROM paper_publications "
+            "WHERE arxiv_id='iacr:2020/1'").fetchone()
+        source_bytes = BODY.encode("utf-8")
+        metadata = {"source_url": "https://h.example/a.pdf", "title": "Fake Paper Title On Something",
+                    "source": io_.FULLTEXT_SOURCE}
+        expected_artifact = {"source": BODY, "metadata": metadata}
+        self.assertEqual(publication[0], hashlib.sha256(
+            source_bytes + b"\0" + io_.json.dumps(metadata, sort_keys=True, separators=(",", ":"),
+                                                   ensure_ascii=False, allow_nan=False).encode()).hexdigest())
+        self.assertEqual(publication[2:], (hashlib.sha256(source_bytes).hexdigest(), "staged"))
+        with open(publication[1], encoding="utf-8") as f:
+            self.assertEqual(json.load(f), expected_artifact)
+        self.assertEqual(io_.rlb.load_progress(self.progress), {"iacr:2020/1"})
+        s.post.assert_not_called()
 
     def test_wrong_paper_text_rejected_and_nothing_changed(self):
         self.paper("iacr:2020/1")
@@ -344,13 +389,16 @@ class Apply(Env):
         self.assertEqual(s.calls, [])
         self.assertEqual(self.row("iacr:2020/1")["fulltext_source"], "iacr-abstract")
 
-    def test_arxiv_copy_queues_discovered_row_without_download(self):
+    def test_arxiv_copy_queues_with_atomic_completion_history_without_download(self):
         self.paper("iacr:2020/1", layers="web3,llm-slm")
         self.plan_with([self.item("iacr:2020/1", action="queue_arxiv", url="https://arxiv.org/abs/2001.09999",
                                   arxiv="2001.09999")])
         n, s = self.run_apply("--apply")
         r = self.row("2001.09999")
         self.assertEqual((n, r["status"], r["twin_of"], r["layers"]), (1, "discovered", "iacr:2020/1", "web3,llm-slm"))
+        self.assertEqual(tuple(self.conn().execute(
+            "SELECT first_known,completed FROM completion_history WHERE arxiv_id='2001.09999'").fetchone()),
+            (1, 0))
         self.assertEqual(s.calls, [])
         self.assertEqual(self.row("iacr:2020/1")["fulltext_source"], "iacr-abstract")
 
@@ -374,17 +422,26 @@ class Apply(Env):
         n, _ = self.run_apply("--apply", "--feed", "--target", "3")
         self.assertEqual(n, 0)
 
-    def test_pdf_items_refused_when_service_lacks_support(self):
+    def test_pdf_candidate_can_be_staged_when_service_lacks_support(self):
         self.paper("iacr:2020/1")
         old_service = os.path.join(self.dir, "service.py")
         open(old_service, "w").write("# old service\n")
         self.plan_with([self.item("iacr:2020/1")])
-        n, s = self.run_apply("--apply", "--service-file", old_service)
-        self.assertEqual(n, 0)
-        self.assertEqual(self.row("iacr:2020/1")["status"], "done")
-        open(old_service, "w").write("if src == 'oa-mirror-pdf': pass\n")
+        before = dict(self.row("iacr:2020/1"))
         n, s = self.run_apply("--apply", "--service-file", old_service)
         self.assertEqual(n, 1)
+        self.assertFalse(io_.service_supports_mirror(old_service))
+        after = self.row("iacr:2020/1")
+        self.assertEqual(after["status"], before["status"])
+        self.assertEqual(after["fulltext_source"], before["fulltext_source"])
+        self.assertEqual(after["source_url"], before["source_url"])
+        staged = self.conn().execute(
+            "SELECT state FROM paper_publications WHERE arxiv_id='iacr:2020/1'").fetchone()
+        self.assertEqual(staged[0], "staged")
+        s.post.assert_not_called()
+        self.assertEqual(io_.rlb.load_progress(self.progress), {"iacr:2020/1"})
+        open(old_service, "w").write("if src == 'oa-mirror-pdf': pass\n")
+        self.assertTrue(io_.service_supports_mirror(old_service))
 
     def test_limit(self):
         for i in range(1, 4):

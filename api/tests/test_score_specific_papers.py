@@ -64,7 +64,10 @@ class ScoreSpecificPapersTests(unittest.TestCase):
 
         self.assertEqual(len(fake.search_calls), 1)
         sent = fake.search_calls[0]
-        self.assertEqual(sent["with_payload"], ["arxiv_id", "section_type"])
+        self.assertEqual(sent["with_payload"], ["arxiv_id", "section_type", "publication_revision"])
+        self.assertNotIn("text", sent["with_payload"])
+        self.assertNotIn("with_vectors", sent)
+        self.assertNotIn("with_vector", sent)
         # limit stays len(paper_ids) * 8, unchanged semantics
         self.assertEqual(sent["limit"], 8)
 

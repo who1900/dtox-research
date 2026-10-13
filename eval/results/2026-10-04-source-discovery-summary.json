@@ -1,0 +1,142 @@
+{
+  "source": "reported live benchmark and final 4-pair server diagnostic",
+  "decision": {
+    "source_discovery_production": "OFF",
+    "dropin_value": 0,
+    "candidate_feature": "held OFF",
+    "api_only_deploy": "confirmed 2026-10-04 with feature flag OFF",
+    "production_api_sha": "a4b1326ff5e7609d13b0cc68070b6ddb4b734a1117b10c8cbe1450ac281f77a6",
+    "deploy_health": {
+      "http_status": 200,
+      "status": "ok",
+      "api_active": true,
+      "mcp_active": true
+    },
+    "checksum_command_history": "initial command failed at final pipelined bash line due to CR; production SHA subsequently confirmed by Main",
+    "rollback_backup": "saved, server-private path omitted",
+    "public_mcp_confirmation": {
+      "sdk_initialize_list_call": "success",
+      "tool_count": 13,
+      "tool_error": false,
+      "result_count": 3,
+      "result_ids": ["eip:20", "eip:5700", "eip:3525"],
+      "partial": false,
+      "source_candidates_present": false,
+      "expected_because_feature_off": true
+    },
+    "mcp_description_code_deployed_to_public_server": false,
+    "mcp_description_update": "optional; public server document unchanged; no restart needed while feature is OFF",
+    "completion": "API optimization deploy and public MCP confirmed; candidate feature remains OFF",
+    "reason": "Only two complete diagnostic pairs; latency directions disagree, so there is no speed proof."
+  },
+  "retrieval_benchmark": {
+    "queries_total": 33,
+    "queries_complete": 32,
+    "primary_exact": "32/32",
+    "primary_hit_at_10_unchanged": "16/32",
+    "combined_discovery": "29/32",
+    "known_hard_negative_candidate_observations": 9,
+    "complete_query_misses": [
+      "episodic-diagnosis",
+      "three-phase-quorum-certificates",
+      "responsive-bft-leader-failover"
+    ],
+    "incomplete_treatment_partials": 1,
+    "partial_case": "capped-delegation",
+    "partial_cause": "returned partial warning was not preserved",
+    "partial_counted_as_complete_miss": false,
+    "criterion_timing": "29/32 measured before serialization/hydration optimization; compact-card shape checked later",
+    "formulation_independence_fully_solved": false
+  },
+  "pre_optimization_timing": {
+    "completed_queries": 32,
+    "runner_elapsed_seconds": 117.123,
+    "baseline_mean_ms": 1413.295,
+    "treatment_mean_ms": 1940.862,
+    "mean_delta_ms": 527.567,
+    "baseline_median_ms": 1226.145,
+    "treatment_median_ms": 1886.92,
+    "scope_note": "Earlier 32-complete-query measurement, not proof of post-optimization speed."
+  },
+  "final_four_pair_diagnostic": {
+    "comparison": "new treatment against unchanged old production file",
+    "complete_pairs": 2,
+    "speed_proof": false,
+    "pairs": [
+      {
+        "case": "technical-interface",
+        "old_ms": 981.11,
+        "new_ms": 1809.34,
+        "old_complete": true,
+        "new_complete": true,
+        "primary_equal": true,
+        "candidate_cards_have_excerpt": false,
+        "comparison_included": true
+      },
+      {
+        "case": "frozen-LoRA",
+        "old_ms": 1078.16,
+        "new_ms": 646.31,
+        "old_complete": true,
+        "new_complete": true,
+        "primary_equal": true,
+        "comparison_included": true
+      },
+      {
+        "case": "guess",
+        "old_ms": 1654.87,
+        "new_ms": 2926.16,
+        "old_complete": true,
+        "new_complete": false,
+        "new_status": "PARTIAL",
+        "comparison_included": false
+      },
+      {
+        "case": "balanced",
+        "old_ms": 2439.38,
+        "new_ms": 3006.46,
+        "old_complete": false,
+        "new_complete": false,
+        "old_status": "PARTIAL",
+        "new_status": "PARTIAL",
+        "comparison_included": false
+      }
+    ]
+  },
+  "compact_candidate_output_chars": {
+    "technical-interface": {
+      "old": 15780,
+      "new": 26994,
+      "delta": 11214,
+      "delta_percent": 71.1
+    },
+    "frozen-LoRA": {
+      "old": 17553,
+      "new": 29090,
+      "delta": 11537,
+      "delta_percent": 65.7
+    },
+    "zero_output_overhead_claimed": false
+  },
+  "point_lookup": {
+    "method": "point lookup by arxiv_id selecting PAPER_COLUMNS plus status, then filter status == done in Python",
+    "schema_changes": false,
+    "query_hints": false,
+    "sample_id_sets_with_equal_rows": 3,
+    "old_status_index_scan_ms": 458,
+    "new_point_lookup_observed_ms_min": 0.42,
+    "new_point_lookup_observed_ms_max": 0.52,
+    "dedicated_tests": 3,
+    "deploy_status": "API optimization deployed 2026-10-04 with source discovery OFF"
+  },
+  "local_verification": {
+    "main_sha": "a4b1326ff5e7609d13b0cc68070b6ddb4b734a1117b10c8cbe1450ac281f77a6",
+    "api_tests_run": 655,
+    "api_tests_passed": 654,
+    "api_tests_skipped": 1,
+    "api_test_seconds": 8.8,
+    "mcp_tests_passed": 24,
+    "mcp_test_seconds": 0.37,
+    "root_full_primary_reading_proof": "32/32"
+  }
+}

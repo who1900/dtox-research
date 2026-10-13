@@ -63,8 +63,19 @@ class TitleIndexTest(unittest.TestCase):
 
     def test_generic_phrase_is_a_name_only_when_written_as_one(self):
         self.assertEqual(self.ids("Generative Agents memory stream")[:1], ["2304.03442"])
+        self.assertEqual(self.ids("Generative Agents memory stream reflection planning")[:1],
+                         ["2304.03442"])
         self.assertEqual(self.ids("generative agents in games"), [])
         self.assertEqual(self.ids("zkVM lookup arguments Jolt Lasso"), [])
+
+    def test_common_phrase_still_rejects_ambiguous_or_low_citation_heads(self):
+        ambiguous = [(f"a{i}", "Generative Agents: A Study", 500) for i in range(9)]
+        low_citation = [("low", "Generative Agents: A Study", 299)]
+        fillers = [(f"f{i}", f"Generative Agents filler {i}", 1) for i in range(30)]
+        self.assertEqual(TitleIndex(ambiguous + fillers).match(
+            "Generative Agents memory stream reflection planning"), [])
+        self.assertEqual(TitleIndex(low_citation + fillers).match(
+            "Generative Agents memory stream reflection planning"), [])
 
     def test_rare_but_obscure_word_is_not_a_name(self):
         self.assertEqual(self.ids("retrieval augmented generation Lewis"), [])
@@ -107,6 +118,14 @@ class InjectExactTest(unittest.TestCase):
         self.assertIsNone(args[2])
         self.assertEqual(kwargs["constraints"], [year])
         self.assertEqual(out[0]["niche_score"], 3)
+
+    def test_title_match_uses_slot_three_without_becoming_an_assertion(self):
+        named = self._r("2304.03442")
+        named["found_via"] = "title match"
+        out = main._place_named([named], [self._r(f"a{i}") for i in range(5)])
+        self.assertEqual(out[2]["arxiv_id"], "2304.03442")
+        self.assertEqual(out[2]["found_via"], "title match")
+        self.assertNotIn("assert", out[2])
 
     def test_excluded_by_filters_stays_out(self):
         with patch.object(main, "_exact_matches", return_value=[("eip:7702", "exact id")]), \

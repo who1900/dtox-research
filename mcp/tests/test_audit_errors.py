@@ -150,10 +150,12 @@ class MCPAuditErrorTests(unittest.TestCase):
         result = self.protocol_call("record_signed_verdict", {"claim": "fixture", "judgments": []})
         self.assertEqual(self.success_payload(result), self.response.json.return_value)
 
-    def test_empty_signed_batch_is_not_assumed_to_be_fully_rejected(self):
+    def test_empty_signed_batch_is_malformed_not_success_or_all_rejected(self):
         self.response.json.return_value = {"results": []}
         result = self.protocol_call("record_signed_verdict", {"claim": "fixture", "judgments": []})
-        self.assertEqual(self.success_payload(result), {"results": []})
+        payload = self.error_payload(result)
+        self.assertEqual(payload["results"], [])
+        self.assertIn("malformed signed verdict batch", payload["error"])
 
     def test_prepare_description_does_not_claim_no_local_writes(self):
         doc = self.docstrings["get_verdict_message"].lower()
