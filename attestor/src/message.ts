@@ -48,8 +48,11 @@ export function claimTextSha256(claimText: string): string {
 }
 
 function assertFieldLength(name: string, value: string, max: number): void {
-  if (value.length === 0 || value.length > max) {
+  if (typeof value !== "string" || value.length === 0 || value.length > max) {
     throw new Error(`${name} must be between 1 and ${max} characters`);
+  }
+  if (/[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error(`${name} must not contain control characters`);
   }
 }
 
@@ -76,9 +79,19 @@ export function assertVerdictFields(fields: VerdictFields): void {
       throw new Error("evidence_sha256 must be a 32-byte sha256 hex digest or '-'");
     }
   }
-  if (Number.isNaN(Date.parse(fields.issuedAt))) {
-    throw new Error("issued_at must be a parseable ISO 8601 timestamp");
+  if (!Number.isFinite(parseIssuedAtTimestamp(fields.issuedAt))) {
+    throw new Error("issued_at must be a valid ISO 8601 timestamp");
   }
+}
+
+export function parseIssuedAtTimestamp(value: string): number {
+  if (typeof value !== "string") return NaN;
+  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$/.exec(value);
+  const timestamp = Date.parse(value);
+  if (!match || !Number.isFinite(timestamp)) return NaN;
+  const localIso = `${match[1]}.${(match[2] ?? "").slice(0, 3).padEnd(3, "0")}Z`;
+  const localTimestamp = Date.parse(localIso);
+  return Number.isFinite(localTimestamp) && new Date(localTimestamp).toISOString() === localIso ? timestamp : NaN;
 }
 
 /**
@@ -102,9 +115,9 @@ export function buildVerdictMessage(fields: VerdictFields): string {
 
 /** Rejects timestamps outside the anti-replay window, relative to `now`. */
 export function checkIssuedAtWindow(issuedAt: string, now: Date = new Date()): void {
-  const ts = Date.parse(issuedAt);
-  if (Number.isNaN(ts)) {
-    throw new Error("issued_at must be a parseable ISO 8601 timestamp");
+  const ts = parseIssuedAtTimestamp(issuedAt);
+  if (!Number.isFinite(ts) || !Number.isFinite(now.getTime())) {
+    throw new Error("issued_at and now must be valid ISO 8601 timestamps");
   }
   const delta = now.getTime() - ts;
   if (delta > MAX_AGE_MS) {

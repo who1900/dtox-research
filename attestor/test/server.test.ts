@@ -132,8 +132,8 @@ async function signedBody(issuedAt = new Date().toISOString().replace("Z", "+00:
     paperId: body.paper_id,
     verdict: body.verdict,
     evidenceSha256: body.evidence_sha256,
-    issuedAt: body.issued_at,
-  });
+    issuedAt: new Date().toISOString(),
+  }).replace(/^issued_at:.*$/m, `issued_at:${body.issued_at}`);
   body.signature = bs58.encode(await ed.signAsync(new TextEncoder().encode(message), secret));
   return body;
 }

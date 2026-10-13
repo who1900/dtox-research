@@ -100,6 +100,17 @@ export function buildApp(dependencies: Partial<{
   app.disable("x-powered-by");
   app.use(express.json({ limit: "64kb" }));
   app.use(requireInternalToken);
+  app.use((req, res, next) => {
+    if (req.method === "POST" && (req.path === "/message" || req.path === "/attest")) {
+      const body: unknown = req.body;
+      if (!body || typeof body !== "object" || Array.isArray(body)
+          || Object.values(body).some((value) => typeof value !== "string")) {
+        badRequest(res, "body must be a JSON object with string fields");
+        return;
+      }
+    }
+    next();
+  });
 
   app.get("/healthz", async (_req, res) => {
     try {
@@ -131,7 +142,7 @@ export function buildApp(dependencies: Partial<{
     // rebuild and check the signature against.
     const issuedAt = (body.issued_at ?? "").trim() || new Date().toISOString();
 
-    if (!claimId || !claimText || !paperId || !verdict) {
+    if (!claimId || !normalizeClaimText(claimText) || !paperId || !verdict) {
       badRequest(res, "claim_id, claim_text, paper_id and verdict are required");
       return;
     }
@@ -180,7 +191,7 @@ export function buildApp(dependencies: Partial<{
     const issuedAt = (body.issued_at ?? "").trim();
     const evidenceSha256 = (body.evidence_sha256 ?? "-").trim() || "-";
 
-    if (!claimId || !claimText || !paperId || !verdict || !reviewer || !signature || !issuedAt) {
+    if (!claimId || !normalizeClaimText(claimText) || !paperId || !verdict || !reviewer || !signature || !issuedAt) {
       badRequest(res, "claim_id, claim_text, paper_id, verdict, reviewer, signature and issued_at are required");
       return;
     }
@@ -190,6 +201,10 @@ export function buildApp(dependencies: Partial<{
     }
     if (!(VALID_VERDICTS as readonly string[]).includes(verdict)) {
       badRequest(res, `verdict must be one of ${VALID_VERDICTS.join(", ")}`);
+      return;
+    }
+    if (reviewer.length > 44 || signature.length > 88) {
+      badRequest(res, "reviewer or signature exceeds base58 encoded ed25519 length");
       return;
     }
     try {
@@ -294,6 +309,12 @@ export function buildApp(dependencies: Partial<{
     }
   });
 
+  app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const status = (error as { status?: number })?.status;
+    res.status(status === 413 ? 413 : status === 400 ? 400 : 500).json({
+      error: status === 413 ? "request body too large" : status === 400 ? "invalid JSON body" : "internal request error",
+    });
+  });
   return app;
 }
 

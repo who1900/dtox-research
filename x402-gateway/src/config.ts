@@ -1,3 +1,6 @@
+import { address } from "@solana/kit";
+import { convertToTokenAmount, parseMoney } from "@x402/core/utils";
+
 export type PaymentMode = "disabled" | "shadow" | "live";
 
 export interface GatewayConfig {
@@ -81,6 +84,32 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     }
   };
 
+  if (!/^solana:[1-9A-HJ-NP-Za-km-z]{32}$/.test(config.svmNetwork)) {
+    throw new Error("X402_SVM_NETWORK must be a CAIP-2 Solana genesis identifier");
+  }
+  for (const [name, price] of Object.entries(config.prices)) {
+    try {
+      if (price.length > 100) throw new Error("price is too long");
+      const { amount, symbol } = parseMoney(price);
+      if (symbol && symbol !== "USDC") throw new Error("settlement asset must be USDC");
+      const fraction = amount.split(".")[1] ?? "";
+      const atomic = BigInt(convertToTokenAmount(amount, 6));
+      if (/[1-9]/.test(fraction.slice(6)) || atomic <= 0n || atomic > 18446744073709551615n) {
+        throw new Error("price must be positive and exactly representable in USDC atomic units");
+      }
+    } catch (error) {
+      throw new Error(`invalid X402_PRICE_${name.toUpperCase()}: ${error instanceof Error ? error.message : "invalid price"}`);
+    }
+  }
+  for (const [name, raw] of [["DTOX_UPSTREAM_MCP_URL", config.upstreamMcpUrl],
+    ["X402_FACILITATOR_URL", config.facilitatorUrl]]) {
+    let url: URL;
+    try { url = new URL(raw); } catch { throw new Error(`${name} must be an HTTP(S) URL`); }
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.hash) {
+      throw new Error(`${name} must be an HTTP(S) URL without credentials or fragment`);
+    }
+  }
+
   if (config.mode === "live") {
     // Solana-only live mode: either the operator never set an EVM payout address, or they
     // explicitly zeroed X402_EVM_NETWORKS to opt out of EVM. Either way, no EVM scheme gets
@@ -97,7 +126,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     if (!config.svmPayTo) {
       throw new Error("live mode is missing: X402_SVM_PAY_TO");
     }
-    if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(config.svmPayTo)) {
+    try {
+      address(config.svmPayTo);
+    } catch {
       throw new Error("X402_SVM_PAY_TO must be a Solana address");
     }
   }

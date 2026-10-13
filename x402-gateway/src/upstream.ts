@@ -1,19 +1,31 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { GatewayConfig } from "./config.js";
+import { isTransientUpstreamError, UpstreamToolError } from "./errors.js";
 
-type ToolContent = { type: string; text?: string };
+export { UpstreamToolError } from "./errors.js";
 
-export class UpstreamToolError extends Error {
-  constructor(readonly payload: Record<string, unknown>) {
-    super(typeof payload.error === "string" ? payload.error : JSON.stringify(payload));
-    this.name = "UpstreamToolError";
+function signedBatchOutcome(payload: Record<string, unknown>): "accepted" | "rejected" | "malformed" {
+  const results = payload.results;
+  if (!Array.isArray(results) || results.length === 0) return "malformed";
+  let accepted = false;
+  for (const item of results) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return "malformed";
+    const status: unknown = item.status;
+    if (typeof status !== "number" || !Number.isInteger(status)
+        || !((status >= 200 && status < 300) || (status >= 400 && status < 600))) return "malformed";
+    accepted ||= status < 300;
   }
+  return accepted ? "accepted" : "rejected";
 }
 
 export function decodeUpstreamResult(name: string, response: Record<string, unknown>) {
-  const content = response.content as ToolContent[] | undefined;
-  const text = content?.find((item) => item.type === "text" && item.text)?.text;
+  if (!response || typeof response !== "object" || Array.isArray(response)) {
+    throw new UpstreamToolError({ error: `upstream tool ${name} returned a non-object response` });
+  }
+  const content = Array.isArray(response.content) ? response.content : [];
+  const text = content.find((item) => item && typeof item === "object" && item.type === "text"
+    && typeof item.text === "string" && item.text.length > 0)?.text as string | undefined;
   let parsed: Record<string, unknown>;
   if (response.structuredContent && typeof response.structuredContent === "object") {
     parsed = response.structuredContent as Record<string, unknown>;
@@ -31,15 +43,17 @@ export function decodeUpstreamResult(name: string, response: Record<string, unkn
     }
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new UpstreamToolError({ error: `upstream tool ${name} returned a non-object result` });
+    throw new UpstreamToolError({ error: `upstream tool ${name} returned a non-object result`, upstream_result: parsed });
   }
   if (response.isError || parsed.error) {
     throw new UpstreamToolError({ ...parsed, error: parsed.error ?? `upstream tool ${name} failed` });
   }
-  const results = parsed.results;
-  if (name === "record_signed_verdict" && Array.isArray(results) && results.length > 0
-      && results.every((item) => item && typeof item.status === "number" && item.status >= 400)) {
-    throw new UpstreamToolError({ ...parsed, error: "all signed verdict judgments were rejected" });
+  if (name === "record_signed_verdict") {
+    const outcome = signedBatchOutcome(parsed);
+    if (outcome !== "accepted") {
+      throw new UpstreamToolError({ ...parsed, error: outcome === "malformed"
+        ? "malformed signed verdict batch result" : "all signed verdict judgments were rejected", error_type: "protocol" });
+    }
   }
   return parsed;
 }
@@ -64,9 +78,7 @@ export function createResearchUpstream(
     try {
       return await callOnce(name, args);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const transient = /timed?\s*out|timeout|could not reach|\b50[234]\b|connection reset/i.test(message);
-      if (!retryTransient || !transient) throw error;
+      if (!retryTransient || !isTransientUpstreamError(error)) throw error;
       return callOnce(name, args);
     }
   }

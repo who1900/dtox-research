@@ -13,7 +13,7 @@ import { createResearchUpstream } from "../src/upstream.js";
 
 export const verdictArgs = {
   claim: "fixture claim", judgments: [{ id: "paper:1", verdict: "asserts",
-    reviewer: "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG", signature: "fixture", issued_at: "fixture" }]
+    reviewer: "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG", signature: "1".repeat(64), issued_at: "2026-10-06T00:00:00Z" }]
 };
 
 export function textResult(payload: Record<string, unknown>, isError = false): CallToolResult {

@@ -3,9 +3,11 @@ import { address, type Address, type Instruction } from "@solana/kit";
 import {
   getCreateAttestationInstructionDataDecoder,
   serializeAttestationData,
+  deserializeAttestationData,
   type Schema,
 } from "sas-lib";
-import { attestVerdict, FIELD_LAYOUT, FIELD_NAMES, type AttestationRecord } from "../src/sas.js";
+import { attestVerdict, deriveCredentialAddress, deriveSchemaAddress, deriveVerdictNonce,
+  FIELD_LAYOUT, FIELD_NAMES, SOLANA_ATTESTATION_SERVICE_PROGRAM_ADDRESS, type AttestationRecord } from "../src/sas.js";
 
 export const TEST_ADDRESS = address("11111111111111111111111111111111");
 
@@ -50,6 +52,7 @@ export function mockChain() {
     failNextWrite: false,
     beforeWrite: async () => {},
     records: new Map<Address, Uint8Array>(),
+    nonces: new Map<Address, Address>(),
   };
   const operations = {
     getChainContext: async () => ({
@@ -63,24 +66,32 @@ export function mockChain() {
     fetchMaybeCredential: async (_rpc: unknown, _pda: unknown, config: { commitment: string }) => {
       assert.equal(config.commitment, "confirmed");
       state.credentialReads++;
-      return { exists: state.credentialExists };
+      return state.credentialExists ? { exists: true, programAddress: SOLANA_ATTESTATION_SERVICE_PROGRAM_ADDRESS,
+        data: { authority: TEST_ADDRESS, authorizedSigners: [TEST_ADDRESS] } } : { exists: false };
     },
     fetchMaybeSchema: async (_rpc: unknown, _pda: unknown, config: { commitment: string }) => {
       assert.equal(config.commitment, "confirmed");
       state.schemaReads++;
-      return { exists: state.schemaExists };
+      return state.schemaExists ? { exists: true, programAddress: SOLANA_ATTESTATION_SERVICE_PROGRAM_ADDRESS,
+        data: { ...schema, credential: await deriveCredentialAddress(TEST_ADDRESS) } } : { exists: false };
     },
     fetchSchema: async (_rpc: unknown, _pda: unknown, config: { commitment: string }) => {
       assert.equal(config.commitment, "confirmed");
       state.schemaReads++;
       if (!state.schemaExists) throw new Error("schema not initialized");
-      return { data: schema };
+      return { programAddress: SOLANA_ATTESTATION_SERVICE_PROGRAM_ADDRESS,
+        data: { ...schema, credential: await deriveCredentialAddress(TEST_ADDRESS) } };
     },
     fetchMaybeAttestation: async (_rpc: unknown, pda: Address, config: { commitment: string }) => {
       assert.equal(config.commitment, "confirmed");
       state.reads++;
       const data = state.records.get(pda);
-      return data ? { exists: true, data: { data } } : { exists: false };
+      if (!data) return { exists: false };
+      const credential = await deriveCredentialAddress(TEST_ADDRESS);
+      const record = deserializeAttestationData<Record<string, string>>(schema, data);
+      return { exists: true, programAddress: SOLANA_ATTESTATION_SERVICE_PROGRAM_ADDRESS,
+        data: { data, credential, schema: await deriveSchemaAddress(credential), signer: TEST_ADDRESS,
+          nonce: state.nonces.get(pda) ?? deriveVerdictNonce(record.claim_id, record.paper_id, record.reviewer) } };
     },
     sendInstructions: async (_ctx: unknown, instructions: readonly Instruction[]) => {
       await state.beforeWrite();
@@ -93,6 +104,7 @@ export function mockChain() {
       assert.equal(create.data?.[0], 6, "unexpected credential/schema provisioning");
       const decoded = getCreateAttestationInstructionDataDecoder().decode(create.data!);
       state.records.set(create.accounts![4].address, Uint8Array.from(decoded.data));
+      state.nonces.set(create.accounts![4].address, decoded.nonce);
       return `mock-transaction-${++state.writes}`;
     },
   } as unknown as NonNullable<Parameters<typeof attestVerdict>[1]>;

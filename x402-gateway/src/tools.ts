@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { createResearchUpstream } from "./upstream.js";
 import { UpstreamToolError } from "./upstream.js";
 import type { GatewayConfig } from "./config.js";
+import { paidToolSchemas } from "./tool-schemas.js";
 
 type Api = ReturnType<typeof createResearchUpstream>;
 type Paid = ReturnType<typeof createPaymentWrapper>;
@@ -105,40 +106,26 @@ export function registerTools(
 
   server.registerTool(
     "get_evidence_bundle",
-    { description: `A bounded research bundle with sources and provenance, also available on the free read endpoint. Price: ${config.prices.evidence} USDC. Unsupported filters are rejected.`,
-      inputSchema: z.object({
-      query: z.string().min(3).max(500),
-      layer: z.enum(["llm-slm", "ai-agents", "web3", "builder-tech"]).optional(),
-      limit: z.number().int().min(1).max(15).default(3),
-      max_chars: z.number().int().min(500).max(30000).default(12000),
-      strict: z.boolean().default(true)
-      }).strict()
+    { description: `A bounded research bundle with sources and provenance, also available on the free read endpoint. Price: ${config.prices.evidence} USDC. API bounds: 1-5 papers, 500-20000 characters; defaults: 3 papers, 12000 characters. Out-of-range inputs and unsupported filters are rejected, never silently clamped.`,
+      inputSchema: paidToolSchemas.get_evidence_bundle
     },
     paidOrShadow(config, wrappers.evidence, config.prices.evidence, async (args) => api.bundle(args))
   );
 
-  server.tool(
+  server.registerTool(
     "get_code_or_math_spec",
-    `Equations, algorithms, code and tables from one indexed paper. Price: ${config.prices.spec} USDC.`,
-    {
-      paper_id: z.string().min(3).max(100),
-      target_elements: z.string().max(100).default("algorithm,equation,code,table"),
-      include_prose: z.boolean().default(false),
-      max_chars: z.number().int().min(500).max(30000).default(12000)
+    { description: `Equations, algorithms, code and tables from one indexed paper. Price: ${config.prices.spec} USDC.`,
+      inputSchema: paidToolSchemas.get_code_or_math_spec
     },
-    paidOrShadow(config, wrappers.spec, config.prices.spec, async ({ paper_id, target_elements, include_prose, max_chars }) => {
-      return api.spec({ arxiv_id: paper_id, target_elements, include_prose, max_chars });
+    paidOrShadow(config, wrappers.spec, config.prices.spec, async ({ paper_id, target_elements, include_prose, max_chars, cursor }) => {
+      return api.spec({ arxiv_id: paper_id, target_elements, include_prose, max_chars, cursor });
     })
   );
 
-  server.tool(
+  server.registerTool(
     "compare_methods",
-    `Results, limitations and benchmark tables from two indexed papers. Price: ${config.prices.compare} USDC.`,
-    {
-      paper_id_a: z.string().min(3).max(100),
-      paper_id_b: z.string().min(3).max(100),
-      tables_only: z.boolean().default(false),
-      max_chars: z.number().int().min(500).max(30000).default(12000)
+    { description: `Results, limitations and benchmark tables from two indexed papers. Price: ${config.prices.compare} USDC.`,
+      inputSchema: paidToolSchemas.compare_methods
     },
     paidOrShadow(config, wrappers.compare, config.prices.compare, async ({ paper_id_a, paper_id_b, tables_only, max_chars }) => {
       return api.compare({
@@ -150,33 +137,20 @@ export function registerTools(
     })
   );
 
-  server.tool(
+  server.registerTool(
     "research_trends",
-    `Topic-normalized research trends by year. Price: ${config.prices.trends} USDC.`,
-    {
-      about: z.string().min(3).max(500),
-      layer: z.enum(["llm-slm", "ai-agents", "web3"]).optional(),
-      year_from: z.number().int().min(1990).max(2100).default(2023),
-      year_to: z.number().int().min(1990).max(2100).optional(),
-      top: z.number().int().min(1).max(50).default(20)
+    { description: `Topic-normalized research trends by year. Price: ${config.prices.trends} USDC.`,
+      inputSchema: paidToolSchemas.research_trends
     },
     paidOrShadow(config, wrappers.trends, config.prices.trends, async ({ about, layer, year_from, year_to, top }) => {
       return api.trends({ about, layer, year_from, year_to, top });
     })
   );
 
-  server.tool(
+  server.registerTool(
     "validate_project",
-    `Full literature-backed audit of technical claims. Price: ${config.prices.audit} USDC.`,
-    {
-      idea: z.string().min(10).max(2000),
-      claims: z.array(z.union([
-        z.string().min(3).max(1000),
-        z.object({ claim: z.string().min(3).max(1000), phrasings: z.array(z.string().min(3).max(1000)).max(4).optional() })
-      ])).min(1).max(8),
-      layer: z.enum(["llm-slm", "ai-agents", "web3"]).optional(),
-      evidence_per_claim: z.number().int().min(1).max(8).default(4),
-      deep: z.boolean().default(true)
+    { description: `Full literature-backed audit of technical claims. Price: ${config.prices.audit} USDC.`,
+      inputSchema: paidToolSchemas.validate_project
     },
     paidOrShadow(config, wrappers.audit, config.prices.audit, async (args) => api.validate(args))
   );
@@ -193,21 +167,10 @@ export function registerTools(
     handler(async (args) => api.verdictMessage(args))
   );
 
-  server.tool(
+  server.registerTool(
     "record_signed_verdict",
-    `Attempt a wallet-signed Solana devnet verdict. In live mode, ${config.prices.verdict} USDC settles upfront before the write handler, per batch attempt, not per accepted item. Handler failure retains a payment receipt; no automatic refund. Partial batches retain every per-item status. Payment is not scientific quorum.`,
-    {
-      claim: z.string().min(3).max(1000),
-      judgments: z.array(z.object({
-        id: z.string().min(3).max(100),
-        verdict: z.enum(["asserts", "does_not_assert", "partial"]),
-        reason: z.string().max(2000).optional(),
-        evidence_sha256: z.string().max(64).optional(),
-        reviewer: z.string().min(32).max(44),
-        signature: z.string().min(1),
-        issued_at: z.string().min(1)
-      })).min(1).max(20),
-      layer: z.enum(["llm-slm", "ai-agents", "web3"]).optional()
+    { description: `Attempt a wallet-signed Solana devnet verdict. In live mode, ${config.prices.verdict} USDC settles upfront before the write handler, per batch attempt, not per accepted item. Handler failure retains a payment receipt; no automatic refund. Partial batches retain every per-item status. Payment is not scientific quorum.`,
+      inputSchema: paidToolSchemas.record_signed_verdict
     },
     paidOrShadow(config, wrappers.verdict, config.prices.verdict, async (args) => api.recordSignedVerdict(args))
   );

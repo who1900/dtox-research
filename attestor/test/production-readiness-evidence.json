@@ -1,0 +1,425 @@
+{
+  "captured_at_utc": "2026-10-06T18:06:54.1508263Z",
+  "algorithm": "SHA-256 over exact file bytes",
+  "aggregate_encoding": "UTF-8 compact JSON files array in recorded order",
+  "aggregate_sha256": "8503cd48177c65aeaaa260f403e89ff064e53190171ba2cbab9216be9bb2ff87",
+  "files": [
+    {
+      "path": "attestor/package.json",
+      "sha256": "ccec2257155d3639a5ce69221a9b19bb110d59dcd87f3742576deaa6d62c8104"
+    },
+    {
+      "path": "attestor/src/message.ts",
+      "sha256": "c00a446c409ac6bc69e57f72dadb4744c48e4206fb806699bdcb557dad8ac915"
+    },
+    {
+      "path": "attestor/src/sas.ts",
+      "sha256": "eb83cb9fc31f1f5848f4594be1b5efc0042904d304cb16ff04ff13cdb4116ba7"
+    },
+    {
+      "path": "attestor/src/server.ts",
+      "sha256": "e404e109cd2e6d4f85e10c55782124b99c304a2eaea5a6b8761152e6f2b59bbc"
+    },
+    {
+      "path": "attestor/test/message.test.ts",
+      "sha256": "a0651d8cd943dbd6cc7bf8f4114256c9ea20767a1678dda9a7886d40d8cedb38"
+    },
+    {
+      "path": "attestor/test/mock-chain.ts",
+      "sha256": "f4cc2eb75133cdae56e7f2b8fc41f12b645188434dd930d8084df050667879cd"
+    },
+    {
+      "path": "attestor/test/sas-readonly-probe.mjs",
+      "sha256": "1cce158076197c24c524dc6ed848ffee6d6a81437d7a0379d5c205226e5f5789"
+    },
+    {
+      "path": "attestor/test/sas-readonly-probe.test.ts",
+      "sha256": "60600f3dc7bd724e14713ccc9ab3d07c943134cd60de2c6156e5f12661531bf3"
+    },
+    {
+      "path": "attestor/test/sas.test.ts",
+      "sha256": "4e8fe399ed00f4603b3ac6c869303671122e88eea28b187c4fa4b4b6fa6209c1"
+    },
+    {
+      "path": "attestor/test/security-contract.test.ts",
+      "sha256": "00be869da8f7ad1e25d64b76c3050f741cb3d3dced3bc58e67aef862dddeb016"
+    },
+    {
+      "path": "attestor/test/server.test.ts",
+      "sha256": "f1fa94e3cc74524c41aa0bcd1a4aded0738d5437b913e62764c50df39771c823"
+    },
+    {
+      "path": "mcp/server.py",
+      "sha256": "47043605ba2e11ac4bfe58e20acc53567941b2ebcbdcbfd6afcb4f535c6d67db"
+    },
+    {
+      "path": "mcp/tests/signed_batch_cases.json",
+      "sha256": "bd39c269a5cde1a970fe732d2ba199baa1ed0342caebbb7321fd8f4a615caa59"
+    },
+    {
+      "path": "mcp/tests/test_agent_workflow.py",
+      "sha256": "ea0bb820a6356581b0b69f3595975e03459f9837e3e70f038e433e75be1126a2"
+    },
+    {
+      "path": "mcp/tests/test_audit_errors.py",
+      "sha256": "a6b36535d1fde18ef18ce85d26690dc506db5d7dba8144253e3b5d99726f6ce5"
+    },
+    {
+      "path": "mcp/tests/test_contract.py",
+      "sha256": "27c79c162bd0f710b25d739c0261611b49bdb999d8ca6e90cb1a2713cb0ae73e"
+    },
+    {
+      "path": "mcp/tests/test_paper_id_aliases.py",
+      "sha256": "e662d4ee764b2845c127bad04b8eaa9be3cb88a9ed847deee2992cd3270363b8"
+    },
+    {
+      "path": "mcp/tests/test_public_tool_surface.py",
+      "sha256": "cd8c6ff511ecc07a29af21c8cd436f294720b6c4380cbce85b124f3b25def199"
+    },
+    {
+      "path": "mcp/tests/test_signed_security_contract.py",
+      "sha256": "fbcb49bce494ac16f0db3915e8c5ea3bf4d7d30b035d19fc95aeb36e118002fe"
+    },
+    {
+      "path": "mcp/tests/test_spec_pagination.py",
+      "sha256": "80399f017f114cd8048eac811844a607c12aeddb4a76c8f89016d4455d92b31f"
+    },
+    {
+      "path": "x402-gateway/package.json",
+      "sha256": "2f2a11f5e821473c26d826e6e04aaf62fbcd31f3d0c229e1a2e853badaf279cf"
+    },
+    {
+      "path": "x402-gateway/src/config.ts",
+      "sha256": "6eb4acb9fc715fd661f831ee13e6efcf59da5c9b52d0fadcf02bc0c78ea19495"
+    },
+    {
+      "path": "x402-gateway/src/errors.ts",
+      "sha256": "65d283518750d8a79e4ebbef3378e5dcc81cea81bfe6a1ded2439df9b769638c"
+    },
+    {
+      "path": "x402-gateway/src/payments.ts",
+      "sha256": "ff522bf16f44f9fe2632c1a195b2fbc50f5f13fc0eb62a7642ae2cec37727fdc"
+    },
+    {
+      "path": "x402-gateway/src/server.ts",
+      "sha256": "f5601345ca69406409856977a42f1aec1864cdfd2ee90f7d7419176890834845"
+    },
+    {
+      "path": "x402-gateway/src/tool-schemas.ts",
+      "sha256": "06f3d0eca3a31f3ddb57ede7e1577c9914187a218a31a469fc2c39a48a2f7ac4"
+    },
+    {
+      "path": "x402-gateway/src/tools.ts",
+      "sha256": "0502d3a1c066901b80360fd49f46c1ab3154233014161bb8096730d2f8f7fa9e"
+    },
+    {
+      "path": "x402-gateway/src/upstream.ts",
+      "sha256": "08449f8a5412fbc0463a1f4afd76c5918f03ac3099d038a97eee375edf127bba"
+    },
+    {
+      "path": "x402-gateway/test/config.test.ts",
+      "sha256": "bef1f59660cd66b9a603555167ecaff28f4a70c744d2db6849d2d920edd9de42"
+    },
+    {
+      "path": "x402-gateway/test/docs.test.ts",
+      "sha256": "fba4d8929e2bac0f68db904b589a66ebaa6643661fc889f65def3c3f9ba26f4f"
+    },
+    {
+      "path": "x402-gateway/test/errors.test.ts",
+      "sha256": "d335170ff73af98d739b10b3e2f2ebd71ed7d2145b1c1571c22c461749803f24"
+    },
+    {
+      "path": "x402-gateway/test/offline.ts",
+      "sha256": "ec836d169267fcf4f33a067dee28bbfb2bea9569a582e95400d935245c72f33d"
+    },
+    {
+      "path": "x402-gateway/test/payments.test.ts",
+      "sha256": "977f5f1468e57684e74d01e2742f8a971a7a86c7508f9e0aa59b06774c8cb00a"
+    },
+    {
+      "path": "x402-gateway/test/release-devnet.test.ts",
+      "sha256": "661062931223bf37f7c65806311e743026f1d0b61ac45b36bad8bfe86a63fd35"
+    },
+    {
+      "path": "x402-gateway/test/security-contract.test.ts",
+      "sha256": "17295652f1ff95ad47f98d907d8900c64ce8feba47039fdb7cb11aa84cea6309"
+    },
+    {
+      "path": "x402-gateway/test/tool-schemas.test.ts",
+      "sha256": "8a5aec59538b1d04b39ce0cd7627c047c2d65dfebb1bbc6e642b102935fd541c"
+    },
+    {
+      "path": "x402-gateway/test/tools.test.ts",
+      "sha256": "e0562fb8a4c6fa1b5cfdf9c8b770bcb03bf8e444252b7f93d3e40c4bc5be382a"
+    },
+    {
+      "path": "x402-gateway/test/upstream.test.ts",
+      "sha256": "e6e68ac60111702eeaa6efea3792f07fc8d679f2b61a5ec26b5381e7701331a9"
+    }
+  ],
+  "repository": "C:/Users/User/Documents/work/Claude/dtox-research-public",
+  "execution": {
+    "scope": "This agent: offline/local mocks only. Coordinator live-readonly and rollout evidence recorded separately.",
+    "external_rpc": false,
+    "wallet_files": false,
+    "real_payments": false,
+    "deployment": false,
+    "commit_push": false,
+    "dependencies_changed": false,
+    "prices_routes_infrastructure_changed": false
+  },
+  "changed_files": [
+    "attestor/src/message.ts",
+    "attestor/src/sas.ts",
+    "attestor/src/server.ts",
+    "attestor/test/mock-chain.ts",
+    "attestor/test/server.test.ts",
+    "attestor/test/security-contract.test.ts",
+    "x402-gateway/src/config.ts",
+    "x402-gateway/src/tool-schemas.ts",
+    "x402-gateway/src/tools.ts",
+    "x402-gateway/test/offline.ts",
+    "x402-gateway/test/tool-schemas.test.ts",
+    "x402-gateway/test/security-contract.test.ts",
+    "mcp/tests/test_signed_security_contract.py",
+    "mcp/server.py",
+    "mcp/tests/signed_batch_cases.json",
+    "mcp/tests/test_audit_errors.py",
+    "x402-gateway/src/upstream.ts",
+    "x402-gateway/test/upstream.test.ts",
+    "attestor/test/sas-readonly-probe.mjs",
+    "attestor/test/sas-readonly-probe.test.ts"
+  ],
+  "fixes": [
+    "Reject control characters in signed claim/paper IDs, normalized-empty claims and malformed JSON/field types with bounded JSON errors.",
+    "Share strict ISO/calendar timestamp validation between message preparation, TTL and attestation. Preserve valid v1 canonical message format.",
+    "Make delimiter-bearing nonce inputs unambiguous while preserving ordinary v1 PDA seeds. Existing delimiter-bearing legacy records remain readable, update in place and idempotently reuse their original PDA; colliding foreign identity never overwrites them.",
+    "Validate fetched SAS account program ownership, credential authority/authorized signer, schema credential/version/layout/field names, attestation signer/credential/schema/nonce and persisted record identity before reuse/update.",
+    "Reject invalid decoded SVM recipient, malformed SVM CAIP identifier/URLs and non-positive or lossy USDC price configuration. Price values, routes and infra files unchanged.",
+    "Validate signed judgment base58 alphabet/encoded-size, evidence hash and timestamp wire shape before payment. Ed25519 identity, calendar validation and TTL remain enforced by attestor.",
+    "Add get_code_or_math_spec optional opaque cursor: string length 1..1024; forward unchanged as cursor to upstream MCP, preserve arxiv_id alias/defaults and discovery-schema compatibility.",
+    "Replace malformed signed-batch success fallthrough in MCP _api_result and gateway decodeUpstreamResult with one generic outcome validator per runtime. Require nonempty results and object items with integral 2xx or 4xx/5xx status; accepted mixed batches remain intact, all-rejected and malformed batches retain diagnostics as protocol errors. Guard malformed gateway content; no signed-write retries."
+  ],
+  "tests": {
+    "attestor": {
+      "command": "npm test",
+      "tests": 58,
+      "pass": 58,
+      "fail": 0,
+      "skipped": 0,
+      "todo": 0,
+      "duration_ms": 9529.595
+    },
+    "gateway": {
+      "command": "npm test",
+      "tests": 59,
+      "pass": 59,
+      "fail": 0,
+      "skipped": 0,
+      "todo": 0,
+      "duration_ms": 4614.5875
+    },
+    "mcp": {
+      "command": "python -B -m unittest discover -s mcp/tests -p 'test_*.py'",
+      "tests": 62,
+      "pass": 62,
+      "fail": 0,
+      "skipped": 0,
+      "expected_failure": 0,
+      "duration_seconds": 0.816,
+      "note": "unittest discovery count includes tests inherited/imported by pagination fixtures; not a claim of 62 unique scenarios."
+    },
+    "typecheck": {
+      "attestor": "tsc --noEmit -p tsconfig.json: PASS",
+      "gateway": "tsc --noEmit -p tsconfig.json: PASS"
+    },
+    "diff_check": "PASS (git CRLF conversion warnings only)",
+    "build": {
+      "attestor": "npm run build: PASS (exit 0)",
+      "gateway": "npm run build: PASS (exit 0)",
+      "note": "Only local compiler outputs were generated; no service start or deploy."
+    },
+    "signed_batch_contract": {
+      "shared_cases": 30,
+      "fixture": "mcp/tests/signed_batch_cases.json",
+      "coverage": "Both decoders consume the same accepted/mixed, all-rejected and malformed empty/nonlist/nonobject/status fixtures. Mocked SDK lifecycle retains upfront receipt and diagnostics; one handler call, no retry. No real settlement."
+    },
+    "readonly_probe": {
+      "command": "node --import tsx --test test/sas-readonly-probe.test.ts",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "duration_ms": 1471.2148,
+      "mode": "SIMULATED injected RPC/SDK fetches; global external fetch forbidden"
+    }
+  },
+  "network_evidence": [
+    {
+      "network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
+      "current": "SIMULATED local SDK/payment and SAS/Ed25519 contracts; LIVE_READONLY existing SAS initialization account compatibility confirmed by Main/coordinator at 2026-10-06T18:12:08Z. No candidate payment/write performed by this agent.",
+      "historical": "docs/2026-10-03-live-release-evidence.md records 2026-10-03 devnet payment/write; not rerun and not proof for this candidate"
+    },
+    {
+      "network": "eip155:84532",
+      "current": "SIMULATED SDK requirements and payment lifecycle; no real transaction"
+    },
+    {
+      "network": "eip155:11155111",
+      "current": "KNOWN BLOCKER: SDK 2.24.0 No default asset configured; configuration kept enabled, not silently dropped"
+    },
+    {
+      "network": "eip155:421614",
+      "current": "SIMULATED requirements construction; settlement UNKNOWN"
+    },
+    {
+      "network": "eip155:8453",
+      "current": "SIMULATED requirements construction; live mainnet UNKNOWN"
+    },
+    {
+      "network": "eip155:1",
+      "current": "SIMULATED requirements construction; live mainnet UNKNOWN"
+    },
+    {
+      "network": "eip155:42161",
+      "current": "SIMULATED requirements construction; live mainnet UNKNOWN"
+    }
+  ],
+  "owner_patch_proposals": [
+    {
+      "path": "api/main.py",
+      "line": 5077,
+      "problem": "After earlier batch items have already persisted, attestor transport/5xx errors raise whole-call HTTPException and omit completed item receipts/statuses. Readonly finding; not changed.",
+      "proposal": "Gauss received a separate small patch proposal: on requests exception or attestor 5xx after completed items, preserve structured HTTPException.detail with error, results:completed, uncertain_item:j.id and outcome_unknown:true. Do not retry signed writes. This agent did not edit API; separate producer partial-receipt-loss finding remains unverified as fixed.",
+      "function": "adjudicate_signed"
+    },
+    {
+      "path": "x402-gateway/src/payments.ts",
+      "line": 23,
+      "problem": "Default EVM network list includes Ethereum Sepolia with no default SDK asset mapping, so requirement construction fails offline.",
+      "proposal": "Owner should provide reviewed per-network asset/decimals/domain mapping via the existing ExactEvmScheme.registerMoneyParser and fixture-backed facilitator support. Do not invent mint/address mappings or disable networks to hide failure."
+    }
+  ],
+  "residual_risks": [
+    "NO blanket production/mainnet GO. Malformed signed-batch decoders are fixed and no TODO/expectedFailure remains in executed suites; Ethereum Sepolia default asset mapping remains a known offline blocker.",
+    "Locks/idempotency serialization are process-local; simultaneous writers in multiple processes/replicas are not proven safe.",
+    "Existing devnet SAS strict credential/schema compatibility passed in Main/coordinator live-readonly execution at 18:12:08 UTC. Candidate write/payment/settlement is not proven by this read-only check; historical payment evidence remains separate.",
+    "Cursor schema/forwarding and MCP pagination contracts pass offline. Main/coordinator confirms guarded API/MCP deployment and active cursor route/health with matching hashes; this does not certify every pagination continuation edge case.",
+    "Gateway wire-shape guards are not full calendar, decoded byte-length or signature verification. Downstream rejection after upfront payment remains possible; payment flow is unchanged.",
+    "API partial-batch transport/5xx completed-receipt loss is a separate readonly owner proposal, not the decoder defect; no fix is claimed here.",
+    "MCP source and all offline MCP tests are included in tested identity. API remains a readonly observation excluded from the aggregate; parallel owner edits are not attributed to this agent.",
+    "13 public MCP tools are checked by the offline surface suite. No live inventory was requested; no tool/network was disabled."
+  ],
+  "source_identity_verified_at_utc": "2026-10-06T18:13:58.1287187Z",
+  "readonly_api_observations": {
+    "path": "api/main.py",
+    "initial_sha256": "485e95c56883b6a81d8f8c0c1f6da52db69b27a5f2460c568f0033001366d1f4",
+    "latest_sha256": "422c6986a5a383f0e4852a0d7f2a5e3ba1605499fb93002ca8a0e0a66f3e889c",
+    "latest_observed_at_utc": "2026-10-06T18:01:08.8878262Z",
+    "excluded_from_tested_source_identity": true,
+    "note": "Parallel local API edits were observed between hash checks. This agent did not edit/deploy API and has no new live/prod measurement."
+  },
+  "decoder_coordination": {
+    "actual_failure_locations": [
+      {
+        "path": "mcp/server.py",
+        "function": "_api_result",
+        "line": 184
+      },
+      {
+        "path": "x402-gateway/src/upstream.ts",
+        "function": "decodeUpstreamResult",
+        "original_line": 35,
+        "current_line": 22
+      }
+    ],
+    "owner_api": "Gauss",
+    "api_changed_by_this_agent": false,
+    "gauss_proposal_sent": true,
+    "fermat_notified_of_narrow_mcp_scope": true,
+    "fix_iterations": 1,
+    "note": "Only _api_result was edited in MCP; _handle_error and sibling cursor changes preserved. No request/result cardinality guarantee claimed."
+  },
+  "validation_boundary": {
+    "gateway": "Wire-shape guard only: ISO-shaped strings may include impossible calendar dates (e.g. February 30); base58 alphabet/encoded length does not establish decoded key/signature byte length, wallet identity or cryptographic signature validity. Such valid-shape invalid inputs can be rejected downstream after upfront payment. Payment policy/flow unchanged.",
+    "attestor": "Local mocked tests exercise strict calendar/TTL parsing, decoded Ed25519 identity and canonical claim/paper/verdict/evidence binding. Main/coordinator live-readonly evidence at 18:12:08 UTC confirms existing SAS credential/schema compatibility; no live signature/payment/mainnet proof.",
+    "cursor": "Opaque optional string length 1..1024 forwarded unchanged; gateway does not decode or authenticate v1:base64url JSON.",
+    "style": "config imports_bottom is stylistic and not a deployment blocker."
+  },
+  "readonly_sas_probe": {
+    "path": "attestor/test/sas-readonly-probe.mjs",
+    "command_from_attestor": "node --import tsx test/sas-readonly-probe.mjs --authority <PUBLIC_ADDRESS>",
+    "status": "PASS LIVE_READONLY: compatible=true, executed by Main/coordinator at 2026-10-06T18:12:08Z",
+    "inputs": "Public authority address only, provided as CLI argument; no health lookup, env or wallet-file loading",
+    "rpc_url": "https://api.devnet.solana.com",
+    "candidate_function": "getInitializationState",
+    "sdk_reads": [
+      "fetchMaybeCredential",
+      "fetchMaybeSchema"
+    ],
+    "rpc_allowlist": [
+      "getGenesisHash",
+      "getBalance",
+      "getAccountInfo",
+      "getMultipleAccounts"
+    ],
+    "safety": "Injected context contains only rpc and authority.address. Every other chain operation, including sendInstructions, is forbidden by proxy. RPC writes are denied by allowlist. Genesis must equal devnet regardless of env overrides. Candidate strict owner/authority/signer/schema credential/version/layout/fieldNames checks run unchanged. Missing accounts fail without provision; no signing/payment/airdrop/subscriptions.",
+    "scope": "Compatibility report includes actual public account metadata/layout/fieldNames bytes; no blanket mainnet or settlement proof. Review/freeze candidate source hash before owner executes.",
+    "live_validation": {
+      "executed_at_utc": "2026-10-06T18:12:08Z",
+      "executor": "Main/coordinator",
+      "provenance": "Direct coordinator execution/validation handoff; not a simulated test or health-only observation",
+      "compatible": true,
+      "passed_checks": [
+        "credential/schema program owner",
+        "credential authority",
+        "credential authorized signer",
+        "schema credential binding",
+        "schema version",
+        "schema layout",
+        "schema field names",
+        "devnet genesis"
+      ],
+      "no_keys_writes_payments_airdrop": true,
+      "probe_sha256": "1cce158076197c24c524dc6ed848ffee6d6a81437d7a0379d5c205226e5f5789",
+      "frozen_probe_hash_verified_locally": true,
+      "local_identity_verified_at_utc": "2026-10-06T18:13:58.1287187Z",
+      "note": "This agent verified frozen local file hashes and records the coordinator live execution outcome; it did not independently rerun the live RPC probe."
+    }
+  },
+  "coordinator_health_snapshot": {
+    "captured_at_utc": "2026-10-06T18:04:00Z (approximate)",
+    "authority": "39ayJ2S5h6VpzxWtAGkKFHTSiHMYt73oJNvpAkTp8Qc8",
+    "credential": "FhuYUySEFspP6AmZAEdPDxVX7U1kFvd977ym4LWwJBwd",
+    "schema": "92NcVEiKANUJREweDAz189bfGEdQzWPqZswS6qquu6Cr",
+    "accounts_exist": true,
+    "note": "Initial existence health observation is superseded by the separate coordinator live-readonly strict account compatibility evidence at 18:12:08 UTC.",
+    "provenance": "Main/coordinator public health capture"
+  },
+  "coordinator_rollout": {
+    "provenance": "Main/coordinator deployment and independent QA handoff",
+    "api_mcp_code_files": 4,
+    "deployed_at_utc": "2026-10-06T18:11:00Z (minute precision)",
+    "guarded_backup": true,
+    "cursor_route_health_active": true,
+    "active_hashes_match_candidate": true,
+    "independent_qa": {
+      "gateway": {
+        "pass": 59,
+        "todo": 0
+      },
+      "mcp": {
+        "pass": 62,
+        "expected_failure": 0
+      },
+      "attestor": {
+        "pass": 55
+      },
+      "linux_api": {
+        "pass": 107,
+        "duration_seconds": 1.832
+      }
+    },
+    "security_services_staging": "Pending Main inspection/staging; no deployment by this agent",
+    "note": "API remains outside this agent's source aggregate and write scope. No new tests, environment/payment/network configuration changes or deploy were performed by this agent."
+  }
+}

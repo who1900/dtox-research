@@ -39,7 +39,8 @@ import {
   deserializeAttestationData,
 } from "sas-lib";
 import bs58 from "bs58";
-import { sha256Hex } from "./message.js";
+import { sha256Hex, parseIssuedAtTimestamp } from "./message.js";
+export { parseIssuedAtTimestamp } from "./message.js";
 
 export const CREDENTIAL_NAME = "dtox-research";
 export const SCHEMA_NAME = "claim_verdict_v1";
@@ -182,6 +183,47 @@ const MAX_PENDING_PER_PDA = 32;
 const READ_CONFIG = { commitment: "confirmed" } as const;
 const attestationLocks = new Map<string, { tail: Promise<void>; pending: number }>();
 
+function assertSasOwner(account: { programAddress: Address }): void {
+  if (account.programAddress !== SOLANA_ATTESTATION_SERVICE_PROGRAM_ADDRESS) {
+    throw new Error("account is not owned by Solana Attestation Service");
+  }
+}
+
+function assertCredentialAccount(
+  account: { programAddress: Address; data: { authority: Address; authorizedSigners: readonly Address[] } },
+  authority: Address,
+): void {
+  assertSasOwner(account);
+  if (account.data.authority !== authority || !account.data.authorizedSigners.includes(authority)) {
+    throw new Error("credential authority or authorized signer mismatch");
+  }
+}
+
+function assertSchemaAccount(account: Awaited<ReturnType<typeof fetchSchema>>, credential: Address): void {
+  assertSasOwner(account);
+  const expectedNames = Buffer.concat(FIELD_NAMES.map((name) => {
+    const bytes = Buffer.from(name);
+    const length = Buffer.alloc(4);
+    length.writeUInt32LE(bytes.length);
+    return Buffer.concat([length, bytes]);
+  }));
+  if (account.data.credential !== credential || account.data.version !== SCHEMA_VERSION
+      || !Buffer.from(account.data.layout).equals(Buffer.from(FIELD_LAYOUT))
+      || !Buffer.from(account.data.fieldNames).equals(expectedNames)) {
+    throw new Error("claim verdict schema contract mismatch");
+  }
+}
+
+function assertAttestationAccount(
+  account: { programAddress: Address; data: { credential: Address; schema: Address; signer: Address } },
+  credential: Address, schema: Address, authority: Address,
+): void {
+  assertSasOwner(account);
+  if (account.data.credential !== credential || account.data.schema !== schema || account.data.signer !== authority) {
+    throw new Error("attestation credential, schema or signer mismatch");
+  }
+}
+
 async function withAttestationLock<T>(pda: Address, run: () => Promise<T>): Promise<T> {
   let lock = attestationLocks.get(pda);
   if (!lock) {
@@ -205,15 +247,6 @@ async function withAttestationLock<T>(pda: Address, run: () => Promise<T>): Prom
     release();
     if (--lock.pending === 0) attestationLocks.delete(pda);
   }
-}
-
-export function parseIssuedAtTimestamp(value: string): number {
-  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$/.exec(value);
-  const timestamp = Date.parse(value);
-  if (!match || !Number.isFinite(timestamp)) return NaN;
-  const localIso = `${match[1]}.${(match[2] ?? "").slice(0, 3).padEnd(3, "0")}Z`;
-  const localTimestamp = Date.parse(localIso);
-  return Number.isFinite(localTimestamp) && new Date(localTimestamp).toISOString() === localIso ? timestamp : NaN;
 }
 
 export async function requestDevnetAirdrop(solAmount = 1): Promise<string> {
@@ -245,7 +278,10 @@ export async function ensureCredential(operations = chainOperations): Promise<Ad
   const credentialAddress = await deriveCredentialAddress(ctx.authority.address);
 
   const maybe = await operations.fetchMaybeCredential(ctx.rpc, credentialAddress, READ_CONFIG);
-  if (maybe.exists) return credentialAddress;
+  if (maybe.exists) {
+    assertCredentialAccount(maybe, ctx.authority.address);
+    return credentialAddress;
+  }
 
   const instruction = getCreateCredentialInstruction({
     payer: ctx.authority,
@@ -264,7 +300,10 @@ export async function ensureSchema(credentialAddress: Address, operations = chai
   const schemaAddress = await deriveSchemaAddress(credentialAddress);
 
   const maybe = await operations.fetchMaybeSchema(ctx.rpc, schemaAddress, READ_CONFIG);
-  if (maybe.exists) return schemaAddress;
+  if (maybe.exists) {
+    assertSchemaAccount(maybe, credentialAddress);
+    return schemaAddress;
+  }
 
   const instruction = getCreateSchemaInstruction({
     payer: ctx.authority,
@@ -289,6 +328,8 @@ export async function getInitializationState(operations = chainOperations) {
     operations.fetchMaybeSchema(ctx.rpc, schema, READ_CONFIG),
     ctx.rpc.getBalance(ctx.authority.address, READ_CONFIG).send(),
   ]);
+  if (credentialAccount.exists) assertCredentialAccount(credentialAccount, ctx.authority.address);
+  if (schemaAccount.exists) assertSchemaAccount(schemaAccount, credential);
   return {
     authority: ctx.authority.address,
     credential,
@@ -301,9 +342,15 @@ export async function getInitializationState(operations = chainOperations) {
 
 /** One attestation per (claim, paper, reviewer): nonce is derived, never random. */
 export function deriveVerdictNonce(claimId: string, paperId: string, reviewer: string): Address {
-  const digestHex = sha256Hex(`dtox:v1:${claimId}|${paperId}|${reviewer}`);
+  const fields = [claimId, paperId, reviewer];
+  if (!fields.some((field) => field.includes("|"))) return legacyVerdictNonce(claimId, paperId, reviewer);
+  const digestHex = sha256Hex(`dtox:nonce:v2:${JSON.stringify(fields)}`);
   const digestBytes = Uint8Array.from(Buffer.from(digestHex, "hex"));
   return address(bs58.encode(digestBytes));
+}
+
+function legacyVerdictNonce(claimId: string, paperId: string, reviewer: string): Address {
+  return address(bs58.encode(Buffer.from(sha256Hex(`dtox:v1:${claimId}|${paperId}|${reviewer}`), "hex")));
 }
 
 function recordToDataObject(record: AttestationRecord): Record<string, unknown> {
@@ -372,18 +419,45 @@ export async function attestVerdict(record: AttestationRecord, operations = chai
     await ensureCredential(operations);
     await ensureSchema(credential, operations);
     const schemaAccount = await operations.fetchSchema(ctx.rpc, schemaAddress, READ_CONFIG);
-    const existing = await operations.fetchMaybeAttestation(ctx.rpc, attestationPda, READ_CONFIG);
+    assertSchemaAccount(schemaAccount, credential);
+    if (schemaAccount.data.isPaused) throw new Error("claim verdict schema is paused");
+    let targetPda = attestationPda;
+    let targetNonce = nonce;
+    let existing = await operations.fetchMaybeAttestation(ctx.rpc, targetPda, READ_CONFIG);
+    const legacyNonce = legacyVerdictNonce(record.claimId, record.paperId, record.reviewer);
+    if (!existing.exists && legacyNonce !== nonce) {
+      const [legacyPda] = await deriveAttestationPda({ credential, schema: schemaAddress, nonce: legacyNonce });
+      const legacy = await operations.fetchMaybeAttestation(ctx.rpc, legacyPda, READ_CONFIG);
+      if (legacy.exists) {
+        assertAttestationAccount(legacy, credential, schemaAddress, ctx.authority.address);
+        const oldRecord = dataObjectToRecord(deserializeAttestationData<Record<string, unknown>>(
+          schemaAccount.data, Uint8Array.from(legacy.data.data),
+        ));
+        if (oldRecord.claimId === record.claimId && oldRecord.paperId === record.paperId
+            && oldRecord.reviewer === record.reviewer) {
+          targetPda = legacyPda;
+          targetNonce = legacyNonce;
+          existing = legacy;
+        }
+      }
+    }
     const instructions: Instruction[] = [];
     if (existing.exists) {
+      assertAttestationAccount(existing, credential, schemaAddress, ctx.authority.address);
+      if (existing.data.nonce !== targetNonce) throw new AttestationConflictError("persisted nonce mismatch");
       const existingRecord = dataObjectToRecord(
         deserializeAttestationData<Record<string, unknown>>(schemaAccount.data, Uint8Array.from(existing.data.data))
       );
+      if (existingRecord.claimId !== record.claimId || existingRecord.paperId !== record.paperId
+          || existingRecord.reviewer !== record.reviewer) {
+        throw new AttestationConflictError("persisted attestation identity does not match nonce");
+      }
       const existingIssuedAt = parseIssuedAtTimestamp(existingRecord.issuedAt);
       if (!Number.isFinite(existingIssuedAt)) {
         throw new AttestationConflictError("persisted issued_at is malformed; refusing to replace attestation");
       }
       if (sameRecord(existingRecord, record)) {
-        return { pda: attestationPda, signature: null, reused: true };
+        return { pda: targetPda, signature: null, reused: true };
       }
       if (issuedAt <= existingIssuedAt) {
         throw new AttestationConflictError("verdict is older than or conflicts with the current attestation");
@@ -392,7 +466,7 @@ export async function attestVerdict(record: AttestationRecord, operations = chai
         payer: ctx.authority,
         authority: ctx.authority,
         credential,
-        attestation: attestationPda,
+        attestation: targetPda,
       }));
     }
     instructions.push(getCreateAttestationInstruction({
@@ -400,13 +474,13 @@ export async function attestVerdict(record: AttestationRecord, operations = chai
       authority: ctx.authority,
       credential,
       schema: schemaAddress,
-      attestation: attestationPda,
-      nonce,
+      attestation: targetPda,
+      nonce: targetNonce,
       data: serializeAttestationData(schemaAccount.data, recordToDataObject(record)),
       expiry: 0n,
     }));
     const signature = await operations.sendInstructions(ctx, instructions);
-    return { pda: attestationPda, signature, reused: false };
+    return { pda: targetPda, signature, reused: false };
   });
 }
 
@@ -417,11 +491,18 @@ export async function getAttestation(pda: Address, operations = chainOperations)
   const credential = await deriveCredentialAddress(ctx.authority.address);
   const schemaAddress = await deriveSchemaAddress(credential);
   const schemaAccount = await operations.fetchSchema(ctx.rpc, schemaAddress, READ_CONFIG);
+  assertSchemaAccount(schemaAccount, credential);
+  assertAttestationAccount(maybe, credential, schemaAddress, ctx.authority.address);
   const decoded = deserializeAttestationData<Record<string, unknown>>(
     schemaAccount.data,
     Uint8Array.from(maybe.data.data)
   );
-  return dataObjectToRecord(decoded);
+  const record = dataObjectToRecord(decoded);
+  if (maybe.data.nonce !== deriveVerdictNonce(record.claimId, record.paperId, record.reviewer)
+      && maybe.data.nonce !== legacyVerdictNonce(record.claimId, record.paperId, record.reviewer)) {
+    throw new Error("attestation record does not match nonce");
+  }
+  return record;
 }
 
 export function explorerUrl(kind: "tx" | "address", value: string): string {

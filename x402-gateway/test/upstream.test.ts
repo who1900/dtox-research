@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { loadConfig } from "../src/config.js";
 import { createResearchUpstream, decodeUpstreamResult, UpstreamToolError } from "../src/upstream.js";
 import { offlineGateway, payload, textResult } from "./offline.js";
@@ -37,12 +38,13 @@ test("upstream protocol errors preserve JSON statuses and rate limit diagnostics
   }
 });
 
-test("upstream all-failed versus partial signed batches and empty batches", () => {
+test("upstream distinguishes rejected, partial and malformed empty signed batches", () => {
   const failed = { results: [{ status: 400 }, { status: 503 }] };
   assert.throws(() => decodeUpstreamResult("record_signed_verdict", textResult(failed)), UpstreamToolError);
-  for (const body of [{ results: [{ status: 200 }, { status: 400 }] }, { results: [] }]) {
+  for (const body of [{ results: [{ status: 200 }, { status: 400 }] }, { results: [{ status: 204 }] }]) {
     assert.deepEqual(decodeUpstreamResult("record_signed_verdict", textResult(body)), body);
   }
+  assert.throws(() => decodeUpstreamResult("record_signed_verdict", textResult({ results: [] })), /malformed signed/);
 });
 
 test("only transient reads retry once; signed writes and preparation never autoretry", async () => {
@@ -51,7 +53,7 @@ test("only transient reads retry once; signed writes and preparation never autor
     let closes = 0;
     const api = createResearchUpstream(loadConfig({}), () => ({
       connect: async () => {}, close: async () => { closes++; },
-      callTool: async () => { attempts++; throw new Error("request timeout"); }
+      callTool: async () => { attempts++; throw new McpError(ErrorCode.RequestTimeout, "request timeout"); }
     } as unknown as Pick<Client, "connect" | "callTool" | "close">));
     await assert.rejects(api[operation]({ query: "fixture" }), /timeout/);
     const expected = operation === "search" || operation === "bundle" ? 2 : 1;
