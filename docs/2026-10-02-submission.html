@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>dtox research | Crypto World's Fair | 2026-10-02</title>
+<style>
+:root { --base:#fafaf3; --ink:#1a1a1a; --wash:color-mix(in srgb, var(--ink) 5%, var(--base)); --space:24px; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--base); color:var(--ink); font-family:Inter,Arial,sans-serif; line-height:1.6; }
+main { max-width:1120px; margin:auto; padding:64px var(--space) 96px; }
+header { max-width:880px; padding-bottom:64px; }
+h1 { font-size:clamp(40px,7vw,88px); line-height:1; letter-spacing:-.055em; font-weight:600; margin:24px 0 32px; }
+h2 { font-size:26px; letter-spacing:-.035em; line-height:1.2; margin:0 0 24px; }
+p { max-width:72ch; margin:0 0 20px; }
+.meta, label, code, pre, dt, footer { font-family:"Roboto Mono",Consolas,monospace; }
+.meta { font-size:12px; letter-spacing:.04em; }
+section { margin-bottom:64px; }
+a { color:inherit; text-underline-offset:4px; overflow-wrap:anywhere; }
+nav { display:flex; gap:24px; flex-wrap:wrap; margin-top:24px; }
+nav a { min-height:40px; padding:8px 0; }
+a:focus-visible, textarea:focus-visible { outline:2px solid var(--ink); outline-offset:4px; }
+label { display:block; font-size:13px; margin-bottom:12px; }
+textarea { display:block; width:100%; padding:24px; border:0; border-radius:0; resize:vertical; background:var(--wash); color:var(--ink); font:16px/1.65 Inter,Arial,sans-serif; }
+pre { padding:24px; background:var(--ink); color:var(--base); font-size:13px; overflow:auto; }
+code { font-size:.9em; overflow-wrap:anywhere; }
+.grid { display:grid; grid-template-columns:1fr; gap:40px; }
+.grid section { margin:0; }
+dl { display:grid; grid-template-columns:1fr 1fr; gap:24px; margin:0; }
+dt { font-size:12px; }
+dd { margin:8px 0 0; font-size:clamp(20px,4vw,32px); letter-spacing:-.04em; }
+.note { padding:24px; background:var(--wash); }
+.note p:last-child { margin-bottom:0; }
+ul { padding-left:20px; max-width:75ch; }
+li { margin-bottom:12px; }
+footer { margin-top:64px; font-size:12px; }
+@media (min-width:768px) { :root { --space:48px; } .grid { grid-template-columns:1fr 1fr; } }
+@media print { main { padding:24px; } textarea { height:500px; resize:none; } section { break-inside:avoid; margin-bottom:32px; } }
+</style>
+</head>
+<body>
+<main>
+<header>
+<p class="meta">DTOX RESEARCH / APPLICATION DRAFT / 2026-10-02</p>
+<h1>Read the mechanism.<br>Keep the evidence.</h1>
+<p>Web3 research for execution agents: source equations, protocol limitations and traceable signed readings through MCP.</p>
+<p class="meta">FREE PUBLIC BETA / SCOPED FIXES DEPLOYED / BOUNDED PUBLIC READ VERIFIED</p>
+<nav aria-label="Application links">
+<a href="https://read.whoim.space/research/">Try the research service</a>
+<a href="https://github.com/who1900/dtox-research">Public code</a>
+<a href="https://colosseum.com/worldsfair">Current competition</a>
+</nav>
+</header>
+
+<section aria-labelledby="copy-title">
+<h2 id="copy-title">Application text</h2>
+<label for="application">Description. Select this text and copy; the field is read-only.</label>
+<textarea id="application" readonly rows="19" spellcheck="false">A cross-chain execution agent needs source equations and stated constraints before its builders choose a transaction path or account architecture. dtox is a Web3-first evidence interface over research papers, protocol specifications and technical whitepapers.
+
+The verified demo retrieves the MEV auction model from Quantifying Blockchain Extractable Value: How dark is the forest? and the security considerations of ERC-4337. One is original LaTeX; the other is specification text. Both retain source links and record-specific provenance. These are retrieved objects, not generated security advice. The pair does not prove that execution assumptions are identical across chains.
+
+Thirteen public MCP tools support discovery, section reading, structured equations/algorithms and character-budgeted research bundles. Dense retrieval, BM25 and citation traversal support discovery, but candidates are not automatically confirmed prior art. Public MCP access is free beta with no key or signup.
+
+Solana adds optional x402 payment experiments and wallet-signed readings anchored through the Solana Attestation Service. Historical devnet records demonstrate settlement and attribution. They are team-controlled, concern different claims, and are not independent votes. Signatures prove signers, not scientific consensus. Registry settlement requires trusted model diversity. Base, Ethereum and Arbitrum have configured testnet support, not demonstrated paid E2Es.
+
+Designed for Web3 developer teams and agent frameworks. Optional usage credits, team integrations and deeper evidence workflows are proposed business models, not live exclusive paid tiers or proven revenue. The free beta remains available. External traction and pilot feedback are not claimed.
+
+The platform predates the contest. Earlier pipeline, API, read tools and shadow payments are disclosed separately from contest-period retrieval improvements, Solana devnet integrations, corpus work and the October 2 verified Web3 demo. October 2 bounded hardening checks passed: 47 attestor and 19 targeted API tests, plus TypeScript check and attestor build. Scoped fixes are deployed with attestor/API health HTTP 200 and a passing free bounded public read-smoke.</textarea>
+</section>
+
+<section aria-labelledby="evidence-title">
+<h2 id="evidence-title">A verified Web3 reading pair</h2>
+<p><a href="https://arxiv.org/abs/2101.05511">arXiv 2101.05511</a> ranks first for the exact paper query. October 2 response: 2021 IEEE S&amp;P, 364 citations, full text, acquisition <code>latex</code>, extraction <code>latex_source</code>, <code>exact_latex=true</code>.</p>
+<pre>find_papers(query="Quantifying Blockchain Extractable Value", layer="web3", limit=3)
+get_code_or_math_spec(arxiv_id="2101.05511", target_elements="equation,algorithm", max_chars=5500)
+read_paper_section(paper_id="eip:4337", section_type="limitations", max_chars=3500)</pre>
+<p>The math call returns 7/7 objects: six equations and one algorithm, 2,211 characters, not truncated. The demo focuses on the BEV auction model, not attack implementation.</p>
+<p><a href="https://eips.ethereum.org/EIPS/eip-4337">ERC-4337</a> returns 1,205 characters of CC0 Markdown constraints; <code>exact_latex=false</code>. These are spec-authored security considerations, not generated advice.</p>
+<p>Original LaTeX can be exact. PDF reconstruction is not exact original LaTeX. Full text is per record; abstract fallbacks and some IACR open-access twin recovery remain. No universal response-snapshot claim.</p>
+</section>
+
+<section aria-labelledby="stats-title">
+<h2 id="stats-title">Corpus, not traction</h2>
+<p class="meta"><a href="https://read.whoim.space/research/stats.json">STATS SNAPSHOT</a> / 2026-10-02T14:00Z</p>
+<dl>
+<div><dt>Documents</dt><dd>180,101</dd></div>
+<div><dt>Structural chunks</dt><dd>10,735,072</dd></div>
+<div><dt>Citation edges</dt><dd>3,377,328</dd></div>
+<div><dt>Web3 documents</dt><dd>17,243</dd></div>
+</dl>
+<p style="margin-top:24px">Four layers: Web3, AI agents, LLMs/small language models and builder-tech. Thirteen public MCP tools, including <code>get_research_bundle</code>. Bundles are read packets, not verdicts.</p>
+</section>
+
+<section class="grid" aria-label="Security and business">
+<section aria-labelledby="security-title">
+<h2 id="security-title">Signer is not consensus</h2>
+<p>The local registry policy requires decisive quorum and two distinct server-established trusted models. Wallet-only agreement stays pending; one-model agreement is <code>agreed_same_model</code>; opposing readings are <code>contested</code>. Client-declared model names do not count. One wallet signature cannot itself establish confirmed prior art.</p>
+<p>Hardening now rejects stale/conflicting equal-time updates with HTTP 409, preserves the original transaction on exact retries and authenticates signers before consuming quota. Health/lookup are read-only. Same-PDA process locks cover one attestor instance only; SQLite cache updates are conditional and monotonic, with 409 propagation. Negative section offsets return 422. <a href="2026-10-02-registry-hardening.html">Local hardening follow-up</a>.</p>
+<p>x402 may return a <code>payment_required</code> MCP challenge inside HTTP 200. A challenge is not settlement. Solana devnet has historical evidence; other chains have configured testnet support only.</p>
+</section>
+<section aria-labelledby="business-title">
+<h2 id="business-title">Business proposal</h2>
+<p>Designed for Web3 developer teams and agent frameworks. Proposed distribution: open-source MCP integrations and reproducible research examples. Explore optional heavier-workload credits, team integrations and deeper evidence workflows.</p>
+<p>The public beta stays free. No live exclusive paid tiers, external users, revenue, pilot feedback or competitor-exclusivity claim is asserted.</p>
+</section>
+</section>
+
+<section class="note" aria-labelledby="history-title">
+<h2 id="history-title">Historical evidence, clearly separated</h2>
+<p>September 29, team-controlled, Solana devnet: <a href="https://explorer.solana.com/address/729nUikYt2SUJaq1Brx2YwXvgLT5J1eVp9sfo31ncswu?cluster=devnet">GRPO attestation</a>, <a href="https://explorer.solana.com/address/6pC4NS96euD9G7jPtjvXbVs1ffaWAjKdJMkX799Mq6eL?cluster=devnet">R1-Zero attestation</a>, <a href="https://explorer.solana.com/tx/5DWkk85AFVHSTCqeSEbq8SpxEAtfkSRgQZLPJy9ZyCnTvZczsyD86yKELGWf5xYrDrF5wTvt3txUL19NFLYmrBvG?cluster=devnet">x402 settlement</a>. Different claims, not independent votes or fresh Web3 transactions.</p>
+<p>September 28 held-out citation-context evaluation, 334 queries: hit@3 0.377 / hit@10 0.458. Latest bounded Web3 probe: 7/9 informative only, not a release benchmark. No fresh 17/17 claim.</p>
+<p>Historical pre-hardening report dated October 2: 497 API + 11 MCP + 40 eval + 27 attestor + 15 gateway passes, one skip. Main independently verified new bounded checks: attestor 47/47 in 2.4 seconds; 19 targeted API tests in 1.65 seconds with three pre-existing DeprecationWarnings; <code>tsc --noEmit</code> and attestor build passed. These are not a fresh full-suite run. Scoped deployment is verified: attestor service active/health HTTP 200; API <code>py_compile</code>, restart and health HTTP 200 passed. Pipeline/MCP remain active; pipeline/Qdrant were not restarted. The free bounded public read-smoke passed.</p>
+<p>Smoke: <code>get_research_bundle(query="EIP-4337", layer="web3", limit=1, max_chars=2000, strict=true)</code> returned actual spec/code/Security Considerations. Flags: <code>isError=false</code>, <code>generated=false</code>, <code>search_partial=false</code>, <code>warnings=[]</code>. Expected <code>partial=true</code>: budget-clipped prose/code and no equation/algorithm/table objects in the retrieved chunks. Healthy public read path, not complete parsing.</p>
+<p>Live negative-offset validation: <code>read_paper_section(paper_id="eip:4337", section_type="limitations", offset=-1, max_chars=500)</code> returned <code>{"error":"research API error (status422)"}</code> with MCP <code>isError=false</code>. The error payload is a validation rejection, not a successful read or transport <code>isError=true</code>. Four checked source hashes matched HEAD before edits: <code>message.ts</code>, <code>server.ts</code>, <code>sas.ts</code>, <code>api/main.py</code>.</p>
+</section>
+
+<section aria-labelledby="disclosure-title">
+<h2 id="disclosure-title">Development disclosure</h2>
+<p>Before September 14: ingestion/quality/chunking/embedding/citation pipeline, REST API, MCP reads, API-identity registry and shadow-mode x402 without settlement.</p>
+<p>During the contest: signed verdict/SAS integration and historical devnet settlement; hierarchical retrieval, lexical/citation channels and twin merging; corpus repairs and builder-tech; exploration tools and bounded bundles. October 2 adds this verified Web3 demo, submission revision and bounded attestor/API hardening checks. Scoped fixes are deployed and the free public read-smoke passed. See the <a href="https://github.com/who1900/dtox-research/commits/main">development history</a>.</p>
+</section>
+
+<section aria-labelledby="submit-title">
+<h2 id="submit-title">Submission gate</h2>
+<p>Contest: September 14 to October 12, 2026. Deadline: October 12 at 23:59 PT, or October 13 at 11:59 Asia/Qyzylorda. <a href="https://colosseum.com/legal/Crypto%20World%27s%20Fair%20Hackathon%20Rules.pdf">Official rules</a>.</p>
+<p><a href="https://colosseum.com/hackathon">Official FAQ</a>: separate English presentation (2-3 minutes) and demo (at most 3 minutes). Both local MP4 previews are completed in the existing project style; owner review and separately authorized upload are pending. No upload, form submission or public video URL is claimed or authorized. Judging is startup-focused; no percentage weights are asserted.</p>
+<p><a href="../presentation/video-2026-10-02/presentation-preview.mp4">Presentation preview</a>: 160.104667 seconds (2:40). <a href="../presentation/video-2026-10-02/presentation.srt">SRT</a> / <a href="../presentation/video-2026-10-02/presentation-contact-sheet.png">Contact sheet</a>.</p>
+<p><a href="../presentation/video-2026-10-02/demo-preview.mp4">Demo preview</a>: 168.896333 seconds (2:49). <a href="../presentation/video-2026-10-02/demo.srt">SRT</a> / <a href="../presentation/video-2026-10-02/demo-contact-sheet.png">Contact sheet</a>.</p>
+<p>Main independently verified both: 1920x1080, 24 fps, H.264, AAC 48 kHz mono. Technical and visual QA is complete for both previews: all 20 contact-sheet frames were visually inspected with no overflow; presentation provenance/history labels passed QA; audio mean -21 dB, max -2.5 dB, no clipping. Owner manual pronunciation and SRT timing review remains pending; owner approval is not inferred.</p>
+<ul>
+<li>TODO(owner): judge contact.</li>
+<li>TODO(owner): names, location, roles, background and founder-market fit.</li>
+<li>TODO(owner): registration, eligibility, prior-work/funding disclosure and authority to submit.</li>
+<li>TODO(owner): public presentation URL and separate demo URL after owner review and separately authorized upload. Local previews are linked above.</li>
+</ul>
+<p>Scoped fixes are deployed and the free bounded public read-smoke passed. Broader release approval and fresh paid E2E remain pending. No fresh consensus, external formal review or mainnet readiness is claimed.</p>
+</section>
+
+<section aria-labelledby="install-title">
+<h2 id="install-title">Try the free beta</h2>
+<p>Claude Code:</p>
+<pre>claude mcp add --transport http dtox https://read.whoim.space/mcp</pre>
+<p>Codex:</p>
+<pre>codex mcp add dtox --url https://read.whoim.space/mcp</pre>
+<p>Main verified installed Codex CLI help accepts <code>NAME --url URL</code>; no client configuration was changed. Other MCP clients:</p>
+<pre>{"type":"http","url":"https://read.whoim.space/mcp"}</pre>
+<p>Public reads require no payment or wallet. Optional payment experimentation: <a href="https://read.whoim.space/x402/mcp">x402 MCP</a>. Code license: AGPL-3.0. Mainnet readiness is not claimed.</p>
+</section>
+<footer>LOCAL APPLICATION COPY / TWO LOCAL PREVIEWS CREATED / OWNER REVIEW AND UPLOAD PENDING<br>Source documents: SUBMISSION.md, DEMO_SCRIPT.md, docs/2026-10-02-web3-demo.md</footer>
+</main>
+</body>
+</html>

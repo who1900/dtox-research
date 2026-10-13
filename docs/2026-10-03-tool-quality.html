@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tool quality: 2026-10-03</title>
+  <style>
+    :root { color-scheme: light; --paper: #fafaf3; --ink: #1a1a1a; --muted: #68685f; --soft: #eeeee5; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.55 Inter, Arial, sans-serif; }
+    main { max-width: 940px; margin: 0 auto; padding: 72px 36px 96px; }
+    .meta, code, th { font-family: "Roboto Mono", Consolas, monospace; }
+    .meta { color: var(--muted); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
+    h1 { max-width: 720px; margin: 24px 0; font-size: clamp(40px, 7vw, 72px); line-height: .98; letter-spacing: -.055em; }
+    h2 { margin: 52px 0 16px; font-size: 24px; letter-spacing: -.03em; }
+    p { max-width: 780px; }
+    .summary { padding: 24px; background: var(--soft); font-size: 19px; }
+    .score { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 24px 0; }
+    .score div { padding: 16px; background: var(--soft); }
+    .score strong { display: block; font-size: 24px; }
+    .score span, .note { color: var(--muted); font-size: 13px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 11px 12px; text-align: left; vertical-align: top; background: var(--soft); }
+    tr + tr td { border-top: 5px solid var(--paper); }
+    th { font-size: 11px; font-weight: 500; letter-spacing: .05em; text-transform: uppercase; }
+    code { overflow-wrap: anywhere; font-size: .9em; }
+    footer { margin-top: 64px; padding-top: 14px; color: var(--muted); font: 11px "Roboto Mono", Consolas, monospace; }
+    @media (max-width: 640px) { main { padding: 40px 20px 64px; } .score { grid-template-columns: repeat(2, 1fr); } table { font-size: 12px; } th, td { padding: 8px; } }
+  </style>
+</head>
+<body>
+<main>
+  <div class="meta">Quality review / 03 Oct 2026 / pre-fix and post-fix evidence</div>
+  <h1>Полезный поиск.<br>Нужна точность.</h1>
+  <p class="summary">Общая экспертная оценка: <strong>7/10</strong>, не объективный benchmark. Хорошее извлечение и bounded-надежность выборки; discovery теряет часть описательных целей, а audit до исправления не связал claim с уже известным материалом.</p>
+
+  <div class="score">
+    <div><strong>9/10</strong><span>Извлечение</span></div>
+    <div><strong>7/10</strong><span>Discovery</span></div>
+    <div><strong>6/10</strong><span>Audit до исправления</span></div>
+    <div><strong>8/10</strong><span>Bounded reliability</span></div>
+  </div>
+  <p class="note">Оценки: экспертное суждение по переданным данным, не независимый benchmark. 8/10 не означает production certificate.</p>
+
+  <h2>Discovery / 10 live-запросов</h2>
+  <table>
+    <thead><tr><th>Запрос → цель</th><th>Наблюдение</th></tr></thead>
+    <tbody>
+      <tr><td>ERC-20 → EIP-20</td><td>Найден, rank 1</td></tr>
+      <tr><td>ERC-4337 → EIP-4337</td><td>Найден, rank 1</td></tr>
+      <tr><td>EIP-7702 → EIP-7702</td><td>Не в top 10</td></tr>
+      <tr><td>Oracle / Chainlink claim → WP Chainlink v2</td><td>Не в top 10</td></tr>
+      <tr><td>HotStuff → canonical 1803.05069</td><td>OA:W2964159515, rank 3; тот же paper, canonical twin засчитан</td></tr>
+      <tr><td>Durable Solana nonce</td><td>Два документа, ranks 1 и 2</td></tr>
+      <tr><td>Reflexion → arXiv 2303.11366</td><td>Найден, rank 1</td></tr>
+      <tr><td>Generative Agents → arXiv 2304.03442</td><td>Не в top 10</td></tr>
+      <tr><td>Entropy / attention variance → D2O, MEDA, CAKE</td><td>D2O и CAKE не найдены; MEDA alias acl:2025.naacl-long.125 на rank 7</td></tr>
+      <tr><td>Builder / Slither → 1908.09878</td><td>Найден, rank 3</td></tr>
+    </tbody>
+  </table>
+  <p><strong>Итог:</strong> hit@3 6/10, hit@10 7/10, MRR@10 0.481; 0 ошибок, 0 partial. Canonical twin даёт credit только при подтверждённом совпадении paper. При попарной оценке: 8 попаданий из 13 expected target-paper pairs; это другая метрика.</p>
+  <p>Поиск занял 4.484-7.934 с с учётом MCP overhead. Health sample n=24: API p50 1.476 с, p95 10.587 с. Ни один показатель не является стресс-SLO.</p>
+
+  <h2>Извлечение</h2>
+  <ul>
+    <li>MEV, arXiv 2101.05511 (2021): 7/7 объектов, 1 алгоритм, 6 уравнений, 2211 символов, <code>exact_latex=true</code> обозначает source-native marker, не независимую byte-for-byte проверку upstream, <code>has_BEVAuctionModel</code>, 3.507 с.</li>
+    <li>D2O: 12/39 уравнений, 2944/3000 символов, <code>truncated=true</code>, 3.469 с.</li>
+    <li>ERC-4337 limitations: 1205 символов, <code>exact_latex=false</code>; central trust point warning уже присутствовал, 3.047 с.</li>
+    <li>Strict bundle: 2000 фактических/объявленных символов; <code>generated=false</code>, <code>search_partial=false</code>, <code>partial=true</code>, 6.806 с.</li>
+    <li>Perovskite и CRISPR вне индекса отклонены (<code>in_scope=false</code>, <code>out_of_index_scope</code>), 7.085 с и 5.931 с.</li>
+  </ul>
+
+  <h2>Audit до исправления</h2>
+  <p>Идея: <code>ERC-4337 EntryPoint security design for an execution agent</code>. Claim: <code>ERC-4337 EntryPoint is a central trust point whose implementation concentrates account abstraction security risks</code>. Deep audit: 12.939 с, <code>weak_signal_only</code>, best score 0.765, evidence пустой. Однако этот central-trust-point warning уже был в <code>known_limitations</code>: это не новое обнаружение источника. Переданная причина: ветка <code>_topFalse</code> пропускает обычную exact injection.</p>
+  <p>Отрицательный пример: claim «ERC-4337 EntryPoint prevents every possible DoS» получил verdict <code>readings_reported_on_similar_claim</code>. Существующий <code>does_not_assert</code> относится к похожему вопросу, в котором читатель использует один кошелёк. Это не тот же claim; новых записей в реестр не добавляли.</p>
+
+  <h2>Исправление и следующий шаг</h2>
+  <p>План: ограниченная hydration названных caller источников, отдельный score для исходного claim, список <code>named_sources</code>. Это повышает inspectability, но не доказывает claim.</p>
+  <div class="summary"><strong>Post-fix live проверка завершена.</strong><br><code>main.py</code> deployed на Contabo, source-only hash <code>e2d81bb1e1492368c9e9a558a0046abf5fbef8b4d76375dc36ae830f9a6bf6b2</code>; API/MCP active, health ok. Source backup создан, DB/services без изменений. Полный набор: 540 passed, 1 skipped, запуск агента-кодера Luna. Focused pytest запущен ведущим: 9 passed, 2 subtests, 1.07 с, 3 существующих предупреждения deprecation/cache permissions.</div>
+  <p>Полный ERC-4337 audit после исправления: 15.558 с, verdict остался <code>weak_signal_only</code>, best 0.765, evidence пустой. <code>named_sources</code> отдельно показывает явно названный источник EIP-4337, score 0.755, band weak, <code>verification_required=true</code>; <code>ordinary_claim_retrieval</code> уже нашёл тот же источник. Источник: <a href="https://eips.ethereum.org/EIPS/eip-4337">EIP-4337</a>; получен фрагмент секции Security Considerations и provenance <code>fulltext=true</code>, не новый markdown full text. Relevant known limits присутствовали до исправления и после остались <code>[eip4337, eip7521, eip7887]</code>. Hydration пережила evidence cut, однако claim не подтверждён.</p>
+  <p>Fast audit: 6.773 с, verdict и named source те же. Это inspectability, не доказательство claim.</p>
+  <p>Негативный claim «prevents every possible DoS»: 16.131 с, verdict <code>readings_reported_on_similar_claim</code>, claim не подтверждён, <code>verification_required=true</code>. Существующий <code>does_not_assert</code> относится к похожему вопросу, в котором читатель использует один кошелёк. Новых записей в реестр не добавляли.</p>
+  <p>Три коротких post-fix ordinary search regression: ERC-4337, nonce, Reflexion вернули ожидаемые цели на rank 1; 0 ошибок, 0 partial; 3.979 с, 2.252 с, 3.433 с. До исправления все также были rank 1. В этом узком наборе ухудшения не найдено, это не оценка всего инструмента и не SLO.</p>
+  <p>Focused pytest запущен ведущим: 9 passed, 2 subtests, 1.07 с, 3 существующих предупреждения deprecation/cache permissions. Полный набор: 540 passed, 1 skipped, запуск агента-кодера Luna. Полный audit до 12.939 с и после 15.558 с измерялся по одному разу, это не статистическое доказательство замедления либо отсутствия регрессии.</p>
+  <div class="summary"><strong>Readonly registry counts совпадают до и после:</strong><br><code>claim_nodes=54</code>, <code>claim_judgments=16</code>, <code>claim_links=2</code>. В этом проходе новых verdicts, links или nodes не создано. API/MCP active, source hash совпадает, health ok.</div>
+  <p>Наблюдение корпуса, 2026-10-03 14:03:46 UTC: 180 182 done, web3: 17 253, agents 18 645, llms 148 598, builder 16 398. Категории перекрываются и не суммируются как уникальные записи.</p>
+  <p>Приоритет: описательные discovery-запросы и claims без известных ID, не просто увеличение числа источников или ingestion. Hackathon submission не нужно блокировать ожиданием полного восстановления; production claims требуют durability proof. Общая оценка остаётся 7/10 по экспертному суждению, не benchmark и не production certificate. Позиционирование: free beta + devnet hackathon demo.</p>
+
+  <h2>Границы оценки</h2>
+  <p>Это quality review по переданным наблюдениям, не полный Solana security audit, не новый payment pen test, не mainnet sign-off и не proof of durability. Никаких выводов о восстановлении платежей или mainnet готовности.</p>
+  <footer>TOOL QUALITY / PRE-FIX AND POST-FIX REVIEW / 2026-10-03</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Архитектурные исправления: 2026-10-06</title>
+  <style>
+    :root { color-scheme: light; --paper: #fafaf3; --ink: #1a1a1a; --muted: #595950; --wash: #eeeee5; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 17px/1.65 Inter, "Segoe UI", sans-serif; }
+    main { width: min(960px, calc(100% - 40px)); margin: 0 auto; padding: 64px 0 96px; }
+    h1 { margin: 12px 0 24px; font-size: clamp(32px, 5vw, 52px); line-height: 1.08; letter-spacing: -.04em; }
+    h2 { margin: 44px 0 16px; font-size: 25px; line-height: 1.25; letter-spacing: -.025em; }
+    p, li { max-width: 82ch; }
+    .meta, code { font-family: "Roboto Mono", Consolas, monospace; }
+    .meta { color: var(--muted); font-size: 12px; letter-spacing: .06em; }
+    code { font-size: .9em; overflow-wrap: anywhere; }
+    .notice { padding: 20px 24px; background: var(--wash); box-shadow: 0 8px 24px rgb(27 28 24 / 4%); }
+    ul { padding-left: 1.3em; }
+    li { margin: 10px 0; }
+    a { color: inherit; text-underline-offset: 3px; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 15px; }
+    th, td { padding: 14px 16px; text-align: left; vertical-align: top; }
+    thead { background: var(--wash); }
+    tbody tr:nth-child(even) { background: #f3f3eb; }
+    footer { margin-top: 44px; color: var(--muted); font-size: 14px; }
+    @media (max-width: 600px) { main { width: calc(100% - 28px); padding-top: 32px; } body { font-size: 16px; } }
+  </style>
+</head>
+<body>
+<main>
+    <div class="meta">DTOX RESEARCH / 2026-10-06 / LIMITED DEPLOYMENT</div>
+  <h1>Архитектурные исправления</h1>
+  <div class="notice">
+    <p>Ограниченный первый этап deployment выполнен guarded rollout и проверен read-only smoke. Это не завершённая архитектурная миграция. Корпус не объявлен восстановленным; production readiness не подтверждена.</p>
+    <p>Статусы и результаты являются переданными наблюдениями на момент проверок, а не новыми live-проверками при написании документа.</p>
+  </div>
+  <section>
+    <h2>Текущий статус и пауза</h2>
+    <ul>
+      <li>Production pipeline, API и MCP активны на проверенном deployed code; API health <code>status=ok</code>.</li>
+      <li>На проверке Qdrant: <code>green</code>, optimizer <code>ok</code>, <strong>10 910 862 points</strong>. Это число точек, не <code>paper_count</code> и не число полных статей.</li>
+      <li>Старый <code>reprocess.timer</code> остановлен <strong>и disabled</strong>.</li>
+      <li>Transient corpus worker остановлен; journals сохранены. Исторические записи о running worker больше не описывают текущий статус.</li>
+      <li>Recovery worker остановлен; его локальная замена в production не выкладывалась.</li>
+      <li>Полные сканы, corpus build и миграции для этих исправлений не запускались.</li>
+    </ul>
+  </section>
+  <section>
+    <h2>Что изменено локально</h2>
+    <p>В ограниченный rollout вошли parser/status, collector, canonical API-кандидат, FTS completion, reprocess fail-closed и общий document module (7 файлов, включая две идентичные копии модуля). Локальными остались x402 schema/retry changes и независимые recovery engine/planner/runner. Gateway runtime не менялся.</p>
+    <ul>
+      <li><strong>Parser P1:</strong> исправлены service failure/empty handling и extractor collector. Новая extractor policy не вводилась; это не доказательство восстановления ранее потерянного текста всего корпуса.</li>
+      <li><strong>Canonical collector/read:</strong> unsplit <code>section_sink</code> собирается в том же parser pass, без второго parse и per-chunk duplication. Default chunk output не изменён. Сохраняются повторяющиеся code/algorithm/formula и их whitespace; builder отвергает legacy split guessing. Manifest задаёт derived canonical section text в исходном порядке source, отдельно от per-point text и stable UUID. Чтение ограничено cache hash и gate <code>status=done</code>; parser не запускается в request path.</li>
+      <li><strong>x402:</strong> общие Zod-схемы платных tools задают единый источник MCP-контракта и generated discovery JSON Schema. Read retry классифицируется по structured error/status/cause; неизвестная ошибка не повторяется. Signed operations никогда не повторяются. Defaults, validation, compatibility, network/auth и цены платежей сохранены.</li>
+      <li><strong>FTS build:</strong> durable completed state отделён от стартового cursor. Страница, cursor и completion фиксируются одной SQLite-транзакцией, включая пустую финальную страницу. Legacy JSON <code>null</code> означает завершённый build; отсутствующий offset означает первый запуск. Завершённый повторный запуск не делает Qdrant calls/inserts; failed page не завершает build. Top-up сохранён. Это не решение глобальной UUID-уникальности legacy FTS.</li>
+      <li><strong>Recovery engine writer RETIRED:</strong> prepared/partial journals v1/v2 отвергаются до любых мутаций. Для <code>done</code> v1 разрешена только scoped read-only verification cache, Qdrant и receipt новых FTS rows. Результат явно сохраняет <code>legacy_fts_baseline_verified=false</code>: same-paper baseline proof остаётся pending. Глобальных FTS-сканов нет; receipt новых строк не доказывает legacy baseline или глобальную UUID-уникальность. Активного независимого writer нет; новый apply остаётся fail closed, не использует lexical fake proof и не возобновляет partial journals записью.</li>
+      <li><strong>Coverage:</strong> missing source/cache и unsupported inputs остаются uninspected/unresolved, не считаются resolved.</li>
+      <li><strong>Reprocess RETIRED/read-only:</strong> retirement из-за дефекта доступа при <code>status=done</code> проверен. <code>--apply</code> возвращает exit code 2 до открытия DB и reset, без изменений. Timer остановлен и disabled.</li>
+    </ul>
+  </section>
+  <section>
+    <h2>Проверки: отдельные, неаддитивные прогоны</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th scope="col">Контур</th><th scope="col">Переданный результат</th><th scope="col">Граница подтверждения</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">x402</th><td>46 tests PASS; build PASS</td><td>Main независимо подтвердил результат</td></tr>
+          <tr><th scope="row">Native pipeline</th><td>115 tests PASS; 20.893 s</td><td>Включая FIFO</td></tr>
+          <tr><th scope="row">Native ops</th><td>112 tests PASS; 18.720 s</td><td>Planner / reprocess / engine / runner</td></tr>
+          <tr><th scope="row">Native API candidate</th><td>8/8 tests PASS; 0.427 s</td><td>Три функции, с PROD modules</td></tr>
+          <tr><th scope="row">Main local</th><td>120 tests PASS; 14.476 s</td><td>Включая canonical reader</td></tr>
+          <tr><th scope="row">Local pipeline</th><td>115 tests: 114 PASS + 1 Windows FIFO skip; 11.838 s</td><td>Skip не считается PASS; native FIFO проверен отдельно</td></tr>
+          <tr><th scope="row">MCP</th><td>36 tests PASS</td><td>Отдельный прогон</td></tr>
+          <tr><th scope="row">API selected</th><td>72 tests PASS</td><td>Выбранные тесты, не полный API suite</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Эти числа нельзя складывать: прогоны могут пересекаться и относятся к разным снимкам кода. Ранее переданные 26 parser/reprocess, 74 pipeline и 15 build safety PASS являются историческими отдельными прогонами, не прибавляются к новым результатам. При написании отчёта тесты и live/network-проверки не запускались.</p>
+  </section>
+  <section>
+    <h2>Ограниченный API-кандидат</h2>
+    <p>Prebuilt API-кандидат ограничен тремя функциями относительно hash-guarded production baseline <code>c7fc69</code>; переданный SHA-prefix кандидата <code>bff708...</code>. Такой кандидат сохраняет unrelated dirty local API, не копирует всю локальную версию. Native-проверка с PROD modules: <strong>8/8 PASS, 0.427 s</strong>. Первоначальный import failure был только environment-проблемой; после корректного stage <code>PYTHONPATH</code> прогон прошёл, без исправления кода ради этого сбоя.</p>
+    <p>Проверенный ограниченный API-кандидат выложен в <code>/opt/dtox-research-api/main.py</code>; unrelated dirty API changes не выкладывались. Private native test artifacts остаются в <code>/opt/dtox-architecture-20261006.JHtOTn</code>. Это не подтверждает всю локальную API-версию.</p>
+  </section>
+  <section>
+    <h2>Что ещё не исправлено</h2>
+    <ul>
+      <li><strong>Один publication owner:</strong> единый владелец публикации согласованных Qdrant/FTS/cache/metadata представлений ещё не реализован.</li>
+      <li><strong>Global FTS identity migration и same-paper baseline proof:</strong> exact indexed UUID identity для legacy/unmapped FTS и доказательство baseline той же статьи ещё не установлены. Миграция и сканы не запущены; retirement writer не решает эти задачи и не заменяет их receipt новых строк.</li>
+      <li><strong>Исторические missing inputs:</strong> нужны fresh acquisition и отдельная проверка; parser fix не создаёт отсутствующие source/cache.</li>
+      <li><strong>Search policy consolidation:</strong> единая production search policy и сведение накопленных веток остаются pending.</li>
+      <li><strong>Canonical whitepaper identity migration:</strong> каноническая source identity/provenance с совместимостью legacy alias остаётся pending.</li>
+    </ul>
+    <p>Фактическое будущее corpus recovery остаётся заблокированным до одного publication owner и exact mapping migration, без обхода full scan. Missing inputs требуют fresh acquisition. Сертификат научной полноты корпуса не получен.</p>
+  </section>
+  <section>
+    <h2>Deployment</h2>
+    <p class="notice"><strong>deployed: ограниченный первый этап</strong></p>
+    <p>История: первая попытка была отклонена auto-review до выполнения. После явного разрешения пользователя guarded rollout завершился успешно. Backup создан в <code>/opt/dtox-architecture-backups/20261006-20261006-135353-c8aa9708</code>; в нём проверены хэши 5 ранее существовавших code files. Это code-only backup, не полная копия БД. Все 7 целевых файлов имеют ожидаемые deployed hashes; 6 additive parse columns присутствуют. Перезапущены только <code>dtox-research</code> и <code>dtox-research-api</code>; MCP не перезапускался. Локальные x402 changes и ops recovery engine в production не выкладывались. Commit/push не выполнялись; secrets и payment runtime не менялись.</p>
+    <p>Bounded post-deploy smoke: три пары MCP до/после совпали по источникам, тексту и хэшам (EIP-4337 search; 347-символьная section; 7 фрагментов с уравнениями D2O из 39 доступных). Для исторического section order указано <code>verified=false</code> с явным legacy fallback. API health <code>ok</code>, все три unit активны, Qdrant <code>green</code>, optimizer <code>ok</code>, <strong>10 910 862 points</strong>. Все 14 стадий запущены, <code>NRestarts=0</code>. В <code>pipeline.log</code> (серверная зона CEST, UTC+02:00) после cutoff <code>2026-10-06 15:53:55</code> просмотрены 40 строк без ошибок/SQLite lock; прежние lock errors от <code>2026-10-06 11:12:59</code> не относятся к post-deploy окну. В journal API 18 строк, startup complete, ошибок нет.</p>
+    <p>Это короткий smoke, не полный SLO, performance improvement или сертификация всего корпуса. Единственная health выборка не доказывает улучшение производительности. Production <code>--apply</code> не запускался: команда была заблокирована до выполнения; native fail-closed tests остаются валидными. Никакого дополнительного разрешения для уже выполненного ограниченного этапа не требуется.</p>
+  </section>
+  <footer>
+    <p><a href="2026-10-06-corpus-prose-recovery.md">Corpus prose recovery</a> сохранён как исторический документ с новым superseded/current-pause banner. Его прежние test counts, pilot и running observations не являются подтверждением состояния текущего revised code или восстановленного корпуса.</p>
+    <p><a href="2026-10-06-architecture-fixes.md">Markdown-версия</a></p>
+  </footer>
+</main>
+</body>
+</html>

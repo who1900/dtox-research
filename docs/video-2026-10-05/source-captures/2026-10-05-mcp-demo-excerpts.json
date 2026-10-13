@@ -1,0 +1,103 @@
+{
+  "record_type": "Excerpt of actual read-only MCP responses, not a UI mockup",
+  "observed_at": "2026-10-05",
+  "calls": [
+    {
+      "tool": "get_code_or_math_spec",
+      "arguments": {
+        "arxiv_id": "2101.05511",
+        "target_elements": "equation",
+        "max_chars": 4500
+      },
+      "response_excerpt": {
+        "arxiv_id": "2101.05511",
+        "title": "Quantifying Blockchain Extractable Value: How dark is the forest?",
+        "url": "https://arxiv.org/abs/2101.05511",
+        "fulltext": true,
+        "completeness": "fulltext_acquired",
+        "returned": 6,
+        "available": 6,
+        "truncated": false,
+        "selected_section": {
+          "element_type": "equation",
+          "section_type": "other",
+          "section_title": "Incentive Compatibility of the Relay auction Participation",
+          "text": "\\begin{equation}\\label{eq:bidstrategy}\n    b_i^{\\text{PA}}(\\mathcal{O}, \\mathcal{S}_i)=\\frac{n-1}{n}\\mathcal{R}_i(\\mathcal{O})\n\\end{equation}",
+          "source_paper_id": "2101.05511",
+          "evidence": {
+            "acquisition_type": "latex",
+            "extraction_type": "latex_source",
+            "source_url": "https://arxiv.org/abs/2101.05511",
+            "source_url_origin": "payload",
+            "source_url_status": "source_not_verified",
+            "legacy_id_alias": null,
+            "provenance_missing": false,
+            "fulltext": true,
+            "completeness": "fulltext_acquired",
+            "section": {
+              "title": "Incentive Compatibility of the Relay auction Participation",
+              "type": "other"
+            },
+            "parse_completeness": "unknown",
+            "exact_latex": true,
+            "fragment_scope": "indexed_chunk",
+            "fragment_chars": 141,
+            "fragment_hash": "057efe1898df7487ae85d9a166c8e541f43dacdf529b89359d3ec80769eef4b9",
+            "source_paper_id": "2101.05511"
+          }
+        }
+      }
+    },
+    {
+      "tool": "read_paper_section",
+      "arguments": {
+        "paper_id": "2101.05511",
+        "section_title": "Incentive Compatibility of the Relay auction Participation",
+        "max_chars": 2200
+      },
+      "response_excerpt": {
+        "id": "2101.05511",
+        "url": "https://arxiv.org/abs/2101.05511",
+        "fulltext": true,
+        "quote": "independently drawn from the same uniform distribution, i.e.,",
+        "next_offset": 2200,
+        "total_chars": 3087,
+        "parse_completeness": "unknown"
+      },
+      "selection_note": "Short verbatim excerpt. MCP section response contained repeated prose and a truncated final equation."
+    },
+    {
+      "tool": "read_paper_section",
+      "arguments": {
+        "paper_id": "eip:4337",
+        "section_type": "limitations",
+        "max_chars": 1800
+      },
+      "response_excerpt": {
+        "id": "eip:4337",
+        "url": "https://eips.ethereum.org/EIPS/eip-4337",
+        "fulltext": true,
+        "license": {
+          "spdx": "CC0-1.0",
+          "terms": "Public domain dedication (Ethereum EIPs repository).",
+          "redistribution": "unrestricted"
+        },
+        "quote": "concentrating security risk in the `EntryPoint` contract",
+        "next_offset": null,
+        "total_chars": 1205,
+        "evidence": {
+          "acquisition_type": "spec-markdown",
+          "extraction_type": "markdown_source",
+          "fragment_hash": "335696d9c582a3285a719928621789cf8ce38438f51d39b8905ed124b0d0978a",
+          "parse_completeness": "unknown",
+          "source_url_status": "source_not_verified"
+        }
+      }
+    }
+  ],
+  "boundaries": [
+    "The BEV question shown in the deck is presenter framing, not a recorded end-to-end natural-language discovery query.",
+    "Source URL verified independently against official source pages; backend returned source_not_verified.",
+    "Source interpretation and developer consequence are labeled separately from retrieved text."
+  ]
+}

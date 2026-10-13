@@ -1,45 +1,53 @@
-# Pitch Q&A - concise, evidence-bounded answers
+# Jury Q&A - concise, evidence-bounded answers
 
 ### What is dtox?
 
-A Web3-focused research service for builders and AI agents. It connects papers and protocol specifications with searchable passages, citations, mathematical material where available, and visible source limitations.
+Dtox helps protocol teams check research before they build. It gives builders and agents a hosted, bounded way to inspect source-backed papers and protocol specifications, including equations and stated limitations where available.
 
-### What is the core difference from general academic search?
+### What is the concrete use case in this pitch?
 
-The product is centered on Web3 sources, including papers, EIPs/ERCs, and Solana SIMDs, and brings retrieved evidence, provenance, formulas when recoverable, and authors’ caveats into an agent-facing workflow. This is a positioning distinction, not a claim that any individual capability is unique.
+A protocol engineer choosing an auction rule asks what strategy a published relay-auction model derives and what assumptions it makes. Dtox retrieves the equation and related source text so the team can assess whether those assumptions fit its design. This example is not evidence that the model applies to every auction or to Solana.
+
+### What did the fresh BEV call establish, and what did it not?
+
+The MCP returned all six available equation objects from LaTeX source, including the bid-strategy equation, with `exact_latex=true` and no response truncation. However, `parse_completeness` is unknown and `source_url_status` is `source_not_verified`. The original paper was separately opened and manually checked. A related section response contained a duplicated paragraph/artifact and was truncated, so extraction is not presented as perfect.
+
+### Does dtox prove an auction design is sound?
+
+No. The paper assumes independently distributed rewards from a common uniform distribution, with participant count and distribution treated as prior knowledge. The engineer must decide whether that model fits the protocol. Retrieval supports that check; it does not prove applicability, correctness, or safety.
+
+### What does the EIP-4337 example say?
+
+The specification's Security Considerations describe the EntryPoint as a trust boundary where risk can concentrate. That is retrieved source text, not a dtox audit. A proposed review checklist or architecture implication is our engineering interpretation, not the specification authors' conclusion.
+
+### How does dtox compare with alternatives?
+
+Use the same three criteria: tool/source scope, evidence-reading features, and agent access. Elicit documents broad academic search, structured extraction/reports, and API/MCP access; Semantic Scholar exposes an academic graph API with metadata and citations; arxiv-mcp-server supports an arXiv paper library, Markdown and original-LaTeX section reads, citation-graph traversal, and local MCP. Dtox focuses on Web3 papers and protocol specs, indexed source objects/sections, and hosted MCP+REST. This is a capability comparison, not an accuracy, speed, coverage, or win-rate benchmark. MCP, LaTeX retrieval, and citation graphs are not exclusive to dtox.
 
 ### How large is the corpus?
 
-At 2026-10-05T10:00Z, the live counters were observed at 180,834 documents, including 17,365 Web3 records, 10,801,902 chunks, and 3,388,476 citation edges. This is an observation time, not a frozen or reproducible index version. Those are corpus inventory counters, not users, customers, or active usage. Full-text coverage is mixed.
+The repository README records an observation at 2026-10-05T10:00Z: 180,834 documents and 17,365 Web3-tagged records, plus chunk and citation-edge counters. This is not a fresh snapshot or reproducible index version; tags can overlap. Counts describe inventory, not users or traction, and do not mean every record has full text.
 
-### Can it reliably recover every paper’s full text or exact equations?
+### Is every result full text or exact LaTeX?
 
-No. Availability and extraction vary by source. A live check of one arXiv example returned 6/6 equations (1,245 characters, not truncated); Equation 4 matched the PDF. That does not guarantee exact recovery for every record, formula, or paraphrased query.
+No. Availability and extraction vary by source. The BEV call is one checked example. Its exact-LaTeX flag does not establish universal parsing completeness, and the related section response had a duplicate artifact and truncation. Other records can be abstract-only or have reconstructed rather than original math.
 
-### Does a match prove that an idea is correct or novel?
+### Is the service paid today?
 
-No. Retrieval identifies evidence to inspect; it is not a truth, safety, or novelty verdict. A missing match does not establish that no prior work exists, and patents are not covered as a patent corpus.
+The public beta offers 13 MCP tools with free research access. The same source bundle stays free. Optional paid transport or intensive usage is a business hypothesis, not exclusive sources, better evidence quality, a launched paid tier, or validated revenue.
 
-### Why not use Elicit, Semantic Scholar, or arXiv MCP tools?
+### What has been demonstrated on Solana?
 
-They provide overlapping research workflows, APIs, or MCP capabilities. dtox focuses its source mix on Web3 papers and protocol specifications, and aims to present evidence with citations, provenance, formulas where available, and author-stated limitations together. Comparative performance has not been established here.
+There are separate historical team-controlled devnet examples: an x402 USDC payment transaction and SAS wallet-attributed readings about different AI claims. They are not one joined event or an independent quorum. A signature attributes a record to a wallet; it does not establish truth, reviewer independence, or Sybil resistance. Base, Ethereum, and Arbitrum test-network configurations exist, but paid end-to-end settlement validation is pending.
 
-### Is MCP or LaTeX retrieval exclusive to dtox?
+### Who is building dtox?
 
-No. Both are available in other tools. The pitch is about the Web3-centered combination and workflow, not exclusive access to MCP or LaTeX.
+Daniyar Gabdullin is the solo founder. Public-repository proof points are the open-source hosted research beta and its documented Solana devnet demonstrations. No award, credential, external customer, or unverified CV claim is needed for this pitch.
 
-### Is this already a paid business?
+### Do you have pilot teams?
 
-The public MCP has 13 tools and free read access. Paid heavy-usage access is planned, not a launched commercial offer; pricing, willingness to pay, conversion, and revenue have not been validated.
+No participants are confirmed. The proposed pilot is 3 teams over 14 days, one real protocol decision per team. Each team would produce a task-cited design memo naming a source, an assumption, and an engineering consequence, then return with a second research question. The target is at least 2 of 3 teams completing both steps. This is a proposed validation target, not traction.
 
-### What has been proven on-chain?
+### Has dtox beaten competitors on a shared test?
 
-The demo includes historical Solana devnet evidence for a payment transaction and wallet-attributed SAS reading. A wallet signature attributes a record; it does not prove its truth or independent review. Base, Ethereum, and Arbitrum test-network configurations exist, while end-to-end payment validation remains pending. This is not a launched paid commercial service or a mainnet-readiness claim.
-
-### How many pilot customers or users do you have?
-
-Three pilot teams is a target, not a claim of signed pilots or validated traction. The corpus size should not be mistaken for users or customers.
-
-### Who is building it?
-
-Daniyar Gabdullin is the solo founder, a mobile/Web3 engineer with blockchain, dApp, and wallet QA experience.
+No. A shared 20-question comparison is proposed but not measured. The pitch makes no comparative accuracy or speed claim. Any test should use the same questions, sources, and scoring criteria for each tool.

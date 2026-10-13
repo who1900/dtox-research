@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <title>DTOX | Full tool test | 2026-10-02</title>
+  <style>
+    :root { color-scheme: light; --base: #fafaf3; --ink: #1a1a1a; --surface: #eeeee5; --muted: #55554e; --gap: 24px; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--base); color: var(--ink); font: 16px/1.65 Inter, Arial, sans-serif; }
+    main { max-width: 1120px; margin: auto; padding: 64px 24px; }
+    h1, h2, h3 { line-height: 1.15; letter-spacing: -.035em; }
+    h1 { max-width: 18ch; font-size: clamp(36px, 6vw, 64px); margin: 24px 0; }
+    h2 { font-size: 28px; margin: 0 0 var(--gap); }
+    h3 { font-size: 20px; margin: 0 0 12px; }
+    p { max-width: 74ch; margin: 12px 0; }
+    section { margin-top: 64px; }
+    .meta, code, th { font-family: "Roboto Mono", Consolas, monospace; }
+    .meta { font-size: 12px; letter-spacing: .035em; color: var(--muted); }
+    .note, .finding { padding: var(--gap); margin: var(--gap) 0; background: var(--surface); }
+    .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--gap); margin: 32px 0; }
+    .metric { padding: var(--gap); background: var(--surface); }
+    .metric strong { display: block; font-size: 36px; line-height: 1.2; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; text-align: left; }
+    caption { text-align: left; margin-bottom: 16px; color: var(--muted); }
+    th, td { padding: 12px 16px; vertical-align: top; }
+    th { background: var(--surface); font-size: 12px; }
+    tbody tr:nth-child(even) { background: #f2f2ea; }
+    code { font-size: .88em; overflow-wrap: anywhere; }
+    a { color: inherit; text-underline-offset: 4px; overflow-wrap: anywhere; }
+    a:focus-visible { outline: 3px solid var(--ink); outline-offset: 4px; }
+    .ci { display: inline-block; padding: 8px 0; min-height: 40px; }
+    ul { padding-left: 24px; } li { margin: 8px 0; }
+    footer { margin-top: 64px; color: var(--muted); }
+    @media (max-width: 600px) { main { padding: 32px 16px; } section { margin-top: 40px; } .metrics { grid-template-columns: 1fr; gap: 12px; } }
+    @media print { main { max-width: none; padding: 0; } .finding, .metric { break-inside: avoid; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <p class="meta">DTOX / QA REPORT / 2026-10-02 / HEAD 7e22e68</p>
+    <p class="meta">Report date: 2026-10-02, Asia/Qyzylorda. Main live snapshot date: 2026-10-01 UTC.</p>
+    <h1>Tool coverage.<br>Evidence boundaries.</h1>
+    <p><strong>Status: Completed bounded assessment; release not signed off.</strong> Results include verified local execution and supplied live observations. The only unrun read-only golden case is <code>mev-sequencer</code>; write-dependent <code>registry-survives-rewording</code> is skipped separately.</p>
+    <div class="metrics" aria-label="Local test totals">
+      <div class="metric"><strong>590</strong><span>Local tests passed</span></div>
+      <div class="metric"><strong>1</strong><span>Native POSIX-only skip</span></div>
+      <div class="metric"><strong>0</strong><span>Local test failures</span></div>
+    </div>
+    <p>Local results were executed by the testing sidecar. Live observations and CI status below were supplied by the main testing agent; they were not re-executed by this report author.</p>
+    <p><a class="ci" href="https://github.com/who1900/dtox-research/actions/runs/36922278149">GitHub CI run 36922278149: completed successfully at head 7e22e68</a></p>
+  </header>
+  <section aria-labelledby="local">
+    <h2 id="local">01 / Local verification</h2>
+    <div class="table-wrap">
+      <table>
+        <caption>Final ordinary unittest run, with no guards or substitute skips.</caption>
+        <thead><tr><th scope="col">Suite</th><th scope="col">Passed</th><th scope="col">Skipped</th><th scope="col">Failures / errors</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">API unittest</th><td>497</td><td>1</td><td>0</td></tr>
+          <tr><th scope="row">MCP unittest</th><td>11</td><td>0</td><td>0</td></tr>
+          <tr><th scope="row">Eval unittest</th><td>40</td><td>0</td><td>0</td></tr>
+          <tr><th scope="row">Python subtotal</th><td>548</td><td>1</td><td>0</td></tr>
+          <tr><th scope="row">Attestor npm tests</th><td>27</td><td>0</td><td>0</td></tr>
+          <tr><th scope="row">x402 npm tests</th><td>15</td><td>0</td><td>0</td></tr>
+          <tr><th scope="row">Combined: 591 tests</th><td>590</td><td>1</td><td>0</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The sole skip is the real flock test on Windows. Earlier guard-induced skips are superseded and excluded. TS chain calls use mocked RPC or fake upstreams; no transaction was submitted.</p>
+    <p>Both normal <code>npm run build</code> commands passed: attestor 7.00 s, x402 6.24 s. Python compile checked 82 files with no errors; three SyntaxWarnings were observed.</p>
+    <p>Unittest execution: API 7.979 s, MCP 0.028 s, eval 0.032 s. The final parallel rerun, including builds and Git checks, took 21 s.</p>
+    <p>CI coverage includes dependency audit, Python units, TS tests and builds, plus Docker image health, 384-dimensional embedding and rerank smoke checks.</p>
+  </section>
+  <section aria-labelledby="mcp">
+    <h2 id="mcp">02 / Main MCP coverage</h2>
+    <p>Live discovery listed 13 tools; all 13 were invoked. Twelve received ordinary calls; the thirteenth, <code>record_signed_verdict</code>, received only a negative request with <code>judgments=[]</code>. Successful signed writes remain covered only by local mocks.</p>
+    <p><strong>Ordinary calls:</strong> <code>search_research_paper</code>, <code>get_research_bundle</code>, <code>find_papers</code>, <code>get_paper</code>, <code>read_paper_section</code>, <code>count_papers</code>, <code>similar_papers</code>, <code>get_code_or_math_spec</code>, <code>compare_methods</code>, <code>get_verdict_message</code>, <code>research_trends</code>, <code>validate_project</code>.</p>
+    <p><strong>Preparation is not pure read:</strong> <code>get_verdict_message</code> was called once on main MCP and also passed as a free gateway call. Its API path uses <code>_judgments_conn</code> / <code>_canonical_claim</code> and can insert a new <code>claim_nodes</code> metadata row and commit. No judgment, verdict or attestation was written; no live wallet transaction, rollback or cleanup occurred.</p>
+    <p><strong>Error envelope:</strong> the empty-judgments request returned an internal HTTP 422 error inside content with MCP <code>isError=false</code>; DB callback was not reached. Clients must inspect payload errors, not only <code>isError</code>.</p>
+    <p>Hidden <code>record_claim_judgment</code> and <code>link_claim_nodes</code> both returned UnknownTool with <code>isError=true</code>. These probes are outside the 13 listed tools and did not invoke registry mutations.</p>
+  </section>
+  <section aria-labelledby="gateway">
+    <h2 id="gateway">03 / x402 discovery and payment gate</h2>
+    <p>All nine gateway tools were invoked: three free ordinary calls passed; six paid tools returned unpaid payment-required challenges with <code>isError=true</code>. Service info and accepted payment requirements were Solana devnet only. No paid execution, payment or settlement was tested.</p>
+    <div class="table-wrap">
+      <table>
+        <caption>Actual invocation coverage; paid rows verify gates, not paid execution.</caption>
+        <thead><tr><th scope="col">Tool</th><th scope="col">Quoted USDC base units</th><th scope="col">Live evidence</th></tr></thead>
+        <tbody>
+          <tr><th scope="row"><code>dtox_service_info</code></th><td>Free</td><td>Called; live / Solana devnet only</td></tr>
+          <tr><th scope="row"><code>search_research_preview</code></th><td>Free</td><td>Ordinary call passed</td></tr>
+          <tr><th scope="row"><code>get_verdict_message</code></th><td>Free</td><td>Ordinary preparation call passed</td></tr>
+          <tr><th scope="row"><code>get_evidence_bundle</code></th><td>10000 ($0.01)</td><td>Payment required; isError=true</td></tr>
+          <tr><th scope="row"><code>get_code_or_math_spec</code></th><td>30000 ($0.03)</td><td>Payment required; isError=true</td></tr>
+          <tr><th scope="row"><code>compare_methods</code></th><td>50000 ($0.05)</td><td>Payment required; isError=true</td></tr>
+          <tr><th scope="row"><code>research_trends</code></th><td>30000 ($0.03)</td><td>Payment required; isError=true</td></tr>
+          <tr><th scope="row"><code>validate_project</code></th><td>250000 ($0.25)</td><td>Payment required; isError=true</td></tr>
+          <tr><th scope="row"><code>record_signed_verdict</code></th><td>10000 ($0.01)</td><td>Payment required; isError=true; no write</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>A preliminary signed request with a too-short reviewer was rejected with MCP <code>-32602</code>. A correctly shaped dummy zero-public-key / invalid-signature request reached the payment gate only, before downstream authentication or attestation. No wallet key, valid signed verdict or settlement was used; paid E2E remains untested.</p>
+  </section>
+  <section aria-labelledby="retrieval">
+    <h2 id="retrieval">04 / Retrieval and structural evidence</h2>
+    <p>Main Web3 golden search batch: nine searches, seven passes and two failures. Chainlink v2 and descriptive EIP-7702 queries did not retrieve the expected target in the top 10.</p>
+    <p>Observed ranks: exact EIP-7702 1; ERC-4337 1; blob 9; VDF 4; nonce 3; named SIMD-0085 1; named SIMD-0297 1. Exact-ID success does not cancel the descriptive EIP-7702 failure.</p>
+    <p>Separate live quality batch: 15 LLM/agent rank cases, hit@3 9/15, hit@10 12/15, MRR@10 0.4163, with no HTTP or tool errors. Adapted golden: 15/16 read-only cases executed, 13 PASS / 2 FAIL: <code>entropy-kv-budget</code> missing MEDA <code>2502.17599</code> despite paraphrase recall 2/3, and <code>onchain-oracle</code> missing <code>wp:chainlink-v2</code>. Only <code>mev-sequencer</code> was unrun; write-dependent <code>registry-survives-rewording</code> was skipped separately. Live batches are not added to local unit totals.</p>
+    <p><strong>Golden execution boundary:</strong> this is an adapted public-MCP fast run with <code>deep=False</code>, not the original REST harness at its default depth. Expected fixture criteria are unchanged, but depth may explain the MEDA miss; no new regression is established without an equal-depth comparison. Most of the latest six before/after Web3 ranks were unchanged.</p>
+    <div class="note">
+      <h3>Structural fixture expectations remain questionable</h3>
+      <p>SIMD-0085 and SIMD-0297 returned zero code, math and table elements despite <code>fulltext=true</code> and a prose outline. Without source-level evidence that these elements exist, this does not establish a parser bug.</p>
+    </div>
+    <p>D2O returned 22 of 39 equations in 3978 characters; raw LaTeX was verified. Tables-only comparison returned two D2O numeric tables in 2574 characters and one CAKE table in 1633 characters. Both passed their 3000-character per-paper budgets.</p>
+    <p><strong>Deep ERC-4337 audit:</strong> a generic claim plus paraphrase completed as a pure-read check in 12.59 s, with <code>error=null</code> and <code>best_score=0.833</code>, matching maximum evidence score. It returned <code>strong_candidates</code>, zero read / three unread candidates, six graph neighbors with visible hub weights, three limitations, zero supporting math, and coverage 42 (moderate).</p>
+    <p>Canonical EIP-4337 was absent from the audit's top-three evidence despite the ERC-4337/bundlers query. This is an additional quality gap, not a contradiction of the functional pass or separate search-fixture ranks. No automatic prior-art conclusion is justified.</p>
+  </section>
+  <section aria-labelledby="findings">
+    <h2 id="findings">05 / Confirmed findings and boundary checks</h2>
+    <article class="finding">
+      <h3>Negative section offset produces a continuation loop</h3>
+      <p>Normal pagination returned 500 then 453 characters and continued correctly. With a valid section title and <code>offset=-1</code>, the response returned <code>chars=0</code> and <code>next_offset=-1</code>.</p>
+      <p><strong>Confirmed bad-input defect:</strong> clients following the unchanged continuation offset can loop. Recommendation: validate <code>offset</code> with <code>Query(0, ge=0)</code> and add a negative-offset regression test. No fix was implemented.</p>
+    </article>
+    <article class="finding">
+      <h3>Bundle budget passes; SSE decoding is a client pitfall</h3>
+      <p>Query <code>LLM agent tool use failures</code>, layer <code>ai-agents</code>, limit 3, <code>max_chars=3000</code>: explicit <code>r.content.decode('utf-8')</code> confirmed 3000 actual and declared characters, with every fragment length matching. ACL: 1000 characters, 1003 UTF-8 bytes.</p>
+      <p>The SSE response used <code>text/event-stream</code> without a charset; the testing client's <code>r.text</code> defaulted to ISO-8859-1 and inflated accented text by three characters. The earlier overrun finding is withdrawn: this is not a server budget bug.</p>
+    </article>
+    <p>Other bundle cases also passed: a 500-character budget returned exactly 500 with <code>partial=true</code>; a 6000-character budget returned 3866 with <code>partial=false</code>.</p>
+    <ul>
+      <li>Strict wrong-layer retrieval returned zero results.</li>
+      <li>Unknown term was rejected with HTTP 400.</li>
+      <li>Invalid bundle budget 499 was rejected with HTTP 422.</li>
+      <li>A missing paper returned the appropriate error.</li>
+      <li>Fresh 2026 queries returned 2026 papers, including IACR and arXiv; <code>builder-tech</code> static analysis returned Slither at rank 1.</li>
+      <li>Bad UTF-8 and malformed JSON each returned HTTP 400 with JSON-RPC error <code>-32700</code>.</li>
+      <li>REST <code>/v1/search</code> without an API key returned HTTP 401.</li>
+    </ul>
+  </section>
+  <section aria-labelledby="infra">
+    <h2 id="infra">06 / Bounded infrastructure snapshot</h2>
+    <p>Completed documents stayed at 179670 from 20:37:28 to 20:41:36 UTC, a 4 min 8 s window; last completion was 20:25:33 UTC. Fourteen stage heartbeats plus the reporter were fresh, with no hung stages. Services were healthy and Qdrant green. Growth rate is not confirmed.</p>
+    <p>Earlier queue snapshot: 13 quality_checked (11 ACL and two older PMLR items missing abstracts); other active states 0; deferred 29183; rejected 40469; off-niche 1038886. SQLite total: 1288242; FTS: 179670. Harvest cursors progressed, but that does not prove new documents or source exhaustion.</p>
+    <p>Overlapping raw completed-layer counts: llm 148133; agents 18551; web3 17228; builder 16381. MCP <code>count_papers</code> returned 16384 canonical web3 papers: <code>paper_facets</code> uses <code>canonical_id</code> and a seen set to deduplicate twins. SQL's 17228 counts raw records. This is an expected metric distinction, not a mismatch bug.</p>
+    <p>Qdrant: 10693340 points; coarse-base 179669 metadata-only records. Memory: 9.639 / 10 GiB, 96.39% of the cgroup cap. Host disk: 89% used, latest 41 GB free (earlier 42 GB); swap: 9 GB. Memory-cap risk is not resolved by OOM score tuning.</p>
+    <p>Bounded logs showed no new Qdrant/embed OOM errors; S2/refs 429s remained. OOM guard timer was active, with actual score -900. Nginx buffering and gzip were verified off for streaming; ten code hashes matched.</p>
+    <p><strong>Final monitor with the verified endpoint: ops availability PASS.</strong> API and embed health were OK; 13-tool MCP schema valid; Qdrant green; backup age 19 h. All 14 stage heartbeats plus reporter were fresh in a two-minute-old snapshot, idle except fulltext busy.</p>
+    <p>Completed documents remained 179670; latest queue 14; no completion-update activity for 21 min. First-completion and reprocessing rates are unknown without journal evidence. Monitor progress was OK under its 90-minute threshold, not proof of healthy ingest; growth is unproven and the queue nearly empty.</p>
+    <p>Public health: latest 30 samples, observed p95 2.594 s in the measurement window, not a service SLO. Reverse-tunnel and old-benchmark failures were pre-existing, not an active outage. No production code/config changes or restarts were performed.</p>
+    <p>Public GET <code>/research/</code> and <code>/research/stats.json</code> returned 200; cached snapshot as_of <code>2026-10-01T21:00Z</code>: documents 179671, chunks 10693370, citation_edges 3372827, web3_documents 17228 (raw records). Versus earlier SQLite 179670 at 20:41 UTC, this is a small net count change of +1, not a growth-rate measurement or first-ever ingestion journal evidence; the earlier window delta of zero remains true, but zero growth throughout the entire test is not claimed.</p>
+  </section>
+  <section aria-labelledby="limits">
+    <h2 id="limits">07 / Timing, safety and assessment limits</h2>
+    <p>The slowest observed main spec call was CAKE at 13.146 s, in a cold-ish but uncontrolled run. Most observed read calls took 0.1 to 3.2 s. No service-wide SLO, p95, load or stability conclusion is supported.</p>
+    <p>Git was clean before adding these reports. The hygiene scan covered 165 public files and their index versions; staging was empty. No secrets matched the checked patterns; this is not an exhaustive secret or Git-history audit.</p>
+    <p>Only these two report files were authored. No production source/config changes, no live verdict/attestation writes; claim-node metadata may be created by message preparation. No dependency installation, commit, push or paid network calls were performed. Ordinary unittest fixtures, pycache and build dist were permitted for the final rerun.</p>
+    <div class="table-wrap">
+      <table>
+        <caption>Completed coverage and explicitly excluded verification.</caption>
+        <thead><tr><th scope="col">Workstream</th><th scope="col">Status</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Assessment scope</th><td>Bounded to the confirmed results recorded here; release not signed off</td></tr>
+          <tr><th scope="row">Adapted golden review</th><td>15/16 read-only executed, 13 PASS / 2 FAIL; only mev-sequencer unrun; write-dependent registry-survives-rewording skipped separately</td></tr>
+          <tr><th scope="row">Expanded x402 coverage</th><td>Complete: nine invoked, three free passes, six unpaid challenges; paid E2E not run</td></tr>
+          <tr><th scope="row">Deep Web3 ERC-4337 audit</th><td>Completed: functional pass, canonical top-three retrieval gap</td></tr>
+          <tr><th scope="row">Infrastructure review</th><td>Final monitor: availability PASS; growth unproven, capacity risks remain</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+  <section aria-labelledby="priorities">
+    <h2 id="priorities">08 / Recommended priorities; no fixes implemented</h2>
+    <ol>
+      <li><strong>Pagination and error contract:</strong> reject negative offsets with <code>Query(0, ge=0)</code> and regression coverage. Propagate internal MCP failures using <code>ToolError</code> or an explicit error flag; clients must inspect payload errors until corrected.</li>
+      <li><strong>Retrieval quality:</strong> expand the candidate pool and validate the fixed failing queries, including equal-depth golden comparisons. Separate candidate recall from score calibration; do not blindly lower thresholds.</li>
+      <li><strong>Ingest yield:</strong> investigate source yield and queue policy, including the earlier 13-item snapshot and the two PMLR items missing abstracts. The latest queue was 14; monitor availability does not establish growth or source exhaustion.</li>
+      <li><strong>Capacity:</strong> address Qdrant's 96.39% cgroup memory usage and disk headroom. An OOM score of -900 does not remove the hard memory-cap risk.</li>
+    </ol>
+  </section>
+  <footer>
+    <p class="meta">COMPLETED BOUNDED ASSESSMENT / LOCAL EXECUTION + MAIN-AGENT OBSERVATIONS / RELEASE NOT SIGNED OFF</p>
+    <p>Static standalone report. Embedded CSS only; no scripts, external assets or private access details.</p>
+  </footer>
+</main>
+</body>
+</html>

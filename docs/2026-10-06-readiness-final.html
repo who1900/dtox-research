@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>DTOX: итоговая готовность 2026-10-06, NO GO</title>
+<style>
+:root{color-scheme:light;--base:#fafaf3;--ink:#1a1a1a;--blue:#164d86;--wash:#eaf0f6;--fail:#9b3030;--pass:#276142}
+*{box-sizing:border-box}body{margin:0;background:var(--base);color:var(--ink);font:16px/1.6 Inter,Arial,sans-serif}
+main{max-width:1080px;margin:auto;padding:64px 28px 80px}header{margin-bottom:48px}h1{font-size:clamp(30px,5vw,52px);line-height:1.12;letter-spacing:-.045em;margin:18px 0}h2{font-size:23px;letter-spacing:-.025em;margin:42px 0 16px}
+p{max-width:92ch}a{color:var(--blue)}.meta,code{font-family:"Roboto Mono",Consolas,monospace;font-size:.86em;overflow-wrap:anywhere}.meta{color:var(--blue)}.notice{padding:22px 26px;background:var(--wash)}.fail{color:var(--fail);font-weight:700}.pass{color:var(--pass);font-weight:700}.pending{color:var(--blue);font-weight:700}
+.table{overflow-x:auto;margin:20px 0;box-shadow:0 8px 24px #1b1c180a}table{border-collapse:collapse;width:100%;min-width:560px;text-align:left;font-size:14px}th,td{padding:13px 16px;vertical-align:top}thead{background:var(--blue);color:white}tbody tr:nth-child(odd){background:#f0f2ee}tbody tr:nth-child(even){background:#eaf0f6}th{font-weight:600}footer{margin-top:46px;font-size:13px}ul{padding-left:22px}li{margin:8px 0}small{font-size:13px}
+@media(max-width:600px){main{padding:32px 18px 48px}header{margin-bottom:30px}.notice{padding:18px}th,td{padding:10px 12px}h2{margin-top:32px}}
+@media print{main{padding:0;max-width:none}.table{box-shadow:none;overflow:visible}table{min-width:0}a{color:inherit}thead{background:#eaf0f6;color:#1a1a1a}}
+</style>
+</head>
+<body>
+<main>
+<header>
+<div class="meta">DTOX / PRIVATE LOCAL QA / 2026-10-06 / UTC</div>
+<h1>Итоговая готовность</h1>
+<p class="meta">FINISHED bounded release audit. SECURITY DEPLOYED. Bounded native PDF smoke CLOSED / PASS.</p>
+<p>Public MCP run: 18:12:43 UTC; security SUCCESS: 18:39:27 UTC; late pipeline snapshot: 18:43 UTC. Текущие tests/jobs завершены, ожидания результата нет. Full native/ABI FAIL/UNKNOWN, memory/root FAIL. Не все цели достигнуты.</p>
+<div class="notice"><span class="fail">Глобальный production GO: НЕТ.</span><br>Quality 1/8 FAIL, два kernel OOM до security, root не исправлен, memory/full native gate NO GO, restore UNKNOWN, money/live E2E исторический. Full gateway HELD по pre-existing drift/limits 15/30000 против API 5/20000. Corrected actual JS security rollout SUCCESS, compiled payment policy unchanged. Lifecycle wrapper LOCAL CANDIDATE, НЕ deployed.</div>
+</header>
+<section aria-labelledby="retrieval">
+<h2 id="retrieval">Поиск: полнота улучшилась, quality gate не закрыт</h2>
+<div class="table"><table><thead><tr><th scope="col">Показатель</th><th scope="col">Public before</th><th scope="col">Public after</th><th scope="col">Candidate internal</th></tr></thead><tbody>
+<tr><th scope="row">Запросы</th><td>24</td><td>24</td><td>24</td></tr>
+<tr><th scope="row">Полные / valid</th><td>19</td><td>24</td><td>Не public proof</td></tr>
+<tr><th scope="row">Partial / errors</th><td>5 lexical / 0</td><td class="pass">0 / 0</td><td>0 errors</td></tr>
+<tr><th scope="row">Known-source hit@10</th><td>10</td><td>13</td><td>13</td></tr>
+<tr><th scope="row">Known-source hit@3</th><td>8</td><td>11</td><td>12</td></tr>
+<tr><th scope="row">Все 3 hit@10 в группе</th><td>1/8</td><td class="fail">1/8, FAIL</td><td>Не заменяет public gate</td></tr>
+</tbody></table></div>
+<p>Public after: 18:12:15 -> 18:12:43 UTC, 28.255 s, 24 реальных MCP-запроса. Старые 10 полных hit@10 сохранены, потеряно 0. Candidate hit@3 = 12 нельзя подменять публичным 11.</p>
+<p>Новые hit@10: <code>structured-dynamics</code>, <code>length-extrapolation-question</code>, <code>cross-chain-fuzzer</code>. Первые два прежде invalid из-за lexical partial. Только Web3/smart-contract fuzzing <code>cross-chain-fuzzer</code> (слой <code>builder-tech</code>) улучшился на ранее полном ответе; чистый причинный semantic gain не доказан. Единственная группа 3/3: data-availability sampling.</p>
+<p>Fixture authored агентом, known-source anchors, без слепых human labels. Это не precision, exhaustive recall, независимая relevance-оценка или гарантия index coverage. Нулевые hard-negative flags не закрывают quality. Полный ответ API не означает fulltext всех источников.</p>
+<h2>Production public MCP pagination proof</h2>
+<p>По main: source <code>2111.00396</code>, S4, equation, <code>maxchars=500</code>. Первая страница: 3 chunks, 500 chars, <code>next_cursor</code>. Вторая: 500 chars, nonempty; тот же clipped chunk с одинаковым 64-символьным raw hash и продолженным <code>returned_offset</code>. <code>partial_reasons</code> ровно <code>character_budget</code>, <code>exact_latex=true</code>. Это continuation внутри clipped chunk в одном live сценарии, не отсутствие partial или полнота корпуса. Не входит в прежние 24 retrieval queries; docs-pass не повторял вызовы.</p>
+</section>
+<section aria-labelledby="deployment">
+<h2 id="deployment">Deployment: не смешивать runtime и offline</h2>
+<div class="table"><table><thead><tr><th scope="col">Область</th><th scope="col">Статус и границы</th></tr></thead><tbody>
+<tr><th scope="row">API/MCP</th><td><span class="pass">DEPLOYED main</span>, guarded rollout 18:11 UTC, 4 файла; health, route, cursor active. Canonical metadata для bounded shortlist; opaque spec pagination, явные partial causes; malformed signed batch fail-closed.</td></tr>
+<tr><th scope="row">Backup / SHA</th><td><code>/opt/dtox-release-20261006/20261006T1811-readiness-api</code><br><code>main 422c6986.. / evidence 94d148.. / bundle d744b0.. / mcp 470436..</code>. Последние три только префиксы main, не полные хеши.</td></tr>
+<tr><th scope="row">First-publication</th><td class="pass">DEPLOYED; одна естественная job подтверждена. Historical replacement и legacy FTS migration не включены.</td></tr>
+<tr><th scope="row">Gateway full candidate</th><td><span class="fail">HELD.</span> Pre-existing schema/API limits mismatch 15/30000 против 5/20000, compatibility не принята. Source/JS drift реален; runtime filters уже отсутствовали, upfront payments уже active. Rollout не источник этих изменений.</td></tr>
+<tr><th scope="row">Gateway scoped patch</th><td><span class="pass">DEPLOYED 18:39:27 UTC.</span> 4 файла <code>upstream.ts/js</code> + <code>errors.ts/js</code>, generic decoder/no-retry writes, exact new hashes verified. Первый aborted preflight до writes исторический. Legacy filters не заявляются: actual schema уже без них.</td></tr>
+<tr><th scope="row">Attestor</th><td><span class="pass">DEPLOYED 18:39:27 UTC.</span> 3 TS + 3 JS security files, exact new hashes verified. Final native Node20.20.1: 58 PASS / 0 fail (55 прежних + 3 read-only probe fixtures). Не monetary E2E.</td></tr>
+<tr><th scope="row">Security guard</th><td><span class="pass">PASS, before/after read-only smoke.</span> Exact ВСЕ 9 actual compiled paid-MCP input schemas + service info/prices + live/devnet networks + SAS authority/credential/schema identities. Existing server/tools/config И <code>dist/payments.js</code> SHA сохранены. Нет env/price/policy changes или money writes.</td></tr>
+<tr><th scope="row">Security backup / hashes</th><td><code>/opt/dtox-release-20261006/20261006T1905-security-compatible</code>. <code>1905</code> только label, не actual time: SUCCESS 18:39:27 UTC. Exact 10 new / 7 preserved SHA256 в private <code>../.codex-artifacts/dtox-readiness-20261006/rollout-security.sh</code> относительно repo. Manifest локально прочитан, не выполнен; deployment verification main.</td></tr>
+<tr><th scope="row">Post-rollout 18:41:04 UTC</th><td>Все 5 служб API/MCP/attestor/gateway/pipeline active. Service status не memory health или OOM fix proof.</td></tr>
+<tr><th scope="row">SAS compatibility</th><td><span class="pass">Read-only PASS 18:12:08 UTC.</span> Actual publication authority <code>39ay..</code>; candidate credential/schema owner, authority, signers, layout, names, genesis verified. Без wallet/secret reads и RPC writes; не fresh payment/E2E.</td></tr>
+</tbody></table></div>
+<p><small>Deployment, SAS, publication и test facts переданы main. Этот docs-pass не обращался к продукту или live-сервисам.</small></p>
+<h2>Runtime correction: pre-existing drift, full candidate HELD</h2>
+<p><span class="fail">Прежний runtime вывод по source TS НЕВЕРЕН и отозван.</span> TS old: search proxy, legacy filters, default 8. Actual compiled <code>dist/tools.js</code> УЖЕ real-bundle schema: query/layer, limit max 15 / default 3, maxchars max 30000, strict, без legacy filters. <code>dist/server.js</code> импортирует <code>payments.js</code>. Source/JS BUILD DRIFT предшествовал попытке. Rollout не вводит новый proxy и не удаляет runtime filters; legacy TS filter preservation не заявляется.</p>
+<p>Main подтвердил: <code>dist/payments.js</code> УЖЕ explicit upfront signed writes / authorization reads. Claims об отсутствии extra call в live wrapper и о новой payment-policy change этим rollout отозваны. Local <code>@x402/svm 2.24.0</code> default authorization не описывает actual wrapper. Schema/API 15/30000 против 5/20000: pre-existing mismatch, compatibility не принята. Денежного E2E нет; inspection не fresh monetary proof.</p>
+<p>Первый preflight FAILED/ABORTED ДО writes/backup/install/restart: initial guard ошибочно считал TS runtime. После исправления actual JS baseline scoped rollout SUCCESS 18:39:27 UTC: 10 files, exact hashes и read-only guard PASS. ВСЕ actual 9 schemas, service info/prices/networks/SAS identities и existing server/tools/config/payments JS сохранены. Existing upfront signed writes/authorization reads действовали до turn и не изменены. Full gateway HELD по pre-existing drift/limits и непроверенной compatibility, не новой policy/filter потере. Новых money writes нет.</p>
+</section>
+<section aria-labelledby="tests">
+<h2 id="tests">Проверки: 1433 PASS + 6 skip</h2>
+<div class="table"><table><thead><tr><th scope="col">Набор main</th><th scope="col">Итог</th></tr></thead><tbody>
+<tr><th scope="row">API / pipeline</th><td>862 run, 1 skip, 861 PASS / 182 run, 5 skip, 177 PASS</td></tr>
+<tr><th scope="row">MCP / ops / eval</th><td>62 / 179 / 40 PASS</td></tr>
+<tr><th scope="row">Attestor / gateway</th><td>55 / 59 PASS offline</td></tr>
+<tr><th scope="row">Total</th><td>1433 PASS + 6 skip = 1439 raw executions</td></tr>
+<tr><th scope="row">Native Linux backend</th><td>107 PASS, 1.832 s; отдельно, не прибавлено к total</td></tr>
+<tr><th scope="row">Native minimal gateway</th><td>Node20.20.1: 14 decoder checks PASS, zero network, отдельно от прежнего total.</td></tr>
+<tr><th scope="row">Final native attestor</th><td>Node20.20.1: 58 PASS / 0 fail, включая 3 read-only probe unit fixtures. Missing helper исправлен, отдельно от total.</td></tr>
+<tr><th scope="row">Fermat local lifecycle</th><td>108 raw PASS / 4 skip; 15 новых PASS + 1 новый skip. LOCAL CANDIDATE, не native PDF equivalence.</td></tr>
+<tr><th scope="row">Main local PDF mock</th><td>16 run, 15 PASS / 1 skip; mocked lifecycle, не native conversion, отдельно от snapshot.</td></tr>
+<tr><th scope="row">Bounded native PDF smoke</th><td>CLOSED / PASS: 3 sequential conversions, 8.629 s, один 2-page fixture. Не full native gate, не прибавлено к snapshot.</td></tr>
+<tr><th scope="row">TypeScript build</th><td>Attestor и gateway PASS</td></tr>
+</tbody></table></div>
+<p>Дублирующиеся fixtures не новая unique coverage. Три ранние неуспешные native Linux попытки: setup/dependencies, не product regressions; финальный прогон полный PASS. Skips и неуспешные попытки не скрыты. Это не native PDF/OCR equivalence, restore или live payment proof.</p>
+<p>Это предыдущий offline snapshot, не scoped-deployment acceptance. Зелёные gateway checks, включая упомянутые main 57 tests, не закрывают pre-existing limits/compatibility gate и не заменяют ранее сообщённые 59 raw executions; policy-change claim отозван после dist inspection.</p>
+<p>Decoder 14, attestor 58/0, Fermat 108/4, PDF mock 16 run (15/1) и native smoke 3 conversions не прибавлены к snapshot 1433 PASS + 6 skip и не объявлены новой unique coverage. Прежний missing-helper import FAIL не скрыт, corrected attestor rerun 58/0. Conversions не test-case count.</p>
+<h2>Fermat: LOCAL CANDIDATE, smoke CLOSED, full native NO GO</h2>
+<p>Lifecycle wrapper: <code>pipeline/extractor.py</code>, <code>pipeline/service.py</code>, <code>test_pdf_conversion_lifecycle</code>. Local 108 raw PASS / 4 skip, 15 новых PASS / 1 новый skip; main PDF mock 16 run, 15 PASS / 1 skip отдельно. Wrapper НЕ deployed; upstream O(N²) не изменён. Отдельный user-authorized агент завершил private <code>pdf-native-qa/REPORT.md</code>; docs-pass прочитал полностью, не повторял QA.</p>
+<div class="table"><table><thead><tr><th scope="col">Native smoke evidence</th><th scope="col">Результат и границы</th></tr></thead><tbody>
+<tr><th scope="row">Runtime</th><td>Exact trio PyMuPDF4LLM / PyMuPDF / Layout 1.28.0, private venv. Local Windows Python 3.13.3 / NumPy 2.4.4 / ONNX 1.30.0; prod Linux Python 3.12.3 / NumPy 2.5.1 / ONNX 1.28.0. Platform/transitive runtime НЕ exact.</td></tr>
+<tr><th scope="row">Source/model identity</th><td>Main stored identity JSON: ВСЕ 4 layout source SHA + 20/20 model/config path/size/SHA match, read-only без native init. Identity файлов не ABI/native execution equivalence: Windows/Linux и Python/NumPy/ONNX различаются.</td></tr>
+<tr><th scope="row">Output / chunks</th><td>2-page synthetic text/formulas/code/table/limitations: old direct 1.28.0 и candidate byte-EQUAL, 455 UTF-8 B. SHA256 <code>93e52dce83b1b24765f83ca647aa785e94071bb7221ed15ad89c51a71975ccf1</code>. 2 native page chunks, concatenated text тот же SHA. Не old 0.0.27, не pipeline semantic chunking/index/corpus QA.</td></tr>
+<tr><th scope="row">Budget / cleanup</th><td>3 sequential conversions, total 8.629 s, outer Windows Job 120 s / 1536 MiB не triggered. Timeout/memory-exhaustion kill этим run НЕ проверен. Recorded PIDs после outer cleanup не живы; это НЕ самостоятельная Windows descendant guarantee wrapper и не POSIX proof.</td></tr>
+<tr><th scope="row">Peak job COMMIT</th><td>Old 586084352 B, candidate 607526912 B: <span class="fail">candidate ВЫШЕ, не memory improvement.</span> COMMIT не RSS; old включает fixture/PNG generation. Single tiny case не даёт throughput/capacity claim.</td></tr>
+<tr><th scope="row">Не проверено</th><td>OCR engines отсутствуют: OCR/image fixture не проверен, не установлен/не заменён. Нет heavy bbox stress или dense-vs-blockwise root comparison. Full Linux equivalence и OOM root fix НЕ приняты.</td></tr>
+</tbody></table></div>
+<p>Transient output был в OS-temp и удалён; confinement harness изменён после run без повторного benchmark, change не verified. Smoke CLOSED, не full feature preservation; full native/ABI FAIL/UNKNOWN. Exact Linux/native/OCR/POSIX QA и bbox edges/ties/masks equivalence будущая отдельная работа, не запущена этим audit. Без production heavy PDF. Root/global cohost risk и memory NO GO сохраняются.</p>
+</section>
+<section aria-labelledby="publication">
+<h2 id="publication">Публикация и корпус</h2>
+<p><span class="pass">Естественная publication job подтверждена 17:49:55 UTC.</span> <code>pmlr:v306/xian26a</code>, 87 points: <code>state=done</code>, <code>parse_status=ok</code>, <code>first_known=1</code>, <code>completed=1</code>; preflight, FTS/Qdrant ACK, cache SHA и artifact revision verified. FTS exact, Qdrant payload semantic equality с missing/null normalization; все 87 проверены и API-visible. Это закрывает прежний pending proof только для одной job.</p>
+<p>17:39 UTC: 9 published документов, state 182109 документов. Qdrant Oracle green, 10912569 points. Points не papers, acquisition смешивает abstracts и fulltext. Нет гарантии всего корпуса, всех полных статей или legacy replacement.</p>
+<p>18:41:04 UTC: Qdrant Oracle green, optimizer ok, 10912622 points (+53 к прежнему snapshot). Прирост points не papers, не full acquisition proof и не приписывается deployment.</p>
+</section>
+<section aria-labelledby="gates">
+<h2 id="gates">Gates и остаточные риски</h2>
+<div class="table"><table><thead><tr><th scope="col">Gate</th><th scope="col">Статус</th><th scope="col">Следующее действие</th></tr></thead><tbody>
+<tr><th scope="row">Retrieval quality</th><td class="fail">FAIL, 1/8</td><td>Отдельная quality-задача и independent labels, frozen fixture не менять ради результата.</td></tr>
+<tr><th scope="row">Pipeline memory / stability</th><td class="fail">FAIL: второй kernel OOM 18:37:31, peak 10.5G, NRestarts=2</td><td>18:37:33 exit 137, 18:38:03 autorestart до security. Active не stability PASS. Fermat LOCAL CANDIDATE, bounded smoke PASS не root fix; global cohost contention/native allocation risk активен.</td></tr>
+<tr><th scope="row">Full-app restore</th><td class="pending">UNKNOWN</td><td>Owner approval и изолированный Oracle target, не Contabo.</td></tr>
+<tr><th scope="row">Money/live E2E</th><td class="pending">Только historical</td><td>Read-only SAS не заменяет transactions/payments.</td></tr>
+<tr><th scope="row">Gateway compatibility</th><td class="fail">Full candidate HELD</td><td>Pre-existing schema 15/30000 против API max 5/20000; compatibility validation нужна. Actual compiled filters/payments известны; новая filter loss или policy change не заявляется.</td></tr>
+<tr><th scope="row">Scoped security deployment</th><td class="pass">CLOSED: DEPLOYED, guard PASS</td><td>18:39:27 UTC, 10 files, exact hashes verified. ALL actual 9 schemas + service info/prices/networks/SAS identities unchanged, server/tools/config/payments JS SHA preserved. Full gateway не входит.</td></tr>
+<tr><th scope="row">Bounded native PDF smoke</th><td class="pass">CLOSED / PASS</td><td>Один 2-page fixture byte-EQUAL, exact trio, 4 source SHA и 20/20 model/config SHA match, 3 conversions. Без prod code, без новых tests этим docs-pass.</td></tr>
+<tr><th scope="row">Full native / memory gate</th><td class="fail">NO GO; native/ABI FAIL/UNKNOWN</td><td>Windows/Linux и Python/NumPy/ONNX различаются; OCR, POSIX descendants, root bbox equivalence/capacity не проверены. Wrapper НЕ deployed, candidate commit выше. Незавершённых QA jobs нет.</td></tr>
+</tbody></table></div>
+<p>OOM 17:21:49 UTC был до main tests: kernel убил pipeline Python, <code>anon-rss=11411608 kB</code>, затем autorestart. Позднее: четыре параллельные native PDF/layout conversions, около 9 GB RSS. Текущий upstream O(N²) scratch подтверждён, точный allocator погибшего PID неизвестен. Runtime 1.28.0 против repo pin 0.0.27. Local lifecycle patch не deployed, OOM green не заявляется. Layout/OCR не отключены, page cap не введён, новая ingestion этим docs-pass не запускалась. <a href="2026-10-06-pipeline-memory.md">Memory diagnosis</a>.</p>
+<p>18:41:04 UTC host memory report: 24031 MiB, available 9887 MiB, swap 12226/12287 MiB. Host metrics не memory fixed proof; 24031 MiB не available. <code>MainPID=3679545</code>, RSS 1792 kB / 1 thread: wrapper metric, не Python memory.</p>
+<p>18:43 UTC: MainPID 3679545 подтверждён как <code>flock</code>, НЕ Python. Actual cgroup stage Python PID 3679546: RSS 2002504 kB, 49 threads, <code>VmSwap=0</code>. Cgroup <code>MemoryCurrent=3414425600 B</code> может включать cache; не Python RSS и не host swap.</p>
+<p><span class="fail">Второй kernel OOM подтверждён 18:37:31 UTC.</span> Убит Python PID 3667572: <code>total-vm=17381620 kB</code>, <code>anon-rss=11466160 kB</code>, <code>file-rss=128 kB</code>, <code>global_oom</code>, task memcg <code>dtox-research</code>. Invoker gunicorn другого cohosted проекта, <code>slopng</code> cpuset, НЕ доказательство единственной причины или точного allocator root. Global cohost contention/native allocations остаются рисками.</p>
+<p>Unit exit 137: 18:37:33 UTC, reported memory peak <strong>10.5G</strong>, единица лога сохранена. Autorestart 18:38:03 UTC, counter 2, <code>NRestarts=2</code>. Оба kernel OOM (17:21:49, 18:37:31) ДО security SUCCESS 18:39:27 UTC. Security scope pipeline не deploy, main pipeline restart не вызывал. Это не новая security rollout regression; limited read-only nonregression не pipeline stability PASS. <span class="fail">Active health не stability PASS, memory/failure gate FAIL.</span></p>
+</section>
+<footer>
+<p>Private before/after/candidate JSON и rollout-security.sh в <code>../.codex-artifacts/dtox-readiness-20261006/</code> относительно repo. <a href="../../.codex-artifacts/dtox-readiness-20261006/pdf-native-qa/REPORT.md">Private native QA REPORT</a>: <code>C:/Users/User/Documents/work/Claude/.codex-artifacts/dtox-readiness-20261006/pdf-native-qa/REPORT.md</code>. REPORT прочитан полностью; script/QA не запускались docs-pass. Main messages/stored identity JSON: 4 source + 20 model/config SHA matches, без live перепроверки. <a href="2026-10-06-publication-release.md">Publication snapshots + Updates</a>. Raw payloads не публиковать.</p>
+<p>Raw fixture SHA256 verified: <code>9b666344cd3e137e0fe532046b5a13e59c23c5e5c907628e7f1b1e597d0ab5ff</code>. Embedded fixtures структурно совпадают. Public поле fixture_sha256 <code>c5d1703f9fa52573156ab38f553bf1d10cefdc3076883684d4f476992595be9e</code> не raw file SHA. Candidate fixture_raw_sha256 совпадает; main candidate SHA <code>422c6986a5a383f0e4852a0d7f2a5e3ba1605499fb93002ca8a0e0a66f3e889c</code>.</p>
+<p>FINISHED bounded release audit. <a href="2026-10-06-readiness-final.md">Полный Markdown</a>. Текущие tests/jobs завершены. НЕ все goals achieved: глобальный NO GO, quality/memory/full-native/restore/money/gateway ограничения сохранены. Только readiness docs и append-only publication Update; без JS/сети/секретов, product/code/live calls, новых tests, deploy, ingestion, commit/push. Старые snapshots сохранены с коррекциями.</p>
+</footer>
+</main>
+</body>
+</html>

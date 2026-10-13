@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>dtox research: post-resize submission gate</title>
+  <style>
+    body { max-width: 900px; margin: 3rem auto; padding: 0 1.25rem; background: #fafaf3; color: #1a1a1a; font: 17px/1.65 Inter, Arial, sans-serif; }
+    h1, h2 { line-height: 1.2; letter-spacing: -.03em; }
+    code, pre, .meta { font-family: "Roboto Mono", Consolas, monospace; }
+    pre { overflow-wrap: anywhere; white-space: pre-wrap; background: #f0f0e8; padding: 1rem; }
+    li { margin: .45rem 0; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>dtox research</h1>
+  <p class="meta">Crypto World's Fair | Copy-ready submission text and owner gate | 2026-10-03</p>
+  <p><strong>Category:</strong> Developer Infrastructure<br><strong>Tagline:</strong> Web3 research infrastructure for execution agents.</p>
+
+  <h2>Project description</h2>
+  <p>Execution agents need more than a list of papers before their builders choose a transaction path or account architecture. dtox is a Web3-first research service that lets agents find and read protocol specifications, technical papers and whitepapers through MCP. It returns source-linked material with acquisition and extraction provenance, including equations, algorithms, code and stated limitations when available. A bounded research bundle assembles a reading packet under a character budget. It is evidence for a human or agent to inspect, not an automatic security review or novelty verdict.</p>
+  <p>One research path pairs the MEV auction model in <em>Quantifying Blockchain Extractable Value: How dark is the forest?</em> with ERC-4337's discussion of EntryPoint risk concentration and account-abstraction safety. The paper source is original LaTeX; the ERC-4337 passage is specification text, not dtox-generated advice. Their juxtaposition supports cross-ecosystem research, not equivalence between chain assumptions.</p>
+  <p>The public read beta is free and needs no key or signup. The public MCP inventory exposes 13 tools: 12 read/preview tools and one signed-write tool, <code>record_signed_verdict</code>. The signed-write tool was not invoked in this release check; no legacy anonymous-write tool appeared in the inventory. Separately, a wallet can sign a reading for Solana Attestation Service anchoring. A signature makes attribution checkable; it does not prove correctness, independent reasoning or scientific consensus.</p>
+
+  <h2>Try the free read demo</h2>
+  <p><a href="https://read.whoim.space/mcp">MCP endpoint</a> | <a href="https://read.whoim.space/research/">Research site</a> | <a href="https://github.com/who1900/dtox-research">Public repository (AGPL-3.0)</a></p>
+  <pre><code>find_papers(query="Quantifying Blockchain Extractable Value", layer="web3", limit=3)
+get_code_or_math_spec(arxiv_id="2101.05511", target_elements="equation,algorithm", max_chars=5500)
+read_paper_section(paper_id="eip:4337", section_type="limitations", max_chars=3500)</code></pre>
+  <p>Post-resize read-only checks on 2026-10-03 are recorded in the release evidence. A repeated VDF query returned the same three IDs (oa:W4394595369, iacr:2018/712, 2211.08162). The same ERC-4337 idea, “ERC-4337 EntryPoint security design for an execution agent,” and claim, “ERC-4337 EntryPoint is a central trust point whose implementation concentrates account abstraction security risks,” were checked at two depths. Both returned weak signal with empty evidence; canonical eip:4337 was absent, although its section endpoint returned exact source text warning about the central trust point. This is a known recall miss for this idea/claim, not evidence of a newly introduced regression. Historical examples are not a guarantee of future retrieval.</p>
+
+  <h2>Corpus counters and scope</h2>
+  <p>Public stats snapshot <code>2026-10-02T14:00Z</code>: 180,101 documents, 10,735,072 structural chunks, 3,377,328 citation edges and 17,243 Web3 documents. These are corpus counters from that timestamp, not counts of papers, users, adoption or paying customers. Source and full-text availability vary by record; abstract-only fallbacks can occur. A small retrieval example does not establish corpus-wide completeness.</p>
+
+  <h2>Payment and chain evidence</h2>
+  <p>One Solana devnet x402 payment of 0.01 USDC and one signed test record passed on 2026-10-03, with independent public RPC readback. The resulting registry state was <code>read_once</code>, not quorum. This was the single tested payment/write flow; no additional payment or write is part of this package. Mainnet settlement and paid EVM settlement are unverified. Base Sepolia, Ethereum Sepolia and Arbitrum Sepolia support must not be presented as demonstrated paid end-to-end flows.</p>
+  <p>Full production readiness is not established. At the 13:25 UTC observation, Oracle reported 23,972 MiB RAM with 13,867 MiB available; Qdrant cgroup use was 13.47/18 GiB, OOM false and restarts 0. All three collections were green; optimizers were idle, with no changes to point counts since resize. Full-text had 10,744,313 points / 11 segments; coarse_base 180,181 / 2; coarse 162,328 / 2. Host disk free was 120 GiB. The small embedding engine was false. There was no collection retrieval/HNSW setting change; the Docker memory limit did change. The 2026-09-27 full-text snapshot is 32.49 GB, and a full restore has <strong>not been verified</strong>. Do not claim a restore SLO, p95 latency, zero-downtime/zero-degradation, mainnet readiness or global production readiness.</p>
+
+  <h2>Submission and demo checklist</h2>
+  <ul>
+    <li>☐ Release decision: conditional bounded beta/hackathon demo only, with known-ID scope and recall limitation disclosed; production and mainnet are NO-GO until resource preflight, verified full application restore and an acceptable outcome for the observed ERC-4337 recall gap.</li>
+    <li>☐ Owner confirms current event rules, account registration, eligibility and prior-work/funding disclosures.</li>
+    <li>☐ Owner supplies and verifies team, contact, location, roles and founder-market-fit fields.</li>
+    <li>☐ Owner reviews the existing English presentation and demo previews and their subtitles; these are local editorial videos using recorded responses, not continuous live-client footage.</li>
+    <li>☐ Owner supplies public video URLs after separately authorized upload. Existing local previews: presentation 2:40; demo 2:49. No video upload or public URL is claimed here.</li>
+    <li>☐ Owner reviews final form text and explicitly authorizes submission. Submission has not been made.</li>
+  </ul>
+  <p><strong>Do not invent adoption, user, revenue, video-view or pilot numbers.</strong> Optional usage credits and team integrations are proposals, not established demand or proven revenue. Development began before the contest and must be disclosed accurately.</p>
+</main>
+</body>
+</html>

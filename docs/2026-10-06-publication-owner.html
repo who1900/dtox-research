@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Publication ownership — 6 октября 2026</title>
+  <style>
+    :root { color-scheme: light; --paper: #fafaf3; --ink: #1a1a1a; --muted: #66665f; --wash: #eeeee5; --alert: #8c3429; --ok: #315c45; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font-family: Inter, "Segoe UI", Arial, sans-serif; line-height: 1.65; }
+    main { width: min(920px, calc(100% - 48px)); margin: 0 auto; padding: 64px 0 88px; }
+    .eyebrow, .meta, .index, code { font-family: "Roboto Mono", Consolas, monospace; }
+    .eyebrow { font-size: 12px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+    h1 { max-width: 760px; margin: 18px 0 12px; font-size: clamp(40px, 7vw, 68px); line-height: .99; letter-spacing: -.055em; font-weight: 650; }
+    .dek { max-width: 680px; margin: 24px 0 34px; color: #45453f; font-size: 19px; }
+    .status { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 48px; }
+    .status span { padding: 7px 11px; background: var(--wash); font: 11px "Roboto Mono", Consolas, monospace; letter-spacing: .04em; }
+    .status .blocked { color: var(--alert); background: #f2e7e2; }
+    .lead { padding: 22px 26px; background: #f0f0e8; box-shadow: 0 12px 32px rgba(27,28,24,.04); font-size: 17px; }
+    section { margin-top: 48px; }
+    h2 { margin: 0 0 18px; font-size: 24px; letter-spacing: -.035em; }
+    p { margin: 0 0 14px; }
+    ol, ul { padding-left: 24px; margin: 12px 0; }
+    li { padding: 0 0 9px 5px; }
+    .core { display: grid; grid-template-columns: 40px 1fr; gap: 12px; padding: 13px 16px; margin: 7px 0; background: #f1f1e9; }
+    .index { color: var(--muted); font-size: 12px; padding-top: 3px; }
+    .note { padding: 18px 20px; margin: 18px 0; background: #f2e7e2; color: #54271f; }
+    .secondary { padding: 18px 20px; background: #edf1e9; color: #304334; }
+    .checks { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+    .check { padding: 15px 17px; background: var(--wash); }
+    .check strong { display: block; margin-bottom: 4px; }
+    code { font-size: .9em; overflow-wrap: anywhere; }
+    footer { margin-top: 56px; padding-top: 18px; color: var(--muted); font: 11px "Roboto Mono", Consolas, monospace; }
+    @media (max-width: 620px) { main { width: min(100% - 32px, 920px); padding-top: 40px; } .checks { grid-template-columns: 1fr; } .lead { padding: 18px; } }
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">DTOX Research · Publication ownership · 06.10.2026</div>
+  <h1>Публикация — это согласованная ревизия</h1>
+  <p class="dek">Видимость новой версии наступает после последовательных durable ACK и финального SQLite visibility commit.</p>
+  <div class="lead">DEPLOYED, first-publication only, 6 октября 15:54 UTC. Все шесть боевых хешей совпали, три службы active, NRestarts=0. Журнал создан; completed production job пока не наблюдалась. Исторические замены блокированы. <a href="2026-10-06-publication-release.html">Актуальный release report</a>.</div>
+
+  <section>
+    <h2>Когда публикация становится видимой</h2>
+    <p>Хранилища не образуют распределённую транзакцию. Записи идут последовательно; каждый durable ACK фиксируется до следующей системы.</p>
+    <div class="core"><div class="index">01</div><div>Проверить <code>chunk_cache</code> и точное совпадение <code>cache_hash</code> — это не original source cache.</div></div>
+    <div class="core"><div class="index">02</div><div>Получить ACK записи новой ревизии от Qdrant.</div></div>
+    <div class="core"><div class="index">03</div><div>Получить ACK chunk FTS для той же ревизии.</div></div>
+    <div class="core"><div class="index">04</div><div>После ACK одна SQLite-транзакция атомарно фиксирует видимые paper status и journal <code>published</code> / <code>done</code>.</div></div>
+    <p>Это SQLite visibility commit, не cross-store transaction. При частичном ACK внешние записи могут ждать retry/repair, но остаются невидимы через gate. Метаданные каталога, coarse index и paper-level FTS — вторичные eventual-consistency проекции.</p>
+    <p>Gate охватывает прямые fulltext пути: обычный Qdrant search/cache, hydration, scroll и grouped hierarchical stage B. Coarse collection остаётся вторичной проекцией.</p>
+  </section>
+
+  <section>
+    <h2>Правила допуска и замены</h2>
+    <p>Первая публикация допустима только для genuinely new документов с <code>completion_history.first_known=1</code> и <code>completed=0</code>.</p>
+    <p>Whitepaper consumer может создать immutable staged candidate для существующей <code>done</code> paper; <code>status != done</code> и stage/busy записи пропускаются. Genuinely new acquired whitepaper идёт обычным pipeline, где first-known записывается атомарно при admission.</p>
+    <p>Fulltext/chunk admission фильтрует first-known до <code>LIMIT</code>. Metadata synchronization меняет только <code>layers</code>/<code>year</code> через owned FTS rowids; body и cache не пересобираются. Для публикации требуется строгое <code>parse_status='ok'</code>. Completion SQL failure откатывается; retry ACK сохраняется и не допускает двойного учёта.</p>
+    <div class="note"><strong>Только исторические IACR / EIP-ERC / whitepaper replacements:</strong> валидированный source можно поместить в journal как <em>staged</em>, не published. Применение <strong>BLOCKED</strong> до точной legacy FTS migration и revision-aware old/new reader switch. Новые whitepaper acquisitions уже идут обычным pipeline; старые опубликованные данные до migration сохраняются.</div>
+    <p>Pending marked points могут занять позиции в top-K до hydration и фильтрации, временно снижая recall. Это не доказательство отсутствия текста. Unmarked legacy points видимы ради совместимости, но это не гарантия здоровья корпуса.</p>
+  </section>
+
+  <section>
+    <h2>Доказательства на сегодня</h2>
+    <div class="checks">
+      <div class="check"><strong>API / pipeline</strong>833 / 158 passed; 1 / 5 skipped.</div>
+      <div class="check"><strong>MCP / ops / x402 offline</strong>36 / 169 / 46 passed; не live payment E2E.</div>
+      <div class="check"><strong>Итого</strong>1242 passed + 6 skipped. Linux native subsets: 54 API и 72 pipeline passed, не прибавлены повторно.</div>
+      <div class="check"><strong>Статус</strong>DEPLOYED first-publication only. Кодовый backup: /opt/dtox-release-20261006/20261006T155411Z. Commit/push и migration не выполнялись.</div>
+      <div class="check"><strong>Live проверки</strong>12 read/preparation tools вызваны. Reads partial, completeness FAIL. Шесть поисковых ID sets сохранены, но paraphrase top-2 overlap 0/0/0: semantic accuracy не доказана.</div>
+    </div>
+    <p><strong>API command:</strong> <code>python -m unittest api.tests.test_publication_visibility api.tests.test_canonical_section_read api.tests.test_grouped_search api.tests.test_hier_rank_channels ops.tests.test_source_staging ops.tests.test_cached_reprocess_safety -q</code></p>
+    <p><strong>Pipeline command:</strong> <code>python -m unittest pipeline.tests.test_publication pipeline.tests.test_publication_failures pipeline.tests.test_parse_safety pipeline.tests.test_pipeline_audit_fixes pipeline.tests.test_fts_catalog pipeline.tests.test_build_fts_safety pipeline.tests.test_whitepaper_staging -q</code></p>
+  </section>
+
+  <section>
+    <h2>Архитектурная опора и следующие шаги</h2>
+    <p>Используются существующие <code>embed_step</code>, publication journal и shared FTS catalog с rowid-операциями, ограниченными owned rows. Новый service/broker и full scan не нужны. Доказательство глобальной уникальности legacy UUID mapping pending и требуется до reader switch.</p>
+    <p>Linux subsets и limited rollout завершены. MDX acquisition=spec-markdown, extraction=markdown_source, stored label latex сохранён, URL/hash неизменны. SSE клиент исправлен на UTF-8; реальная секция ровно 1000 символов. Validate после rollout: DAG 13.294 s, исходный DA-sampling 14.660 s успешны; причина первого сбоя не установлена.</p>
+  </section>
+
+  <section>
+    <h2>Что остаётся после ограниченного rollout</h2>
+    <ol>
+      <li>Явно согласовать unique UUID mapping для миграции legacy FTS identifiers.</li>
+      <li>Получить отдельное approval на revision replacement и old/new reader switch.</li>
+      <li>Подтвердить первую фактическую completed production job Qdrant + FTS; журнал пока пуст.</li>
+      <li>Отдельно закрыть semantic-quality и partial evidence gates, не подменяя их доступностью.</li>
+      <li>Определить SLO, alerts, rollout и rollback границы до отдельного release-решения.</li>
+    </ol>
+    <div class="secondary"><strong>Граница безопасности.</strong> Развёрнута только первая публикация; historical replacement и migration блокированы. При rollout writer кратко остановлен, API gate проверен первым. Full scan, reindex, secrets, платежи и hardware changes не затрагивались; новый service/broker не добавлен.</div>
+  </section>
+
+  <footer>LIMITED PRODUCTION RELEASE · Не полный production-ready PASS; live migrations не выполнялись.</footer>
+</main>
+</body>
+</html>

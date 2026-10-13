@@ -1,0 +1,92 @@
+{
+  "date": "2026-10-06",
+  "final_freeze": "PASS",
+  "deployment": {
+    "status": "DONE",
+    "scope": "narrow three-file deployment",
+    "production_sha256": {
+      "api": "c7fc69f0c393d8b21f6dabcfb28d37061c73589c6800b2e05da68ff12d81c586",
+      "mcp": "cca456af5e8c8579cf34d80375cd86bf1751696130812a567f66ccaa286fdbf9",
+      "extractor": "8a18ab4dd5eaf42be670d77eae6cbb63f1fc674dbf1f9ea56bdb5c56e912802f"
+    },
+    "all_three_services_active": true,
+    "post_deployment_api_health": "OK",
+    "api_startup_probe_status": 200
+  },
+  "readiness": "NOT CERTIFIED",
+  "test_results": {
+    "api_local": {"cases": 806, "passed": 805, "skipped": 1, "duration_seconds": 8.185},
+    "api_softguard_local": {"passed": 13},
+    "api_native_linux": {"cases": 13, "passed": 11, "skipped": 2, "duration_seconds": 0.189},
+    "mcp_local_windows": {"passed": 36},
+    "mcp_native_linux": {"passed": 8},
+    "pipeline_local_windows": {"passed": 58, "parser_version": "2.10", "deadline_override": true},
+    "parser_native_linux": {"passed": 2, "cached_snapshot_comparison": "PASS", "chunks_before": 77, "chunks_after": 90, "math_and_algorithm_payloads_byte_equal": true},
+    "old_timeout_native_linux": {"cases": 11, "passed": 9, "skipped": 2},
+    "candidate_builder_offline": {"passed": 9},
+    "planner_dry_run": {"tests_passed": 7, "additive_chunks": [77, 78, 79, 80], "apply_enabled": false}
+  },
+  "public_smokes": {
+    "runs": 2,
+    "each_run": {"http_calls_attempted": 10, "http_calls_completed": 10, "failed_assertions": 4},
+    "failed_assertions_are_http_error_responses": false,
+    "http_responses": "200 except 202 notification; expected managed 400/404 tool responses pass",
+    "smoke_v1_duration_seconds": 7.69,
+    "failure_breakdown": [
+      {"assertions": 2, "cause": "BADTEST EIP fixture requested algorithm/equation for an item indexed as CODE"},
+      {"assertions": 1, "cause": "Discussion retrieval against old snapshot"},
+      {"assertions": 1, "cause": "strict Web3 raw-ID comparison"}
+    ],
+    "passed_checks": {
+      "tool_inventory_count": 13,
+      "conflicting_ids_status": 400,
+      "missing_section_status": 404,
+      "missing_section_has_outline": true,
+      "memory_primary_candidates": 0,
+      "memory_unverified_candidates": 3
+    }
+  },
+  "corrected_code_alias_check": {
+    "http_calls": 4,
+    "passed": true,
+    "both_identifier_variants_returned_code_blocks": true,
+    "code_blocks_per_variant": 7,
+    "truncated": true,
+    "partial": false,
+    "compared_fragment_characters": 100,
+    "compared_fragment_sha256": "14bb1c05f88c5900a68348137852067fb1b0df3836f77eb60d9f8a20b68d0c9d",
+    "all_seven_blocks_compared": false,
+    "offline_runner_sha256": "2a96fab5e60cb059d5421e1f68cf39051137718ed7ed766b3df4cc0b46e31910",
+    "offline_tests_passed": 4,
+    "used_for_public_ten_call_smokes": false
+  },
+  "web3_identity_check": {
+    "exact_raw_ids_equal": 9,
+    "raw_id_comparison_total": 10,
+    "changed_id": {"before": "wp:flashbots-mev", "after": "oa:W2938920845"},
+    "same_work": "FlashBoys 2.0",
+    "same_url": "https://arxiv.org/pdf/1904.05234",
+    "reciprocal_twins": true,
+    "manual_source_identity_preserved": 10,
+    "source_identity_total": 10,
+    "ranking_improvement_proven": false
+  },
+  "old_indexed_data": {
+    "status": "BLOCKED",
+    "fts_mapped": false,
+    "mapped_rows": 0,
+    "atomic_journal_exists": false,
+    "deployed_fix_repairs_old_record": false,
+    "fts_cache_qdrant_write_performed": false,
+    "reindex_performed": false
+  },
+  "other_changes": {
+    "environment_changes": false,
+    "payment_changes": false,
+    "access_changes": false,
+    "chain_changes": false,
+    "commit": false,
+    "push": false,
+    "readiness_score_assigned": false
+  }
+}

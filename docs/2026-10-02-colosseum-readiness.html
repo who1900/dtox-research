@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+  <title>DTOX | Готовность к Colosseum | 02.10.2026</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #fafaf3;
+      --ink: #1a1a1a;
+      --soft: #eeeee6;
+      --muted: #55554e;
+      --space: 24px;
+      --sans: Inter, Arial, sans-serif;
+      --mono: "Roboto Mono", Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    html { background: var(--paper); color: var(--ink); }
+    body { margin: 0; font: 16px/1.65 var(--sans); -webkit-font-smoothing: antialiased; }
+    main { max-width: 1120px; margin: 0 auto; padding: 64px 32px 48px; }
+    h1, h2, h3, p { margin: 0; }
+    h1 { max-width: 900px; margin: 24px 0 32px; font-size: clamp(40px, 6vw, 76px); line-height: 1.04; letter-spacing: -0.055em; font-weight: 700; }
+    h2 { margin-bottom: 20px; font-size: 28px; line-height: 1.2; letter-spacing: -0.035em; }
+    h3 { margin-bottom: 8px; font-size: 18px; line-height: 1.35; letter-spacing: -0.02em; }
+    p + p { margin-top: 16px; }
+    a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: 4px; overflow-wrap: anywhere; }
+    a:focus-visible { outline: 2px solid var(--ink); outline-offset: 4px; }
+    code, .meta, .number, th, td:first-child { font-family: var(--mono); }
+    code { font-size: 0.9em; overflow-wrap: anywhere; }
+    .meta { font-size: 12px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
+    .intro { max-width: 72ch; }
+    .decision { margin-top: 32px; padding: 32px; background: var(--ink); color: var(--paper); box-shadow: 0 8px 24px rgba(27, 28, 24, 0.04); }
+    .decision .meta { color: var(--paper); }
+    .decision p { max-width: 75ch; }
+    .decision h2 { margin-top: 12px; }
+    section { margin-top: 56px; }
+    .section-head { display: grid; grid-template-columns: 64px 1fr; gap: 16px; align-items: baseline; }
+    .number { font-size: 14px; color: var(--muted); }
+    .section-body { margin-left: 80px; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; }
+    .panel { padding: 24px; background: var(--soft); }
+    .panel p { font-size: 15px; }
+    .table-wrap { overflow-x: auto; margin: 20px 0; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    caption { text-align: left; color: var(--muted); margin-bottom: 12px; font-size: 13px; }
+    th, td { padding: 12px 16px; text-align: left; vertical-align: top; }
+    th { background: var(--ink); color: var(--paper); font-size: 12px; font-weight: 400; }
+    tbody tr:nth-child(odd) { background: var(--soft); }
+    td:not(:first-child) { font-variant-numeric: tabular-nums; white-space: nowrap; }
+    ul, ol { padding-left: 24px; margin: 16px 0 0; }
+    li + li { margin-top: 12px; }
+    .small { color: var(--muted); font-size: 13px; }
+    footer { margin-top: 56px; padding: 24px; background: var(--soft); }
+    footer p { max-width: 90ch; font-size: 13px; }
+    @media (max-width: 700px) {
+      main { padding: 40px 20px 32px; }
+      .decision { padding: 24px; }
+      .section-head { grid-template-columns: 32px 1fr; gap: 12px; }
+      .section-body { margin-left: 0; }
+      .grid { grid-template-columns: 1fr; }
+      h2 { font-size: 25px; }
+      th, td { padding: 12px; }
+    }
+    @media print {
+      main { max-width: none; padding: 0; }
+      body { font-size: 11pt; }
+      h1 { font-size: 34pt; }
+      section { margin-top: 28px; }
+      .panel, .decision, tr { break-inside: avoid; }
+      a { text-decoration: underline; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="meta">DTOX Research / инженерная оценка / 02.10.2026</p>
+      <h1>Сильный MVP.<br>Заявка ещё не готова.</h1>
+      <p class="intro">Ограниченный аудит готовности к Colosseum. HEAD <code>7e22e68</code>; текущий <a href="https://github.com/who1900/dtox-research/actions/runs/36922278149">GitHub CI 36922278149 успешен</a>. Факты и официальные ссылки предоставлены главным агентом; новых сетевых проверок здесь нет.</p>
+      <div class="decision">
+        <p class="meta">Вердикт / субъективная оценка</p>
+        <h2>Идея 8/10. Hackathon MVP убедителен.</h2>
+        <p>Финальная заявка не готова к отправке как есть. Техническая готовность к подаче условна из-за двух P1 ниже. Production-релиз не подписан; mainnet не оценён. Оценка идеи не является вероятностью победы. Основная ценность: цепочка от научного и протокольного источника до ограниченного пакета доказательств и проверяемого авторства вердикта.</p>
+      </div>
+    </header>
+
+    <section aria-labelledby="evidence-title">
+      <div class="section-head"><span class="number">01</span><h2 id="evidence-title">Что уже доказано</h2></div>
+      <div class="section-body grid">
+        <article class="panel">
+          <h3>Рабочая исследовательская поверхность</h3>
+          <p><a href="2026-10-02-full-tool-test.md">Существующий отчёт 02.10</a>: 590 тестов passed, 1 skip. Тесты повторно не запускались. Вызваны 13 инструментов, но успешная signed-запись live не проверена; paid E2E не выполнен. Моки не заменяют оплату и on-chain подтверждение. <code>isError=false</code> при ошибке относится к public MCP; REST fee wrappers уже распознают <code>parsed.error</code>.</p>
+        </article>
+        <article class="panel">
+          <h3>Качество измерено, не гарантировано</h3>
+          <p>Adapted fast golden: 13/15 PASS, 2 FAIL, MEDA и Chainlink. Web3 fixture: 7/9 PASS, 2 FAIL, Chainlink v2 и описательный EIP-7702. Формулы, числовые таблицы и бюджеты чтения показаны в отчёте; разные глубины проверки нельзя смешивать в один показатель.</p>
+        </article>
+      </div>
+    </section>
+
+    <section aria-labelledby="corpus-title">
+      <div class="section-head"><span class="number">02</span><h2 id="corpus-title">Корпус и операционный риск</h2></div>
+      <div class="section-body">
+        <div class="table-wrap">
+          <table>
+            <caption>Публичные snapshots <a href="https://read.whoim.space/research/stats.json">stats.json</a>, предоставленные главным агентом. Web3 здесь считает raw records.</caption>
+            <thead><tr><th scope="col">Метрика</th><th scope="col">01.10 / 21:00Z</th><th scope="col">02.10 / 14:00Z</th></tr></thead>
+            <tbody>
+              <tr><td>Документы</td><td>179 671</td><td>180 101</td></tr>
+              <tr><td>Chunks</td><td>10 693 370</td><td>10 735 072</td></tr>
+              <tr><td>Citation edges</td><td>3 372 827</td><td>3 377 328</td></tr>
+              <tr><td>Web3 raw</td><td>17 228</td><td>17 243</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>За 17 часов net +430 документов и +15 Web3. Это изменение счётчиков, не измерение первых ingestion completions: журнала нет. Текущий SSH monitor: 180 102 done, 13 queued; heartbeat всех 14 стадий свежий, Qdrant green, API/embed/MCP с 13 инструментами OK, backup 13 часов. Cached public 180 101 и SSH 180 102 относятся к разным моментам, не count bug; raw/canonical Web3 намеренно различаются.</p>
+        <p>Disk FAIL подтверждён: свободно 39 GB при guard 40 GB. Свежий Oracle read-only snapshot: Qdrant 9.443/10 GiB, 94.43% cap, CPU 0.07%. Старые 96.39% не текущая оценка. p95 окна 2.594 s, 31 sample, не SLO. Защита от OOM не создаёт headroom; доступность не доказывает долгосрочную устойчивость.</p>
+      </div>
+    </section>
+
+    <section aria-labelledby="security-title">
+      <div class="section-head"><span class="number">03</span><h2 id="security-title">Подтверждённые source findings</h2></div>
+      <div class="section-body">
+        <p>Пути кода проверены главным агентом; эксплуатация не выполнялась. Это оценка, не исправление.</p>
+        <ul>
+          <li><strong>P1 / replay отката аттестации.</strong> <a href="../attestor/src/sas.ts">sas.ts:303</a>: <code>sameRecord</code> сохраняет только точный повтор; отличающаяся запись закрывается и создаётся на том же PDA без monotonic guard <code>issued_at</code>. <a href="../attestor/src/message.ts">message.ts:104</a>: окно 10 минут допускает старую валидную A после новой B. С захваченной публичной подписью возможен A → B → A внутри окна. Рекомендация: отклонять более старые updates, сохраняя idempotency одинаковой пары.</li>
+          <li><strong>P1 / quota poisoning.</strong> <a href="../attestor/src/server.ts">server.ts:201</a>: <code>checkRateLimit(reviewer)</code> выполняется до <code>verifyVerdictSignature</code> на строке 228. Public signed MCP через <a href="../api/main.py">api/main.py:4412</a> пересылает invalid calls. 30 поддельных, корректно сформированных запросов расходуют quota чужого reviewer. Рекомендация: проверять подпись до identity quota, отдельно ограничивать invalid requests по IP.</li>
+          <li><strong>P2 / health может писать.</strong> <a href="../attestor/src/server.ts">server.ts:97</a>: <code>ensureCredential/ensureSchema</code> могут bootstrap on-chain при отсутствии объектов. <code>healthz</code> исключён из internal-token проверки на строке 71, но сервис loopback-bound: это не unrestricted remote critical. Сегодня attestor health намеренно не вызывали во избежание записей.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section aria-labelledby="drift-title">
+      <div class="section-head"><span class="number">04</span><h2 id="drift-title">Что исправить в заявке</h2></div>
+      <div class="section-body">
+        <ul>
+          <li><a href="../SUBMISSION.md">SUBMISSION</a> и <a href="../DEMO_SCRIPT.md">DEMO_SCRIPT</a> устарели: 12 вместо 13 инструментов, старые счётчики, Golden 17/17 не свежая проверка. Заменить исторические формулировки и явно разделить результаты.</li>
+          <li>Разные кошельки не устанавливают settled quorum. <a href="../api/registry_policy.py">Сервер требует доверенное разнообразие моделей</a>; свежая подпись без этого остаётся pending, не confirmed. Подпись удостоверяет авторство, не истину и не независимость.</li>
+          <li>IACR/full-text определяется записью и provenance, не семейством источника; не каждый ответ содержит snapshot. <a href="../README.md">README</a> описывает эти ограничения точнее.</li>
+          <li>Owner TODO: команда, контакт, demo video, demand evidence; в <a href="../SECURITY.md">SECURITY</a> отсутствует прямой security-контакт. Подтверждённая тракция в изученных материалах отсутствует.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section aria-labelledby="rules-title">
+      <div class="section-head"><span class="number">05</span><h2 id="rules-title">Подача и позиционирование</h2></div>
+      <div class="section-body">
+        <p>Дедлайн <a href="https://colosseum.com/worldsfair">World's Fair</a> и <a href="https://colosseum.com/legal/Crypto%20World%27s%20Fair%20Hackathon%20Rules.pdf">официальных правил</a>: 12.10.2026, 23:59 PT, то есть 13.10, 11:59 Asia/Qyzylorda. Английская подача; один проект на человека/команду.</p>
+        <p><a href="https://colosseum.com/hackathon?year=fall2026">Текущий FAQ</a>: preexisting code разрешён при раскрытии; оценивается работа 14.09 по 12.10. Подготовить и проверить оба готовых видео: presentation 2-3 минуты и product demo не более 3 минут, плюс go-to-market, команда и background. Скрипт не равен готовым видео. Старое правило двух месяцев из блога 2024 не применяется. Регистрационная допустимость и соответствие критерию отсутствия существенного финансирования не проверены.</p>
+        <p>Треки экосистемные, не отдельные AI-треки. Позиция: Solana с историческим devnet proof и multichain roadmap, без гонки за четырьмя сетями. Проверенная live-конфигурация paid x402: только Solana devnet. Исторический receipt есть в <a href="../SUBMISSION.md">SUBMISSION</a>; paid E2E текущей сборки неизвестен, production settlement не подтверждён. <a href="../x402-gateway/src/config.ts">config.ts:23</a>: generic <code>ExactEvmScheme</code> допускает настройку Base/Ethereum/Arbitrum; defaults Base Sepolia 84532, Ethereum Sepolia 11155111, Arbitrum Sepolia 421614. Код и testnet configuration не доказывают live settlement в трёх EVM-сетях; его демонстрация остаётся будущей работой.</p>
+      </div>
+    </section>
+
+    <section aria-labelledby="market-title">
+      <div class="section-head"><span class="number">06</span><h2 id="market-title">Отличие, а не ложная уникальность</h2></div>
+      <div class="section-body">
+        <p><a href="https://elicit.com/blog/the-elicit-api-and-mcp-powering-autonomous-research-engines">Elicit</a> уже предлагает API/MCP, full-text и structured review. <a href="https://github.com/blazickjp/arxiv-mcp-server">arxiv-mcp-server</a> уже имеет LaTeX по секциям, citation graph и bounded reads. <a href="https://colosseum.com/copilot">Colosseum Copilot</a> уже исследует проекты. Только публичные официальные источники: Copilot API не вызывался, окружение не настроено; personalized score v2 не заявляется.</p>
+        <p>Преимущество DTOX: сочетание Web3 specs, научной математики, failure limitations, bounded provenance, x402 и переносимого wallet-authorship. Уникальность MCP/full-text/LaTeX и превосходство качества не доказаны; head-to-head сравнения нет.</p>
+        <p>Paid/free duplication подтверждён в <a href="../x402-gateway/src/upstream.ts">upstream.ts:37</a> и <a href="../mcp/server.py">public MCP spec/signed</a>. Нужна убедительная дифференциация платного сервиса и будущая политика, пока beta остаётся бесплатной; автоматический paywall сейчас не вводить. <a href="https://info.arxiv.org/help/license/index.html">Лицензии arXiv различаются по документам</a>. В материалах есть source-family banner, но нет per-document policy: для коммерческой выдачи нужно определить допустимость и объём использования по конкретной лицензии; общий banner не закрывает вопрос. Это не утверждение о незаконности платного цитирования.</p>
+      </div>
+    </section>
+
+    <section aria-labelledby="priorities-title">
+      <div class="section-head"><span class="number">07</span><h2 id="priorities-title">До отправки</h2></div>
+      <div class="section-body">
+        <ol>
+          <li>Закрыть оба P1 при отдельном разрешении; обеспечить disk/memory headroom. До этого техническая подача условна, production/mainnet sign-off отсутствует.</li>
+          <li>Согласовать документы; подготовить и проверить оба видео по checklist, не только сценарий. Заполнить owner-поля, раскрыть работу до конкурса.</li>
+          <li>Подготовить стабильное Web3-first E2E демо: формула, limitations, источник, devnet payment receipt, подписанный pending-verdict. Не обещать автоматическое подтверждение.</li>
+          <li>Если позже разрешено, повторить только два retrieval miss: MEDA и Chainlink. Отдельно сохранить описательный EIP-7702 как известный Web3 gap.</li>
+          <li>Получить отзывы 3-5 внешних пилотов: цель demand validation, не существующая тракция. Описать free/paid политику и проверить права по документам.</li>
+        </ol>
+        <p class="small">Future hardening, не deadline blocker: <code>corpus.as_of</code> сам по себе не immutable reproducible query snapshot. Для обещания воспроизводимости нужны query params, build/model/index versions, registry revision и evidence hashes.</p>
+      </div>
+    </section>
+
+    <footer>
+      <p class="meta">Границы работы</p>
+      <p>Рекомендации не реализованы. Только локальный отчёт добавлен; код и конфигурация не изменены. Без новых тестов, коммитов, paid calls, on-chain writes, deploys и чтения секретов. Нет JS, аналитики или сетевых ресурсов; шрифты используют только локальные fallbacks. Снимки не являются непрерывным мониторингом.</p>
+    </footer>
+  </main>
+</body>
+</html>

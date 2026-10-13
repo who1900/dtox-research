@@ -1,0 +1,37 @@
+# Release gate plan: 2026-10-04
+
+## Scope and preregistered holdout
+
+Use [`eval/paraphrase_release_20261004.json`](../eval/paraphrase_release_20261004.json) as frozen v2 for a controlled retrieval cohort: 8 technical claims × 3 distinctly phrased queries authored for this fixture = 24 queries. This is an agent-authored holdout, not independent expert-labelled data. Each claim has at least two accepted original-paper anchors and a mechanism-specific hard negative. The query text does not include paper names or IDs. The DAG-BFT sources [Narwhal/Tusk](https://arxiv.org/abs/2105.11827) and [Bullshark](https://arxiv.org/abs/2201.05677), plus the data-availability sources [LazyLedger](https://arxiv.org/abs/1905.09274) and [Fraud and Data Availability Proofs](https://arxiv.org/abs/1809.09044), were checked against their primary records. No live query has run. Status is `frozen_before_live`; after a live query starts, any correction requires a new dated fixture.
+
+The release core has priority in the cohort: 2 consensus/data-availability groups (6 queries) use `web3`, 4 model-method groups (12 queries) use `llm-slm`, and 2 smart-contract developer/security-tooling groups (6 queries) use `builder-tech`. Pure vision/image recognition was removed because it does not match the language-model layer. Do not reinterpret `builder-tech` as “LLM only”; caller/UI context does not override the corpus layer.
+
+Main approved fixture v2 and will run an isolated in-process baseline/candidate comparison on Contabo against production read-only indexes. This task did not run it; no live scores exist yet. Use the 24 fixed queries in four variants: baseline and candidate imports, each with discovery OFF and ON. Reuse shared query vectors, rotate variant order, disable cache, and enforce 180 seconds wall time, 150% CPU, and 1536 MiB memory. Timing is retrieval-only and excludes embedding. Production `SOURCE_DISCOVERY` remains OFF; discovery ON is confined to the private experimental process and must not be enabled on the service. Keep the query cap at 30, `strict=false`, limit 10, and record build identity, UTC times, errors, partial status, and raw results. Do not edit queries, anchors, or layers after the first live query; corrections then require a new dated fixture.
+
+Frozen fixture SHA-256 fingerprint (raw file bytes): `9b666344cd3e137e0fe532046b5a13e59c23c5e5c907628e7f1b1e597d0ab5ff`. The offline test pins the exact fixture bytes.
+
+## Separate quality gates
+
+1. **Fixture integrity:** 24/24 distinct queries, exactly three per group, layer assignment preserved, no exact wording or positive-anchor overlap with the existing fresh fixture. Do not edit prompts, expected sources, or layers after a run to improve its result; corrections require a new dated fixture.
+2. **Source identity and coverage:** existing-index membership preflight remains incomplete for some expected IDs. Resolve each expected ID read-only against indexed metadata/catalog and its primary source record; do not drop unresolved or unknown IDs. The read-only probe selected `source_url` for all 29 checked records and observed `NULL` in every row. The ingest `INSERT` omits `source_url`, which is the documented metadata gap; do not describe this as a SQL query that excluded the column. A null URL is not proof that the paper is absent from the index. Record `indexed`, `not indexed`, `identity unresolved`, or `unknown`. An unindexed target is a corpus-coverage limitation, not a retrieval miss. Report the original 24-query denominator and separately show source-availability strata.
+3. **Paraphrase retrieval:** report valid-answer hit@3/hit@10, first accepted-anchor rank, per-group all-three hit@10, and operational invalid/partial counts. These are anchor-recovery measures only, not anchor precision, general relevance precision, exhaustive recall, or evidence that unlisted papers are wrong. Keep explicit mechanism-contrast flags and hard-negative observations in a separate table with rank; inspect the returned record/passages before interpretation. Never convert a negative hit/rank into an automatic false-positive label.
+4. **Evidence accuracy:** independently inspect retrieved primary-source passages for whether they support the focal mechanism, not merely whether the paper ID matches. Keep evidence-support outcomes and unresolved/no-excerpt cases separate from retrieval hits. No human blinded judgments are available for this release; do not claim independent human relevance or use the automated scorer as a substitute.
+5. **Release security:** Main has not authorized anonymous writes, recovery/restore, or chain writes. Do not infer authorization from a tool inventory. This comparison requires no writes; do not invoke signed writes or probe a live public write endpoint.
+
+6. **Attribution URL boundary:** the attribution patch validates URL syntax and HTTP(S) shape, but does not resolve DNS, restrict private/local IP ranges, or check live URL availability. The API attribution path does not fetch candidate source URLs. A payload URL is marked `source_not_verified`; treat it as display/provenance metadata, not an authenticated source. Any downstream URL fetcher must apply its own SSRF protections and redirect validation.
+
+## Operational / chain gates
+
+- Backup proof is read-only: compare snapshot timestamp, manifest/source-time coverage, recorded checksum, and current health/resource headroom. The September 27 full-text snapshot is 32.49 GB; the full Qdrant/application restore remains unverified. Do not run an actual restore under this plan. Any isolated restore exercise needs separate explicit approval, fresh disk/RAM measurements, a controlled window, and an owner-approved rollback plan. A snapshot hash alone is not recovery proof.
+- Main reports a live preflight with four services active and SHA unchanged. This is reported evidence only; this task did not re-probe services or independently verify the SHA.
+- The last recorded devnet proof is October 3, 2026: a previously authorized 0.01 USDC devnet payment/signed write and registry counts of 54 nodes / 16 judgments / 2 links. Do not repeat the payment or write unless Main explicitly authorizes it. This plan does not request or imply such authorization.
+- Production and mainnet remain NO-GO pending the separately documented recovery and release blockers. Make no mainnet or EVM deployment/validation claim from devnet evidence or this retrieval fixture.
+- No secrets, `.env` reads, deployment, service mutation, paid judges, or chain/network writes are in scope.
+
+## Decision record
+
+This document records the preregistration, not a release pass. Fixture v2 was frozen before live retrieval. At freeze, scores and some expected-ID membership checks were unavailable. Independent blinded relevance, full application restore and live anonymous-write authorization were not established. Report every gate according to collected evidence, without replacing unknowns with a pass.
+
+## Subsequent execution
+
+Main completed the 24-query isolated comparison and deployed the narrow attribution fix. See [the release evidence](2026-10-04-attribution-release.md) for results, partial responses, the negative speed result, public smoke checks and remaining blockers. Earlier statements about no live run describe the preregistration moment. The fixture itself remains unchanged. Production discovery remains OFF; full production readiness is not established.

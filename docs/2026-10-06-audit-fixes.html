@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>External audit fixes | 2026-10-06</title>
+  <style>
+    :root { color-scheme: light; --paper: #fafaf3; --ink: #1a1a1a; --muted: #66665f; --wash: #eeeee5; --alert: #7b2d20; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.6 Inter, system-ui, sans-serif; }
+    main { width: min(880px, calc(100% - 40px)); margin: 72px auto; }
+    h1, h2 { line-height: 1.12; letter-spacing: -.035em; }
+    h1 { max-width: 720px; font-size: clamp(2.4rem, 7vw, 4.8rem); margin: 14px 0 28px; }
+    h2 { margin-top: 52px; font-size: 1.7rem; }
+    p, li { max-width: 75ch; }
+    .eyebrow, dt, .mono { font: 12px/1.5 "Roboto Mono", ui-monospace, monospace; letter-spacing: .04em; }
+    .eyebrow, dt { color: var(--muted); text-transform: uppercase; }
+    .status { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 3px; margin: 30px 0; background: var(--paper); }
+    .status > div { padding: 16px; background: var(--wash); }
+    dd { margin: 5px 0 0; font-weight: 650; }
+    .not-deployed { color: var(--alert); }
+    .note { padding: 18px 20px; background: var(--wash); }
+    table { width: 100%; border-collapse: collapse; margin: 18px 0; text-align: left; }
+    th, td { padding: 11px 12px; vertical-align: top; background: var(--wash); }
+    tr + tr th, tr + tr td { border-top: 3px solid var(--paper); }
+    th { width: 38%; font-weight: 600; }
+    code { font: .9em "Roboto Mono", ui-monospace, monospace; overflow-wrap: anywhere; }
+    ul { padding-left: 22px; }
+    footer { margin-top: 56px; padding-top: 18px; color: var(--muted); background: linear-gradient(var(--muted), var(--muted)) top / 100% 1px no-repeat; font-size: .9rem; }
+    @media (max-width: 600px) { main { margin: 38px auto; } .status { grid-template-columns: 1fr; } th { width: 42%; } }
+  </style>
+</head>
+<body>
+<main>
+  <p class="eyebrow">External audit | 2026-10-06 | Local and deployment evidence</p>
+  <h1>External audit fixes</h1>
+  <p class="note"><strong>Follow-up:</strong> This page preserves the pre-repair audit and failed-smoke record. Current one-record repair results and remaining legacy-data limits are in the <a href="2026-10-06-prose-repair.html">prose repair report</a>.</p>
+  <p class="note"><strong>Final freeze PASS. Narrow deployment completed. Public smoke has failed assertions.</strong>
+    Readiness is NOT CERTIFIED. The old indexed-data blocker remains unresolved.</p>
+
+  <dl class="status" aria-label="Release status">
+    <div><dt>Final freeze</dt><dd>PASS</dd></div>
+    <div><dt>Deployment</dt><dd>DONE, 3 files</dd></div>
+    <div><dt>Readiness</dt><dd>NOT CERTIFIED</dd></div>
+  </dl>
+
+  <p>This report covers API search and sections, parser and chunk extraction,
+    MCP paper-ID compatibility, deployment health, public smokes, and the
+    separate state of old indexed data. The work is partially resolved.</p>
+
+  <h2>Three fix areas</h2>
+  <ol>
+    <li><strong>API search and paper sections.</strong> Candidate filtering checks active filters; an empty LLM query returns no primary results, with up to 3 unverified source candidates. Final local API suite: <strong>806 cases, 805 passed, 1 skipped, 8.185 s</strong>; softguard suite: <strong>13 passed</strong>. Linux-native API suite: <strong>13 cases, 11 passed, 2 skipped, 0.189 s</strong>. API production hash: <code>c7fc69f0c393d8b21f6dabcfb28d37061c73589c6800b2e05da68ff12d81c586</code>.</li>
+    <li><strong>Parser and chunk extraction.</strong> Windows local parser suite: <strong>58 passed</strong> with pinned parser 2.10 and deadline override. Linux-native parser checks: <strong>2 passed</strong>; exact cached-snapshot comparison passed. Snapshot grew from 77 to 90 chunks; Discussion was restored and math and algorithm payloads were byte-equal. Extractor production hash: <code>8a18ab4dd5eaf42be670d77eae6cbb63f1fc674dbf1f9ea56bdb5c56e912802f</code>.</li>
+    <li><strong>MCP paper IDs.</strong> Neutral ID arguments coexist with legacy names and positional calls; missing, invalid, or conflicting IDs fail before outbound HTTP. Windows local MCP suite: <strong>36 passed</strong>; focused Linux-native MCP suite: <strong>8 passed</strong>. MCP production hash: <code>cca456af5e8c8579cf34d80375cd86bf1751696130812a567f66ccaa286fdbf9</code>.</li>
+  </ol>
+
+  <h2>Deployment and public smoke</h2>
+  <p>Main reports deployment of the narrow 3-file candidate. All 3 services were active; the post-deployment API health probe returned <strong>200 / OK</strong>. A final-script curl line had a CRLF malformed-URL issue and is not a product failure. Small p95 samples do not establish an SLO.</p>
+  <p>Two public smoke runs each attempted and completed <strong>10/10 HTTP calls</strong>. Each had <strong>4 failed assertions</strong>, not 4 HTTP error responses. Smoke v1 took <strong>7.69 s</strong>. HTTP responses were 200 except for a 202 notification; expected managed 400/404 tool responses passed.</p>
+  <ul>
+    <li>Two invalid-spec assertions used a BADTEST fixture that asked for algorithm/equation on an EIP item indexed as <code>CODE</code>. This is a fixture mismatch, not an empty-result bug.</li>
+    <li>Discussion retrieval failed against the old snapshot in both runs.</li>
+    <li>Web3 raw-ID ordering matched <strong>9/10</strong> exact IDs at unchanged ranks. One changed from <code>wp:flashbots-mev</code> to <code>oa:W2938920845</code>. Both records identify FlashBoys 2.0 at <code>https://arxiv.org/pdf/1904.05234</code>, reciprocal twins. Manual source identity was <strong>10/10</strong>. The strict raw-ID assertion remains failed; IDs were not rewritten and this is not evidence of ranking improvement.</li>
+    <li>Passed checks included inventory 13, conflict response 400, rich section 404 outline, and memory search with 0 primary plus 3 unverified candidates.</li>
+  </ul>
+  <p>A separate corrected CODE alias check made <strong>4/4 HTTP calls</strong>. Both ID forms returned 7 code blocks, <code>truncated=true</code>, <code>partial=false</code>. Only the first 100 characters were compared; hash <code>14bb1c05f88c5900a68348137852067fb1b0df3836f77eb60d9f8a20b68d0c9d</code> matched. This does not prove all seven blocks equal. Runner hash <code>2a96fab5e60cb059d5421e1f68cf39051137718ed7ed766b3df4cc0b46e31910</code>; offline tests 4 passed. This runner was not used for the 10-call live smokes.</p>
+
+  <h2>Existing indexed data: BLOCKED</h2>
+  <p>Old-snapshot FTS mapping preflight: <code>mapped=false</code>, <strong>0 rows</strong>, and no atomic journal. Planner dry-run proposed 4 additive chunks (77-80) and passed 7 tests; apply remains disabled. The deployed fix prevents future loss but does not repair the old record. No FTS, cache, or Qdrant write and no reindex were performed. Durable journaling and index mapping are prerequisites.</p>
+
+  <h2>Additional offline evidence</h2>
+  <p>Linux-native old-timeout candidate tests: <strong>9 passed, 2 skipped (11 cases)</strong>. Candidate builder: <strong>9 passed</strong>. Planner tests: <strong>7 passed</strong>.</p>
+
+  <h2>Identifier contract</h2>
+  <ul>
+    <li><code>get_code_or_math_spec</code> prefers <code>paper_id</code> and still accepts legacy <code>arxiv_id</code>.</li>
+    <li><code>compare_methods</code> prefers <code>paper_id_a</code> / <code>paper_id_b</code> and still accepts <code>arxiv_id_a</code> / <code>arxiv_id_b</code>.</li>
+    <li>New and legacy schema properties are optional; the tool validates required IDs and ambiguity itself. Missing or conflicting values return MCP <code>ToolError</code> before HTTP. Equal values after surrounding whitespace trim are accepted.</li>
+    <li>Old positional ordering is preserved. IDs are not rewritten to an assumed provider prefix. Existing path quoting remains; EIP IDs and IACR IDs with slash are covered offline.</li>
+    <li>Existing response fields remain. A caller-ID <code>paper_id</code> alias is added only when absent; existing <code>arxiv_id</code> values are preserved.</li>
+    <li>Tool documentation now says indexed structured elements; PDF-derived equations are not guaranteed to be exact raw LaTeX.</li>
+  </ul>
+
+  <h2>Function-only splice targets</h2>
+  <p><code>ops/prepare_audit_fix_patch.py</code> constructs a fresh candidate from
+    a Git baseline or an explicitly SHA-256-verified baseline file, plus current
+    source. It selects unique top-level functions, preserves decorators and
+    annotations, checks selected ASTs, copies no imports or globals, and
+    preserves text outside selected spans. Builder tests reported 9 passed.</p>
+  <table>
+    <tbody>
+      <tr><th>Insert helper</th><td><code>_resolve_paper_id</code></td></tr>
+      <tr><th>Replace function</th><td><code>get_code_or_math_spec</code></td></tr>
+      <tr><th>Replace function</th><td><code>compare_methods</code></td></tr>
+      <tr><th>Additional imports/constants</th><td>None. <code>Optional</code>, MCP <code>ToolError</code>, URL quoting, and error helpers already exist in the baseline module.</td></tr>
+    </tbody>
+  </table>
+  <p>Baseline source is supplied by the caller and hash-verified before build.</p>
+
+  <h2>Verification summary</h2>
+  <ul>
+    <li>API local 805/806 passed; native API 11 passed, 2 skipped. MCP local 36 passed; native MCP 8 passed.</li>
+    <li>Pipeline local 58 passed; native parser 2 passed and cached-snapshot comparison passed.</li>
+    <li>Old-timeout native 9 passed, 2 skipped. Builder 9 passed. Corrected alias runner 4 passed offline.</li>
+    <li>Each public smoke had 4 failed assertions. No index repair/write, environment, payment, access, or chain changes, commit, or push.</li>
+  </ul>
+
+  <h2>Release state: PARTIALLY RESOLVED</h2>
+  <p>Final freeze passed and the narrow deployment is confirmed. Readiness is
+    <strong>NOT CERTIFIED</strong>. The old snapshot remains broken: FTS mapping is
+    false with 0 rows and there is no atomic journal. The deployed fix prevents
+    future loss but does not repair existing data. No readiness score is assigned.</p>
+
+  <footer>Evidence reflects the reported local, native, deployment, and public-smoke results. The remaining old-data blocker is explicit.</footer>
+</main>
+</body>
+</html>

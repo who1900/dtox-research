@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SnapKV Discussion prose repair | 2026-10-06</title>
+  <style>
+    :root { color-scheme: light; --paper: #fafaf3; --ink: #1a1a1a; --muted: #66665f; --wash: #eeeee5; --alert: #7b2d20; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.6 Inter, system-ui, sans-serif; }
+    main { width: min(880px, calc(100% - 40px)); margin: 64px auto; }
+    h1, h2 { line-height: 1.12; letter-spacing: -.035em; }
+    h1 { max-width: 760px; font-size: clamp(2.3rem, 7vw, 4.4rem); margin: 14px 0 24px; }
+    h2 { margin-top: 42px; font-size: 1.6rem; }
+    p, li { max-width: 78ch; }
+    .eyebrow, dt, code { font-family: "Roboto Mono", ui-monospace, monospace; }
+    .eyebrow, dt { color: var(--muted); font-size: 12px; letter-spacing: .04em; text-transform: uppercase; }
+    .status { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 3px; margin: 28px 0; }
+    .status > div { padding: 15px; background: var(--wash); }
+    dd { margin: 5px 0 0; font-weight: 650; }
+    .alert { color: var(--alert); }
+    .note { padding: 16px 18px; background: var(--wash); }
+    code { font-size: .88em; overflow-wrap: anywhere; }
+    ul { padding-left: 22px; }
+    footer { margin-top: 48px; padding-top: 16px; color: var(--muted); border-top: 1px solid var(--wash); font-size: .9rem; }
+    @media (max-width: 620px) { main { margin: 36px auto; } .status { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <p class="eyebrow">Repair evidence | 2026-10-06 | SnapKV, arXiv 2404.14469</p>
+  <h1>Discussion prose repair</h1>
+  <p class="note"><strong>One bounded missing-prose repair completed.</strong>
+    Readiness remains <strong>NOT CERTIFIED</strong>. The old whole-paper FTS mapping remains unresolved.</p>
+
+  <dl class="status" aria-label="Repair status">
+    <div><dt>Journal stage</dt><dd>DONE</dd></div>
+    <div><dt>Bounded FTS MATCH</dt><dd>PASS, new row only</dd></div>
+    <div><dt>Readiness</dt><dd class="alert">NOT CERTIFIED</dd></div>
+  </dl>
+
+  <h2>Frozen implementation and tests</h2>
+  <ul>
+    <li>Engine SHA-256 <code>9aa0d64e9997a1c5097a9580a55c68ccdf8ccadc7a629b2fb315f843a306a0b9</code>.</li>
+    <li>Planner SHA-256 <code>c92d7a0ff3797db387efcdef0e2ce338ae9b0c59656dd3c884b524f869390261</code>.</li>
+    <li>Cached source SHA-256 <code>909db89f85a3c19011d68b64c942bb3ce58c268e62106dae99dde57c16ed8876</code>; before-cache SHA-256 <code>c6810e6b74839a4505c1cff3252c4f3e2e144b961707659d7b054ffe7972cdd4</code>.</li>
+    <li>Main independently ran the full local ops suite: <strong>60 passed, 4.313 s</strong>. Focused native tests: <strong>26 passed, 5.677 s</strong>. The earlier focused local 26 tests are included in the full suite, not additional.</li>
+    <li>An interim native run had <strong>25 passed and 1 fixture error</strong> (NameError); the fixture was corrected before freeze.</li>
+  </ul>
+
+  <h2>Strict boundary and one-chunk plan</h2>
+  <p>The planner requires one unescaped exact <code>\section{Discussions}</code> outside comments and protected literal spans. The bounded body stops at the first supported boundary, <code>\bibliographystyle</code>. Ambiguous or missing headers, unsupported boundaries, and missing end boundaries fail closed. No legacy fallback is used.</p>
+  <p>Bounded body: <strong>1201 characters</strong>, SHA-256 <code>2611e0a48ca14c8138e9d79e77c34e806dd9668ce29de42d7f6c2d9878ce729c</code>. The bounded parser produced one authentic Discussion prose chunk, <strong>1186 characters</strong>, at index <strong>77</strong>, text SHA-256 <code>c4559eb475e9f81a1da477db5ce5384a80dbb0a6c4b5d9e4dfd2179d8182a188</code>. It contains the limitation prose and excludes the Medusa appendix and bibliography. Both full and bounded parser modes were <code>pylatexenc_recovered</code>; old structured hashes remained equal. The former four-chunk plan is retained as historical evidence and was not applied.</p>
+
+  <h2>Apply and integrity checks</h2>
+  <ul>
+    <li>Apply completed once in <strong>1.173 s</strong>, including the internal <code>BEGIN IMMEDIATE</code> state guard. This is not a separate lock-time measurement.</li>
+    <li>Qdrant moved from 72 to 73 points. The previous 72 payload and vector dictionaries were exactly equal.</li>
+    <li>Cache moved from 77 to 78 chunks. Previous 77 chunk objects were exactly equal. The JSON file was reserialized and is not claimed byte-identical. Source was unchanged. After-cache SHA-256 <code>939d6a8fe82a1d335bbe3b9beae792bff609bc1b77f018d916860a29c3d7b63f</code>.</li>
+    <li>FTS added rowid <code>11309047</code>, UUID <code>37938d7a-4aeb-5fbd-849c-65aa84a72fb7</code>. Receipt repair ID <code>339a4a92110eba8c99fe482ac44411369e473793d5d8e23b7c8813254d02f816</code>; digest <code>82f045b75965c6452a6f6ffd730ecf46c6b8d6cfee266a68431731007352f744</code>.</li>
+    <li>Resume used the same receipt and added no row. Journal stage remained <code>done</code>.</li>
+    <li>Bounded FTS MATCH for <code>&quot;generative aspect&quot; AND &quot;prompt inference&quot;</code> returned rowid 11309047, the expected UUID and SnapID in <strong>0.46 s</strong>. This confirms the new row only.</li>
+  </ul>
+
+  <h2>Post-apply health</h2>
+  <p>All three services were active. <code>/v1/health</code> returned HTTP 200 with status <code>ok</code>. Paper state remained <code>done</code>, extractor version <code>3</code>, and <code>pending_sync=0</code>. No restart occurred. Four production file hashes were unchanged: API <code>c7fc69f0c393d8b21f6dabcfb28d37061c73589c6800b2e05da68ff12d81c586</code>, MCP <code>cca456af5e8c8579cf34d80375cd86bf1751696130812a567f66ccaa286fdbf9</code>, extractor <code>8a18ab4dd5eaf42be670d77eae6cbb63f1fc674dbf1f9ea56bdb5c56e912802f</code>, and service hash prefix <code>60b685...</code>.</p>
+
+  <h2>Read verification</h2>
+  <p>Two public MCP reads returned <code>isError=false</code>. Section output changed from the old 273-character figure-only result to 1461 characters of figure plus prose, with both limitation phrases present. All three available equation/algorithm sections were returned: 687 characters total, untruncated, with complete JSON objects unchanged. The existing misclassified figure was not fixed and <code>parse_completeness</code> remains unknown.</p>
+
+  <h2>Legacy data blocker</h2>
+  <p>Whole-paper legacy FTS mapping remains unknown and unmapped; only one new side-catalog row is confirmed. A durable journal exists for this repair but does not establish whole-paper coverage. One sampled old row, 497572, retained hash <code>a780667ad7afcdcdc854cda2852d6ccb6d91e6d9978e294e6db1a85a1f24df8c</code>. The entire FTS table was not hashed. No mass reindex or status reset occurred.</p>
+  <p>Private journal and old-cache/old-vector backups were retained with mode 600. There is no external backup or production restore. An initial FTS preflight timed out before mutation; the final guarded preflight passed in 2.0 s. An initial apply caller error for missing <code>state_db_path</code> occurred before effects; the caller was corrected before the successful apply. No additional FTS, cache, or Qdrant writes beyond the described single additions occurred.</p>
+
+  <h2>Scope and readiness</h2>
+  <p>This closes only the missing Discussion prose finding for this record. The parser fix addresses the tested conversion failure only and does not repair old whole-paper FTS mapping or claim to prevent all future loss. The original failed smokes remain in the <a href="2026-10-06-audit-fixes.html">historical audit report</a>. No environment, secret, payment, access, chain, commit, or push change occurred. Readiness remains <strong>NOT CERTIFIED</strong>.</p>
+  <footer>Production health was checked after apply. No corpus-wide completeness or SLO claim is made.</footer>
+</main>
+</body>
+</html>

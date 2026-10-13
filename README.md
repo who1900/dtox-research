@@ -6,7 +6,9 @@
 
 **dtox helps AI agents test Web3 ideas against scientific research.** A free MCP research service with embeddings-based vector search over structured papers and protocol specifications, returning cited evidence for agents and builders.
 
-[Live research](https://read.whoim.space/research/) · [Free MCP endpoint](https://read.whoim.space/mcp) · [Technical reference](docs/technical-reference.md) · [Visual pitch deck](presentation/pitch-visual/dtox-research-visual.pptx)
+[Live research](https://read.whoim.space/research/) · [Free MCP endpoint](https://read.whoim.space/mcp) · [Technical reference](docs/technical-reference.md) · [Visual pitch deck](presentation/pitch-visual/dtox-research-jury.pptx)
+
+Current source and corpus-repair status: [13 October 2026 snapshot](docs/current-state.md). Repository code, deployed services and ongoing data repair are tracked separately there.
 
 ## The problem
 
@@ -85,10 +87,12 @@ These counters were observed at 2026-10-05T10:00Z; this is not a frozen or repro
 
 ## Resources
 
+- [Current local submission review package](docs/2026-10-05-hackathon-package.md) (includes local video paths; no public video URLs or submission claimed)
+- [Crypto World's Fair requirements and remaining owner fields](docs/2026-10-05-submission-checklist.md)
 - [Live research interface](https://read.whoim.space/research/)
 - [MCP endpoint](https://read.whoim.space/mcp)
-- [Pitch deck PDF](presentation/pitch-visual/dtox-research-visual.pdf)
-- [Editable pitch deck](presentation/pitch-visual/dtox-research-visual.pptx)
+- [Pitch deck PDF](presentation/pitch-visual/dtox-research-jury.pdf)
+- [Editable pitch deck](presentation/pitch-visual/dtox-research-jury.pptx)
 - [Browser deck file](presentation/pitch-visual/index.html) (download/open locally; not hosted as a live web page)
 - [Pitch evidence ledger](presentation/pitch-visual/evidence.md)
 - [Pitch QA questions](presentation/pitch-visual/QA-questions.md)

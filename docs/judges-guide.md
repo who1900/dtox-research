@@ -17,7 +17,7 @@ The public MCP currently exposes 13 tools. Read operations are available without
 
 These read-only MCP calls were freshly checked on 5 October 2026. Corpus counters were observed at **2026-10-05T10:00Z**; this is the observation time, not a frozen or reproducible index version:
 
-- `get_code_or_math_spec(arxiv_id="2101.05511", target_elements="equation", max_chars=4500)` returned 6 of 6 equations, 1,245 characters, without truncation, with `exact_latex=true`; Equation 4 matched the source PDF. Source: [Quantifying Blockchain Extractable Value](https://arxiv.org/abs/2101.05511).
+- `get_code_or_math_spec(arxiv_id="2101.05511", target_elements="equation", max_chars=4500)` returned 6 of 6 equations, 1,245 characters, without truncation, with `exact_latex=true`; Equation 4 was checked against the cited original source (the evidence ledger records the independent HTML v5 check). Source: [Quantifying Blockchain Extractable Value](https://arxiv.org/abs/2101.05511).
 - `read_paper_section(paper_id="eip:4337", section_type="limitations", max_chars=1800)` returned 1,205 characters from ERC-4337 Security Considerations, including EntryPoint concentration and fee-draining/hijacking conditions. This is the specification’s own security discussion, not a dtox audit.
 
 To reproduce with an agent, ask it to first discover whether the target source is indexed; then read the source section or formula and report provenance, truncation, and scope. Exact source LaTeX is available for this checked example, not guaranteed for all records or paraphrases. Do not assume a paper exists in the index or treat a retrieval score as a truth score.
