@@ -1,39 +1,6 @@
 name: Checks
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'api/**'
-      - 'mcp/**'
-      - 'pipeline/**'
-      - 'ops/**'
-      - 'eval/**'
-      - 'embed/**'
-      - 'tests/**'
-      - 'attestor/**'
-      - 'x402-gateway/**'
-      - 'site/**'
-      - 'requirements*.txt'
-      - '.github/workflows/ci.yml'
-      - '!**/*.md'
-      - '!eval/results/**'
-  pull_request:
-    paths:
-      - 'api/**'
-      - 'mcp/**'
-      - 'pipeline/**'
-      - 'ops/**'
-      - 'eval/**'
-      - 'embed/**'
-      - 'tests/**'
-      - 'attestor/**'
-      - 'x402-gateway/**'
-      - 'site/**'
-      - 'requirements*.txt'
-      - '.github/workflows/ci.yml'
-      - '!**/*.md'
-      - '!eval/results/**'
   workflow_dispatch:
 
 permissions:

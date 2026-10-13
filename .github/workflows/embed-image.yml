@@ -1,17 +1,6 @@
 name: Embedding image
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'embed/**'
-      - '.github/workflows/embed-image.yml'
-      - '!**/*.md'
-  pull_request:
-    paths:
-      - 'embed/**'
-      - '.github/workflows/embed-image.yml'
-      - '!**/*.md'
   workflow_dispatch:
 
 permissions:
