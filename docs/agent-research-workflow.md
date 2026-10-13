@@ -1,55 +1,17 @@
-# A practical research workflow for agents
+# Research with an agent
 
-This is a usage guide, not a claim that retrieval quality has improved. No
-fresh evidence of a semantic-quality gain is established by these instructions.
+Connect a client using the [README](../README.md#connect-your-agent), then start with an engineering question:
 
-## Example: data availability for light clients
+> How can light clients check data availability with limited bandwidth?
 
-Suppose you are researching a Web3 design that lets light clients check data
-availability without downloading a full block. Start with the mechanism,
-object and constraint in ordinary language:
+1. Use `find_papers` or `search_research_paper` to discover relevant sources.
+2. Open a promising result with `get_paper` and inspect its outline and coverage.
+3. Read the relevant method, assumptions or limitations with `read_paper_section`.
+4. Request equations, code, algorithms or tables with `get_code_or_math_spec` when they are relevant.
+5. Use `get_research_bundle` to assemble a bounded packet, or `compare_methods` to inspect two approaches.
 
-> How can light clients verify data availability with limited bandwidth?
+Connect each engineering conclusion to the supporting passage and its source metadata. Distinguish the author's statements from your own interpretation. Document IDs and source links let a reader return to the underlying evidence.
 
-Use `find_papers` to find papers on the subject, or
-`search_research_paper` when looking for passages about a particular mechanism
-or result. A paper title or identifier is helpful if already known, but not
-required. Retrieval scores and `source_candidates` are candidate leads; they
-do not prove that two passages make the same claim or express a probability.
-Do not assume wording changes or synonyms preserve retrieval results.
+For structured reads use `paper_id`; for comparisons use `paper_id_a` and `paper_id_b`. Tool discovery provides the full schemas, filters and pagination arguments.
 
-For a promising result, call `get_paper` and inspect its outline and source
-metadata. Read the relevant method or experiments section with
-`read_paper_section`; inspect limitations when evaluating tradeoffs. Use
-`get_code_or_math_spec` only when indexed formulas or algorithm elements are
-relevant, and `compare_methods` to retrieve two papers' reported results and
-limitations side by side. `get_research_bundle` can assemble a bounded packet
-with provenance when several sources are useful. For a project review,
-`validate_project` should receive distinct technical claims separately.
-
-For `get_code_or_math_spec`, prefer the neutral `paper_id` argument; for
-`compare_methods`, use `paper_id_a` and `paper_id_b`. The previous
-`arxiv_id`/`arxiv_id_a`/`arxiv_id_b` names remain accepted for existing clients.
-If both names are supplied for one identifier, they must agree (apart from
-surrounding whitespace); missing or conflicting identifiers are rejected
-before the API request. IDs are not rewritten to an assumed provider prefix,
-so protocol and EIP-style identifiers such as `iacr:2019/953` and `eip:1559`
-remain usable.
-
-`get_code_or_math_spec` returns indexed structured elements, not a promise of
-the original PDF or universally exact raw LaTeX. Some extracted equations
-retain raw LaTeX; PDF-derived text and equations may not. Check the returned
-element type, extraction/source metadata and truncation fields before treating
-an object as exact source notation.
-
-Tie each conclusion to the source evidence. Label limitations the authors
-explicitly report separately from your inference, and call out missing
-information. Cite the exact paper id and URL. Reproduce formulas only from
-extracted indexed content; do not reconstruct an equation from prose. If the
-record is abstract-only, say that and do not present it as inspected full
-text. If results remain sparse or inconsistent after inspecting their source
-channels, try a targeted reformulation once; avoid spending tokens on
-repeated near-duplicate searches by default.
-
-This workflow guides evidence handling; it does not establish corpus coverage,
-synonym invariance, semantic equivalence, or a new retrieval-quality gain.
+[Tool catalog](technical-reference.md#public-mcp-tools)

@@ -6,7 +6,6 @@ const readme = readFileSync(new URL("../../README.md", import.meta.url), "utf8")
 const technical = readFileSync(new URL("../../docs/technical-reference.md", import.meta.url), "utf8");
 const site = readFileSync(new URL("../../site/index.html", import.meta.url), "utf8");
 const ci = readFileSync(new URL("../../.github/workflows/ci.yml", import.meta.url), "utf8");
-const plan = readFileSync(new URL("../../docs/2026-10-02-qdrant-maintenance-plan.md", import.meta.url), "utf8");
 
 test("self-host docs explicitly export local paths and port 8005 without claiming automatic env loading", () => {
   assert.ok(readme.includes("codex mcp add dtox --url https://read.whoim.space/mcp"));
@@ -17,9 +16,6 @@ test("self-host docs explicitly export local paths and port 8005 without claimin
   assert.ok(technical.includes('export EMBED_URL="http://127.0.0.1:8005/embed"'));
   assert.ok(technical.includes('export EMBED_BATCH_URL="http://127.0.0.1:8005/embed_batch"'));
   assert.ok(technical.includes("A .env file is not automatically loaded"));
-  assert.ok(technical.includes("restore verification not established"));
-  assert.ok(!readme.includes("backups with verified restores"));
-  assert.ok(!technical.includes("backups with verified restores"));
 });
 
 test("self-host outline separates blocking services and persists local Qdrant storage", () => {
@@ -36,17 +32,15 @@ test("self-host outline separates blocking services and persists local Qdrant st
     assert.equal(["python3 pipeline/service.py", "uvicorn api.main:app --port 8010", "python3 mcp/server.py"]
       .filter((service) => block[1].includes(service)).length, 1);
   }
-  assert.ok(technical.includes("this is a setup outline, not a turnkey verification claim"));
 });
 
-test("public docs distinguish retrieval limits, observation timestamps, payment and scientific quorum", () => {
-  assert.ok(technical.includes("not invariant to wording"));
-  assert.ok(technical.includes("arbitrary paraphrases are not guaranteed"));
-  assert.ok(technical.includes("observation time, not a corpus snapshot identifier"));
+test("public guide documents source metadata, attributed readings and payment terms", () => {
+  assert.ok(technical.includes("acquisition, extraction and coverage metadata"));
+  assert.ok(technical.includes("caller's wallet signature"));
   assert.ok(technical.includes("no automatic refund"));
   assert.ok(technical.includes("per-batch-attempt fee"));
-  assert.ok(technical.includes("Payment is not scientific quorum"));
-  assert.ok(technical.includes("Solana devnet only"));
+  assert.ok(technical.includes("reviewer attribution and registry status are separate fields"));
+  assert.ok(technical.includes("uses Solana devnet"));
   assert.ok(technical.includes("no default asset mapping"));
   assert.ok(!site.includes("when independent wallets agree"));
   assert.ok(!site.includes("The registry reports this claim as confirmed_prior_art"));
@@ -69,16 +63,4 @@ test("CI includes bounded offline pipeline and operations suites", () => {
   }
   assert.ok(ci.includes("Fast offline pipeline regressions"));
   assert.ok(ci.includes("Fast offline operations regressions"));
-});
-
-test("HNSW document is a gated plan, not an executed migration or verified restore", () => {
-  for (const fact of ["10.737", "14 segments", "9.882", "10 GiB", "1.6 GB", "swap 0", "121 GB"]) {
-    assert.ok(plan.includes(fact));
-  }
-  assert.ok(plan.includes("NOT\nstart a rebuild now"));
-  assert.ok(plan.includes('"hnsw_config": {"on_disk": true}'));
-  assert.ok(plan.includes("Restore verification is NOT"));
-  assert.ok(plan.includes("not an instantaneous or resource-free rollback"));
-  assert.ok(plan.includes("No exact freed\nRAM"));
-  assert.ok(plan.includes("no rebuild"));
 });

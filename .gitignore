@@ -18,6 +18,22 @@ monitor_state.json
 harness_baseline.json
 *.log
 *.log.*
-# local build and presentation material, never commit
+# local build and presentation outputs; selected public assets are tracked
 .deck-build/
 presentation/
+
+# local evaluation outputs and internal operator material
+eval/results/
+ops/deploy/
+docs/20??-*
+docs/data/
+docs/video-*/
+docs/current-state.md
+docs/source-extraction-benchmark-protocol.md
+AUDIT_*.md
+COLOSSEUM_*
+DEMO_SCRIPT.md
+DTOX_X402_VALIDATION.html
+SUBMISSION.md
+attestor/test/production-readiness-evidence.json
+local-access-config.json

@@ -1,0 +1,43 @@
+name: Embedding image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'embed/**'
+      - '.github/workflows/embed-image.yml'
+      - '!**/*.md'
+  pull_request:
+    paths:
+      - 'embed/**'
+      - '.github/workflows/embed-image.yml'
+      - '!**/*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - run: docker build -t dtox-embed:ci embed
+      - run: docker run -d --name dtox-embed-ci -p 127.0.0.1:8005:8080 dtox-embed:ci
+      - run: |
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8005/healthz && break
+            sleep 2
+          done
+          curl -fsS -X POST http://127.0.0.1:8005/embed \
+            -H 'Content-Type: application/json' \
+            -d '{"text":"verifiable delay function","query":true}' \
+            | python -c 'import json,sys; assert len(json.load(sys.stdin)["vector"]) == 384'
+          curl -fsS -X POST http://127.0.0.1:8005/rerank \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"zero knowledge proof","passages":["a zero knowledge proof system"]}' \
+            | python -c 'import json,sys; assert len(json.load(sys.stdin)["scores"]) == 1'
