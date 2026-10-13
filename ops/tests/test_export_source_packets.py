@@ -562,7 +562,8 @@ class ExportTests(unittest.TestCase):
         with patch.object(exporter, "extract_citation_contexts", side_effect=AssertionError("export reparses")):
             report = self.run_export(full_export=True, max_sources=None)
         self.assertIsNone(report["citation_binding_coverage"]["unresolved_mentions"])
-        with patch.object(producer, "extract_citation_contexts", wraps=producer.extract_citation_contexts) as parse:
+        with patch.object(producer, "extract_citation_contexts", side_effect=AssertionError("producer materializes citations")), \
+                patch.object(producer, "stream_citation_contexts", wraps=producer.stream_citation_contexts) as parse:
             producer.produce(self.output / "packets.jsonl", self.root / "parsed.sqlite",
                              input_report=self.output / "report.json")
         self.assertEqual(parse.call_count, 1)

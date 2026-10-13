@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from unittest.mock import patch
 
 from ops import transport_cached_originals as transport
@@ -182,6 +183,7 @@ class CachedOriginalTransportTests(unittest.TestCase):
         store = transport.OriginalStore.create(store_root)
         lock_dir = root / "global-lock"
         lock_dir.mkdir()
+        lock_dir.chmod(0o700)
         job_parent = root / "jobs"
         job_parent.mkdir()
         bodies = [b"%PDF-1.7\nfixture\n", b"<html><body>fixture</body></html>"]
@@ -243,6 +245,26 @@ class CachedOriginalTransportTests(unittest.TestCase):
         frames.write(trailing)
         return store, config, plan, items, frames.getvalue(), job_parent, lock_dir, bodies
 
+    def _root_owned_lock_dir(self, lock_dir):
+        """Model the receiver's root-owned 0700 lock directory in isolated tests."""
+        lock_dir = Path(lock_dir)
+        stack = ExitStack()
+        if os.name == "nt":
+            return stack
+        real_lstat = Path.lstat
+
+        def lstat(path):
+            info = real_lstat(path)
+            if path == lock_dir:
+                values = list(info)
+                values[4] = 0
+                return os.stat_result(values)
+            return info
+
+        stack.enter_context(patch.object(transport.os, "geteuid", return_value=0))
+        stack.enter_context(patch.object(Path, "lstat", lstat))
+        return stack
+
     def test_receiver_ingests_two_items_with_batch_lock_and_protected_reserve(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -251,7 +273,8 @@ class CachedOriginalTransportTests(unittest.TestCase):
             def capture_reserve(reserve_bytes, additional_bytes=0):
                 observed_reserves.append(reserve_bytes)
             store._stream_space = capture_reserve
-            with patch.object(transport, "MAX_ITEMS", 2), \
+            with self._root_owned_lock_dir(lock_dir), \
+                 patch.object(transport, "MAX_ITEMS", 2), \
                  patch.object(transport, "TARGET_STORE", str(store.root)), \
                  patch.object(transport, "target_identity", return_value=transport.TARGET_PIN), \
                  patch.object(transport.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(10**15, 0, 10**15)):
@@ -272,7 +295,8 @@ class CachedOriginalTransportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             store, cfg, plan, items, wire, jobs, _, _ = self._receiver_fixture(root, corrupt_second=True)
-            with patch.object(transport, "MAX_ITEMS", 2), \
+            with self._root_owned_lock_dir(cfg["target"]["lock_dir"]), \
+                 patch.object(transport, "MAX_ITEMS", 2), \
                  patch.object(transport, "TARGET_STORE", str(store.root)), \
                  patch.object(transport, "target_identity", return_value=transport.TARGET_PIN), \
                  patch.object(transport.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(10**15, 0, 10**15)), \
@@ -294,7 +318,8 @@ class CachedOriginalTransportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             store, cfg, plan, items, wire, jobs, _, _ = self._receiver_fixture(root, trailing=b"x")
-            with patch.object(transport, "MAX_ITEMS", 2), \
+            with self._root_owned_lock_dir(cfg["target"]["lock_dir"]), \
+                 patch.object(transport, "MAX_ITEMS", 2), \
                  patch.object(transport, "TARGET_STORE", str(store.root)), \
                  patch.object(transport, "target_identity", return_value=transport.TARGET_PIN), \
                  patch.object(transport.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(10**15, 0, 10**15)), \

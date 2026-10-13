@@ -415,10 +415,10 @@ class BenchmarkTests(unittest.TestCase):
         self.assertIn("NOT full-document precision/recall", report["quality_scope"])
 
     def test_holdout_class_missing_or_exception_blocks(self):
-        assignments = self.freeze()["payload"]["assignments"]
         for doc in self.manifest["documents"]:
-            if assignments[doc["document_id"]]["split"] == "holdout":
-                doc["classes"].remove("healthy")
+            # Remove the control label from the frozen sample so the resulting
+            # holdout coverage gate is tested after stratification is rebuilt.
+            doc["classes"].remove("healthy")
         self.manifest["documents"][0]["exceptions"] = ["candidate layout support not established"]
         seal, _, _, runs = self.collection()
         report = bench.grade(seal["payload"], runs)
@@ -713,7 +713,10 @@ class BenchmarkTests(unittest.TestCase):
         reviewed = self.reviewed_grade(seal, runs)
         self.assertEqual(reviewed["candidate_paired_check_gain"], 0)
         self.assertTrue(all(row["status"] == "PASS" for row in reviewed["documents"]))
-        self.assertEqual(reviewed["decision"], "NO_WINNER")
+        self.assertEqual(reviewed["decision"], "CLASS_SPECIFIC_CANDIDATES")
+        self.assertEqual(reviewed["eligible_classes"], ["healthy"])
+        self.assertEqual(reviewed["required_route_status"], "NOT_ACCEPTED")
+        self.assertFalse(reviewed["publication_authorized"])
 
     def test_declared_semantic_denominator_preserved_when_unmeasured(self):
         seal, _, _, runs = self.collection()
