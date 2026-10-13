@@ -5,6 +5,7 @@ existing label-repair journal, so memory and recovery scope remain paper-sized.
 No extraction, embedding, vector upsert, or global FTS scan is performed here.
 """
 import argparse
+import base64
 from contextlib import nullcontext
 from datetime import datetime, timezone
 import hashlib
@@ -20,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ops import repair_section_labels as legacy
 from ops import replace_published_labels as published
 from ops import audit_corpus_quality as census_tools
+from ops import restore_corpus_points as point_restore
 from pipeline import document_cache
 
 
@@ -93,11 +95,15 @@ def _candidate_rows(census):
     tables = {r[0] for r in census.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if "meta" not in tables or dict(census.execute("SELECT key,value FROM meta")).get("run_complete") != "1":
         raise DriverError("corpus census is not marked complete")
+    meta = dict(census.execute("SELECT key,value FROM meta"))
     candidate_filter = "candidate_status='candidate' AND exact_text_ids=1"
     if "labels_source_verified" in columns:
-        candidate_filter += " OR (candidate_status='heading_label_candidate' AND labels_source_verified=1 AND candidate_changes_json!='[]')"
+        empty_verified_retry = (meta.get("candidate_subset") == "verified-unresolved-label-retry")
+        candidate_filter += (" OR (candidate_status='heading_label_candidate' AND labels_source_verified=1"
+            + (" AND candidate_label_map_json!='[]'" if empty_verified_retry else "")
+            + ("" if empty_verified_retry else " AND candidate_changes_json!='[]'") + ")")
     optional = [name if name in columns else "NULL AS " + name
-                for name in ("fulltext_source", "parser_mode")]
+                for name in ("fulltext_source", "parser_mode", "frozen_cache_sha256")]
     return census.execute("SELECT paper_id,cache_sha256,source_sha256,source_location,"
         "candidate_changes_json,candidate_label_map_json," + ",".join(optional) + " FROM papers WHERE ("
         + candidate_filter + ") ORDER BY paper_id").fetchall()
@@ -338,16 +344,75 @@ def _verify_after(module, journal_path, qdrant):
     return True
 
 
+def _verify_bounded_previous_cache(row, cache_dir, journal_path, run_db):
+    """Verify the prior label cache receipt without pinning its historical point set.
+
+    A bounded source-proven retry may see accepted points added after the prior
+    label journal. The new prepare/apply owner validates the complete current
+    Qdrant/FTS before-image; this check binds only the prior source/cache lineage.
+    """
+    aid = row["paper_id"]
+    cache_path = Path(cache_dir).resolve() / (document_cache.safe_id(aid) + ".json")
+    raw = document_cache.read_bounded(cache_path)
+    current_sha = legacy._sha(raw)
+    if current_sha != row["cache_sha256"]:
+        raise DriverError("bounded retry cache differs from its prepared candidate")
+    plan = json.loads(Path(journal_path).read_text(encoding="utf-8"))
+    if plan.get("phase") != "applied":
+        raise DriverError("prior bounded label journal is not applied")
+    if plan.get("kind") == "section-label-repair":
+        papers = [item for item in plan.get("papers", []) if item.get("arxiv_id") == aid]
+        if len(papers) != 1:
+            raise DriverError("prior bounded label journal paper identity mismatch")
+        paper = papers[0]
+    elif plan.get("kind") == "published-label-replacement":
+        paper = plan.get("paper", {})
+    else:
+        raise DriverError("unsupported prior bounded label journal kind")
+    if paper.get("arxiv_id") != aid:
+        raise DriverError("prior bounded label journal paper mismatch")
+    try:
+        before = base64.b64decode(paper["cache_before"], validate=True)
+        after = base64.b64decode(paper["cache_after"], validate=True)
+        before_chunks, after_chunks = json.loads(before), json.loads(after)
+    except Exception as exc:
+        raise DriverError("prior bounded label journal cache images are invalid") from exc
+    if after != raw or not isinstance(before_chunks, list) or not isinstance(after_chunks, list):
+        raise DriverError("prior bounded label journal does not bind the current cache")
+    non_label = lambda chunks: [
+        {key: value for key, value in chunk.items() if key not in ("section_title", "section_type")}
+        for chunk in chunks if isinstance(chunk, dict)]
+    if (len(before_chunks) != len(after_chunks)
+            or len(non_label(before_chunks)) != len(before_chunks)
+            or non_label(before_chunks) != non_label(after_chunks)):
+        raise DriverError("prior bounded label journal changed non-label cache fields")
+    frozen_sha = row["frozen_cache_sha256"] if "frozen_cache_sha256" in row.keys() else None
+    if not isinstance(frozen_sha, str) or len(frozen_sha) != 64:
+        raise DriverError("bounded candidate lacks its frozen cache hash")
+    frozen_row = dict(row)
+    frozen_row["cache_sha256"] = frozen_sha
+    try:
+        proved_sha = point_restore._cache_hash(frozen_row, raw, run_db)
+    except Exception as exc:
+        raise DriverError("prior bounded cache ancestry does not match the frozen census") from exc
+    if proved_sha != current_sha:
+        raise DriverError("prior bounded cache ancestry does not bind current cache")
+    return raw
+
+
 def _publication_context(module, factory):
     """The caller owns reader shutdown/restart and must leave it shut on failure."""
     return factory() if module is published and factory is not None else nullcontext()
 
 
-def _recover_failed_paper(aid, journal_dir, qdrant, publication_maintenance=None):
-    latest = _latest_journal(journal_dir, aid)
+def _recover_failed_paper(aid, journal_dir, qdrant, publication_maintenance=None, *, journal_path=None):
+    latest = _latest_journal(journal_dir, aid) if journal_path is None else (
+        None, Path(journal_path), json.loads(Path(journal_path).read_text(encoding="utf-8")))
     if latest is None:
         return None
     _attempt, path, plan = latest
+    if journal_path is not None and _plan_paper_id(plan) != aid:
+        raise DriverError("recovery journal paper identity mismatch")
     module = _module_for_plan(plan)
     phase = plan.get("phase")
     if phase in {"applying", "qdrant_applied", "fts_applied", "cache_applied", "applied", "rolling_back"}:
@@ -368,9 +433,16 @@ def _recover_failed_paper(aid, journal_dir, qdrant, publication_maintenance=None
 
 def _resume_one(row, *, state_db, fts_db, census_db, rowmap_conn, qdrant,
                 cache_dir, section_cache_dir, fulltext_cache_dir, latex_cache_dir,
-                journal_dir, ledger, collection, publication_maintenance=None):
+                journal_dir, ledger, collection, publication_maintenance=None,
+                verify_completed=False):
     aid = row["paper_id"]
-    old = ledger.execute("SELECT status,attempt,journal_path FROM papers WHERE paper_id=?", (aid,)).fetchone()
+    old = ledger.execute("SELECT status,attempt,journal_path,detail FROM papers WHERE paper_id=?", (aid,)).fetchone()
+    prior_verified_with_unresolved = False
+    if old and old[0] == "verified" and old[3]:
+        try:
+            prior_verified_with_unresolved = bool(json.loads(old[3]).get("unresolved_chunks", []))
+        except (TypeError, json.JSONDecodeError):
+            prior_verified_with_unresolved = False
     existing = None
     if old and old[2] and Path(old[2]).exists():
         existing = (old[1], Path(old[2]), json.loads(Path(old[2]).read_text(encoding="utf-8")))
@@ -380,11 +452,17 @@ def _resume_one(row, *, state_db, fts_db, census_db, rowmap_conn, qdrant,
         prior_attempt, old_journal, prior = existing
         module = _module_for_plan(prior)
         phase = prior.get("phase")
-        if phase == "applied" and _verify_after(module, old_journal, qdrant):
+        if phase == "applied":
+            if prior_verified_with_unresolved and verify_completed:
+                _verify_bounded_previous_cache(row, cache_dir, old_journal,
+                    ledger.execute("PRAGMA database_list").fetchone()[2])
+            elif not _verify_after(module, old_journal, qdrant):
+                raise DriverError("verified label journal no longer matches its after-image")
             _source_path_for(row, fulltext_cache_dir, latex_cache_dir)
-            _record(ledger, aid, "verified", prior_attempt, old_journal, _journal_detail(prior))
-            return "verified"
-        if phase in {"prepared"}:
+            if not prior_verified_with_unresolved:
+                _record(ledger, aid, "verified", prior_attempt, old_journal, _journal_detail(prior))
+                return "verified"
+        elif phase == "prepared":
             with _publication_context(module, publication_maintenance):
                 module.apply_plan(old_journal, qdrant=qdrant)
                 if not _verify_after(module, old_journal, qdrant):
@@ -396,7 +474,7 @@ def _resume_one(row, *, state_db, fts_db, census_db, rowmap_conn, qdrant,
             with _publication_context(module, publication_maintenance):
                 module.rollback_plan(old_journal, qdrant=qdrant)
             _record(ledger, aid, "rolled_back_retryable", prior_attempt, old_journal)
-        elif phase == "rolled_back":
+        elif phase in {"rolled_back", "applied"}:
             pass
         else:
             raise DriverError("unrecognized or non-resumable journal phase")
@@ -407,6 +485,9 @@ def _resume_one(row, *, state_db, fts_db, census_db, rowmap_conn, qdrant,
         row, chunks, by_index, rowmap_conn, fts_db, qdrant, collection)
     module = _route(state_db, aid)
     attempt = (existing[0] + 1) if existing else 1
+    if verify_completed and prior_verified_with_unresolved:
+        latest = _latest_journal(journal_dir, aid)
+        if latest:attempt = max(attempt, latest[0] + 1)
     journal = _journal_path(journal_dir, aid, attempt)
     if journal.exists():
         raise DriverError("next attempt journal already exists; inspect run ledger")
@@ -425,6 +506,29 @@ def _resume_one(row, *, state_db, fts_db, census_db, rowmap_conn, qdrant,
         kwargs["preserve_invalid_unchanged_before_image"] = True
         kwargs["unresolved_chunks_by_paper"] = {aid: unresolved}
     plan = module.prepare_plan(changes, **kwargs)
+    before_cache = None
+    if plan.get("kind") == "section-label-repair":
+        papers = [p for p in plan.get("papers", []) if p.get("arxiv_id") == aid]
+        if len(papers) != 1:
+            raise DriverError("prepared label journal does not contain exactly one paper")
+        before_cache = base64.b64decode(papers[0]["cache_before"], validate=True)
+    elif plan.get("kind") == "published-label-replacement":
+        paper = plan.get("paper", {})
+        if paper.get("arxiv_id") != aid:
+            raise DriverError("prepared published label journal paper identity mismatch")
+        before_cache = base64.b64decode(paper["cache_before"], validate=True)
+    if (prior_verified_with_unresolved and existing
+            and existing[2].get("phase") == "applied"
+            and legacy._sha(before_cache) != (row["frozen_cache_sha256"]
+                if "frozen_cache_sha256" in row.keys() and row["frozen_cache_sha256"]
+                else row["cache_sha256"])):
+        parent_path = Path(existing[1]).resolve()
+        if parent_path.is_symlink() or not parent_path.is_file():
+            raise DriverError("prior verified label journal path is invalid")
+        parent_bytes = parent_path.read_bytes()
+        plan["cache_parent_journal"] = {
+            "path": str(parent_path), "sha256": legacy._sha(parent_bytes)}
+        _atomic_json(journal, plan)
     _record(ledger, aid, "prepared", attempt, journal, _journal_detail(plan))
     with _publication_context(module, publication_maintenance):
         module.apply_plan(journal, qdrant=qdrant)
@@ -442,16 +546,58 @@ def run(args, qdrant):
     ledger = _ledger(args.run_db or (Path(args.journal_dir) / "repair-run.sqlite3"))
     totals = {"verified": 0, "failed": 0, "skipped_verified": 0, "skipped_failed": 0}
     try:
+        census_meta = dict(census.execute("SELECT key,value FROM meta"))
+        if getattr(args, "verify_completed", False):
+            if census_meta.get("candidate_subset") != "verified-unresolved-label-retry":
+                raise DriverError("completed-label verification is restricted to its bounded candidate subset")
+            source_path = Path(census_meta.get("source_census_path", ""))
+            try:
+                source_identity = json.loads(census_meta["source_census_identity"])
+                resolved = source_path.resolve()
+                stat = resolved.stat()
+                current_identity = [str(resolved), stat.st_dev, stat.st_ino,
+                                    stat.st_size, stat.st_mtime_ns]
+            except Exception as exc:
+                raise DriverError("verified-unresolved candidate lacks a valid frozen census identity") from exc
+            if source_identity != current_identity:
+                raise DriverError("verified-unresolved candidate census identity changed")
+            expected = census_meta.get("source_bound_selected_count")
+            if (expected != "343" or census_meta.get("source_verified_unresolved_count") != "403"
+                    or census_meta.get("source_unresolved_chunk_count") != "1758"
+                    or census_meta.get("source_bound_resolved_chunk_count") != "1134"):
+                raise DriverError("verified-unresolved candidate does not match the audited bounded scope")
         rows = _candidate_rows(census)
         totals["candidates"] = len(rows)
+        if getattr(args, "verify_completed", False) and len(rows) != int(expected):
+            raise DriverError("verified-unresolved candidate row count changed")
         work = []
         for row in rows:
-            state = ledger.execute("SELECT status FROM papers WHERE paper_id=?", (row["paper_id"],)).fetchone()
+            state = ledger.execute("SELECT status,detail FROM papers WHERE paper_id=?", (row["paper_id"],)).fetchone()
             status = state[0] if state else None
             if status == "manual_attention":
                 raise DriverError("repair run has a paper marked manual_attention")
-            if status == "verified" and not args.verify_completed:
-                totals["skipped_verified"] += 1
+            if status == "verified":
+                if not getattr(args, "verify_completed", False):
+                    totals["skipped_verified"] += 1
+                else:
+                    detail = state[1]
+                    try:
+                        detail_value = json.loads(detail) if detail else {}
+                        unresolved = detail_value.get("unresolved_chunks", [])
+                    except (AttributeError, TypeError, json.JSONDecodeError) as exc:
+                        raise DriverError("verified bounded candidate has invalid unresolved detail") from exc
+                    if not isinstance(unresolved, list):
+                        raise DriverError("verified bounded candidate has invalid unresolved detail")
+                    retry_error = detail_value.get("bounded_retry_error")
+                    retry_id = getattr(args, "bounded_retry_id", None)
+                    if retry_error and (not args.retry_failed or retry_id is not None
+                            and isinstance(retry_error, dict) and retry_error.get("run_id") == retry_id):
+                        totals["skipped_failed"] += 1
+                        continue
+                    if unresolved:
+                        work.append(row)
+                    else:
+                        totals["skipped_verified"] += 1
             elif status == "failed" and not args.retry_failed:
                 totals["skipped_failed"] += 1
             else:
@@ -464,15 +610,48 @@ def run(args, qdrant):
             if deadline is not None and attempted and time.monotonic() >= deadline:
                 break
             attempted += 1
+            accepted = None
+            prior_latest_attempt = 0
+            if getattr(args, "verify_completed", False):
+                previous = ledger.execute("SELECT status,attempt,journal_path,detail FROM papers WHERE paper_id=?", (row["paper_id"],)).fetchone()
+                if previous and previous[0] == "verified":
+                    accepted = previous
+                    latest = _latest_journal(args.journal_dir, row["paper_id"])
+                    prior_latest_attempt = max(previous[1], latest[0] if latest else 0)
             try:
                 _resume_one(row, state_db=args.state_db, fts_db=args.fts_db,
                     census_db=args.census_db, rowmap_conn=rowmap, qdrant=qdrant,
                     cache_dir=args.cache_dir, section_cache_dir=args.section_cache_dir,
                     fulltext_cache_dir=args.fulltext_cache_dir, latex_cache_dir=args.latex_cache_dir,
                     journal_dir=args.journal_dir, ledger=ledger, collection=args.collection,
-                    publication_maintenance=getattr(args, "publication_maintenance", None))
+                    publication_maintenance=getattr(args, "publication_maintenance", None),
+                    verify_completed=getattr(args, "verify_completed", False))
                 totals["verified"] += 1
             except Exception as exc:
+                if accepted is not None:
+                    fresh = _latest_journal(args.journal_dir, row["paper_id"])
+                    if fresh is not None and fresh[0] <= prior_latest_attempt:fresh = None
+                    try:
+                        if fresh and fresh[2].get("phase") not in {"prepared", "rolled_back"}:
+                            _recover_failed_paper(row["paper_id"], args.journal_dir, qdrant,
+                                getattr(args, "publication_maintenance", None), journal_path=fresh[1])
+                    except Exception as recovery_exc:
+                        _record(ledger, row["paper_id"], "manual_attention", fresh[0], fresh[1],
+                            type(recovery_exc).__name__ + ": bounded retry recovery failed")
+                        raise DriverError("bounded retry recovery failed; keep API maintenance active") from recovery_exc
+                    # A rejected retry never compensates the older accepted label
+                    # journal. Retain its status, ancestry and unresolved detail.
+                    detail_value = json.loads(accepted[3]) if accepted[3] else {}
+                    detail_value["bounded_retry_error"] = dict(
+                        error=type(exc).__name__ + ": " + str(exc)[:300],
+                        run_id=getattr(args, "bounded_retry_id", None),
+                        attempted_at=datetime.now(timezone.utc).isoformat(),
+                        journal_path=str(fresh[1]) if fresh else None,
+                        attempt=fresh[0] if fresh else prior_latest_attempt + 1)
+                    _record(ledger, row["paper_id"], "verified", accepted[1], accepted[2],
+                        json.dumps(detail_value, sort_keys=True))
+                    totals["failed"] += 1
+                    continue
                 prior = ledger.execute("SELECT attempt,journal_path FROM papers WHERE paper_id=?", (row["paper_id"],)).fetchone()
                 attempt = prior[0] if prior else 0
                 journal = prior[1] if prior else None

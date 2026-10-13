@@ -5,6 +5,20 @@ from unittest.mock import patch
 from pipeline import extractor
 
 
+class IndexAdmissionPolicyTests(unittest.TestCase):
+    def test_missing_detector_cannot_silently_admit_index_points(self):
+        with patch.object(extractor, 'is_boilerplate_chunk', None), \
+                patch.object(extractor, 'BOILERPLATE_FILTER', None):
+            with self.assertRaisesRegex(RuntimeError, 'boilerplate policy'):
+                extractor.should_embed(dict(text='Acknowledgments', element_type='prose'))
+
+    def test_explicit_filter_setting_remains_distinct_from_missing_policy(self):
+        with patch.object(extractor, 'BOILERPLATE_FILTER', False), \
+                patch.object(extractor, 'is_boilerplate_chunk', return_value=True) as detector:
+            self.assertTrue(extractor.should_embed(dict(text='Acknowledgments', element_type='prose')))
+            detector.assert_not_called()
+
+
 class LatexCommentRegressionTests(unittest.TestCase):
     def test_literal_modulo_in_all_code_environments(self):
         for environment in ("verbatim", "Verbatim", "lstlisting", "minted"):

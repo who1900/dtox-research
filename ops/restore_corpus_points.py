@@ -73,22 +73,71 @@ def _cache_hash(row,raw,label_run_db):
         receipt=conn.execute("SELECT journal_path FROM papers WHERE paper_id=? AND status='verified'",(row['paper_id'],)).fetchone()
     finally:conn.close()
     if not receipt:raise DriverError('verified label receipt missing')
-    plan=json.loads(Path(receipt[0]).read_text(encoding='utf-8'))
-    if plan.get('phase')!='applied':raise DriverError('label repair is not applied')
-    if plan.get('kind')=='section-label-repair':
-        papers=[p for p in plan['papers']if p['arxiv_id']==row['paper_id']]
-        if len(papers)!=1:raise DriverError('label receipt paper identity mismatch')
-        paper=papers[0]
-    elif plan.get('kind')=='published-label-replacement':paper=plan['paper']
-    else:raise DriverError('unsupported label receipt kind')
-    if paper['arxiv_id']!=row['paper_id']:raise DriverError('label receipt paper mismatch')
-    before=base64.b64decode(paper['cache_before']);after=base64.b64decode(paper['cache_after'])
-    if labels._sha(before)!=row['cache_sha256']or after!=raw:
-        raise DriverError('label receipt does not bind original/current cache')
+    def paper_images(plan):
+        if plan.get('kind')=='section-label-repair':
+            papers=[p for p in plan.get('papers',[])if p.get('arxiv_id')==row['paper_id']]
+            if len(papers)!=1:raise DriverError('label receipt paper identity mismatch')
+            paper=papers[0]
+        elif plan.get('kind')=='published-label-replacement':
+            paper=plan.get('paper')
+        else:raise DriverError('unsupported label receipt kind')
+        if not isinstance(paper,dict)or paper.get('arxiv_id')!=row['paper_id']:
+            raise DriverError('label repair paper mismatch')
+        try:
+            before=base64.b64decode(paper['cache_before'],validate=True)
+            after=base64.b64decode(paper['cache_after'],validate=True)
+        except Exception as exc:raise DriverError('label receipt cache image is invalid')from exc
+        return before,after
+
     def content(data):
-        return [{k:v for k,v in c.items()if k not in('section_title','section_type')}for c in json.loads(data)]
-    if content(before)!=content(after):raise DriverError('label receipt changed content beyond labels')
-    return actual
+        try:chunks=json.loads(data)
+        except (TypeError,ValueError)as exc:raise DriverError('label receipt cache JSON is invalid')from exc
+        if not isinstance(chunks,list)or any(not isinstance(c,dict)for c in chunks):
+            raise DriverError('label receipt cache shape is invalid')
+        return [{k:v for k,v in c.items()if k not in('section_title','section_type')}for c in chunks]
+
+    def read_journal(path, *, referenced=False):
+        path=Path(path)
+        if (referenced and not path.is_absolute())or path.is_symlink()or not path.is_file():
+            raise DriverError('label receipt journal path is invalid')
+        try:raw_journal=path.read_bytes();plan=json.loads(raw_journal)
+        except Exception as exc:raise DriverError('label receipt journal is unreadable')from exc
+        if plan.get('phase')!='applied':raise DriverError('label repair is not applied')
+        before,after=paper_images(plan)
+        if content(before)!=content(after):raise DriverError('label receipt changed content beyond labels')
+        return raw_journal,plan,before,after
+
+    current_path=Path(receipt[0])
+    _,plan,before,after=read_journal(current_path)
+    if after!=raw:raise DriverError('label receipt does not bind current cache')
+    if labels._sha(before)==row['cache_sha256']:
+        if plan.get('cache_parent_journal'):
+            raise DriverError('unexpected parent reference on frozen-cache label receipt')
+        return actual
+
+    # Repeated verified label passes form a hash-bound journal chain. Follow
+    # only recorded parent paths; never scan journal directories for a guess.
+    expected_child_before=before
+    reference=plan.get('cache_parent_journal')
+    seen={str(current_path.resolve())}
+    while True:
+        if not isinstance(reference,dict)or set(reference)!={'path','sha256'}:
+            raise DriverError('label receipt parent reference is missing or malformed')
+        parent_path=Path(reference['path'])
+        normalized=str(parent_path.resolve())
+        if normalized in seen:raise DriverError('label receipt parent journal cycle')
+        seen.add(normalized)
+        parent_raw,parent_plan,parent_before,parent_after=read_journal(parent_path,referenced=True)
+        if labels._sha(parent_raw)!=reference['sha256']:
+            raise DriverError('label receipt parent journal hash drift')
+        if parent_after!=expected_child_before:
+            raise DriverError('label receipt parent cache boundary drift')
+        if labels._sha(parent_before)==row['cache_sha256']:
+            if parent_plan.get('cache_parent_journal'):
+                raise DriverError('frozen-cache root unexpectedly has a parent reference')
+            return actual
+        expected_child_before=parent_before
+        reference=parent_plan.get('cache_parent_journal')
 
 
 def _inputs(row,args):
@@ -145,7 +194,7 @@ def _maintenance(module,args):
 
 def _recover(ledger,args,client,deadline):
     added=verified=0
-    groups=ledger.execute("SELECT DISTINCT paper_id,journal_path FROM targets WHERE status!='verified' AND journal_path IS NOT NULL").fetchall()
+    groups=ledger.execute("SELECT DISTINCT paper_id,journal_path FROM targets WHERE status NOT IN('verified','excluded') AND journal_path IS NOT NULL").fetchall()
     for aid,path in groups:
         if time.monotonic()>=deadline:break
         entries=ledger.execute('SELECT chunk_index,status FROM targets WHERE paper_id=? AND journal_path=?',(aid,path)).fetchall()

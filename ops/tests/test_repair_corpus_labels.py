@@ -10,6 +10,8 @@ import uuid
 from types import SimpleNamespace
 
 from ops import repair_corpus_labels as driver
+from pipeline import document_cache
+from pipeline import extractor
 
 
 class FakeQdrant:
@@ -119,31 +121,141 @@ class CorpusLabelDriverTests(unittest.TestCase):
             census.execute("INSERT INTO papers VALUES (?,?,?,?,?,?,?,?,?)",
                            ("unchanged-heading", "heading_label_candidate", 0, "c", "s", *base, 1))
             census.execute("INSERT INTO papers VALUES (?,?,?,?,?,?,?,?,?)",
+                           ("verified-nochanges-fullmap", "heading_label_candidate", 0, "c", "s",
+                            "fulltext_cache", "[]",
+                            '[{"chunk_index":0,"section_title":"Methods","section_type":"method"}]', 1))
+            census.execute("INSERT INTO papers VALUES (?,?,?,?,?,?,?,?,?)",
                            ("unverified-heading", "heading_label_candidate", 0, "c", "s", *base, 0))
             census.commit()
             rows = driver._candidate_rows(census)
-            census.close()
             self.assertEqual([row["paper_id"] for row in rows], ["exact", "verified-heading"])
+            census.execute("INSERT INTO meta VALUES ('candidate_subset','verified-unresolved-label-retry')")
+            rows = driver._candidate_rows(census)
+            census.close()
+            self.assertEqual([row["paper_id"] for row in rows],
+                             ["exact", "verified-nochanges-fullmap"])
 
-    def test_one_legacy_candidate_runs_from_frozen_rowmap_to_verified(self):
+    def test_bounded_completed_batches_skip_cleared_prefix_and_continue(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source_census = root / "frozen-census.sqlite"
+            source_census.write_bytes(b"frozen census identity")
+            stat = source_census.stat()
+            source_identity = json.dumps([str(source_census.resolve()), stat.st_dev,
+                stat.st_ino, stat.st_size, stat.st_mtime_ns], separators=(",", ":"))
+            candidate = root / "verified-unresolved.sqlite"
+            conn = sqlite3.connect(candidate)
+            conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+            conn.executemany("INSERT INTO meta VALUES (?,?)", [
+                ("run_complete", "1"),
+                ("candidate_subset", "verified-unresolved-label-retry"),
+                ("source_census_path", str(source_census.resolve())),
+                ("source_census_identity", source_identity),
+                ("source_bound_selected_count", "343"),
+                ("source_verified_unresolved_count", "403"),
+                ("source_unresolved_chunk_count", "1758"),
+                ("source_bound_resolved_chunk_count", "1134")])
+            conn.commit(); conn.close()
+            journal_dir = root / "journals"
+            run_db = root / "run.sqlite"
+            ledger = driver._ledger(run_db)
+            driver._record(ledger, "000", "verified", 1, "prior.json",
+                           json.dumps({"unresolved_chunks": [7]}))
+            for index in range(2, 343):
+                driver._record(ledger, f"{index:03}", "verified", 1, "prior.json")
+            ledger.close()
+            rows = [{"paper_id": f"{index:03}"} for index in range(343)]
+            args = SimpleNamespace(census_db=candidate, rowmap_db=root / "rowmap.sqlite",
+                fts_db=root / "fts.sqlite", state_db=root / "state.sqlite", cache_dir=root / "cache",
+                section_cache_dir=root / "sections", fulltext_cache_dir=root / "source",
+                latex_cache_dir=root / "latex", journal_dir=journal_dir, run_db=run_db,
+                collection="papers_fulltext", limit=1, max_seconds=0,
+                verify_completed=True, retry_failed=False)
+            calls = []
+            def complete_one(row, *, ledger, **kwargs):
+                calls.append(row["paper_id"])
+                driver._record(ledger, row["paper_id"], "verified", 1, "new.json")
+            with patch.object(driver, "_candidate_rows", return_value=rows), \
+                 patch.object(driver, "_open_rowmap", return_value=sqlite3.connect(":memory:")), \
+                 patch.object(driver, "_resume_one", side_effect=complete_one):
+                first = driver.run(args, object())
+                second = driver.run(args, object())
+            self.assertEqual(calls, ["000", "001"])
+            self.assertEqual((first["scheduled"], first["pending"]), (1, 0))
+            self.assertEqual((second["scheduled"], second["pending"]), (1, 0))
+            self.assertEqual(second["skipped_verified"], 342)
+
+    def test_bounded_preflight_failure_preserves_accepted_journal_until_explicit_retry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);source=root/'frozen.sqlite';source.write_bytes(b'frozen identity')
+            stat=source.stat();candidate=root/'bounded.sqlite'
+            with sqlite3.connect(candidate) as c:
+                c.execute('CREATE TABLE meta(key PRIMARY KEY,value)')
+                c.executemany('INSERT INTO meta VALUES(?,?)',[
+                    ('candidate_subset','verified-unresolved-label-retry'),
+                    ('source_census_path',str(source.resolve())),
+                    ('source_census_identity',json.dumps([str(source.resolve()),stat.st_dev,stat.st_ino,stat.st_size,stat.st_mtime_ns])),
+                    ('source_bound_selected_count','343'),('source_verified_unresolved_count','403'),
+                    ('source_unresolved_chunk_count','1758'),('source_bound_resolved_chunk_count','1134')])
+            c.close()
+            journal_dir=root/'journals';accepted=driver._journal_path(journal_dir,'000',3)
+            accepted_bytes=json.dumps(dict(kind='section-label-repair',phase='applied',papers=[dict(arxiv_id='000')])).encode()
+            accepted.write_bytes(accepted_bytes)
+            run_db=root/'run.sqlite';ledger=driver._ledger(run_db)
+            driver._record(ledger,'000','verified',3,accepted,json.dumps({'unresolved_chunks':[7]}))
+            for i in range(1,343):driver._record(ledger,f'{i:03}','verified',1,'prior.json')
+            ledger.close()
+            args=SimpleNamespace(census_db=candidate,rowmap_db=root/'rowmap',fts_db=root/'fts',
+                state_db=root/'state',cache_dir=root/'cache',section_cache_dir=root/'sections',
+                fulltext_cache_dir=root/'source',latex_cache_dir=root/'latex',journal_dir=journal_dir,
+                run_db=run_db,collection='papers_fulltext',limit=1,max_seconds=0,
+                verify_completed=True,retry_failed=False,bounded_retry_id=None)
+            rows=[{'paper_id':f'{i:03}'} for i in range(343)]
+            with patch.object(driver,'_candidate_rows',return_value=rows), \
+                 patch.object(driver,'_open_rowmap',side_effect=lambda *a:sqlite3.connect(':memory:')), \
+                 patch.object(driver,'_resume_one',side_effect=driver.DriverError('preflight rejected before a new journal')) as resume, \
+                 patch.object(driver,'_recover_failed_paper',side_effect=AssertionError('must not roll back accepted journal')) as recover:
+                first=driver.run(args,object());second=driver.run(args,object())
+                self.assertEqual((first['failed'],second['scheduled']),(1,0))
+                self.assertEqual(resume.call_count,1);recover.assert_not_called()
+                args.retry_failed=True;args.bounded_retry_id='explicit-invocation'
+                driver.run(args,object());driver.run(args,object())
+                self.assertEqual(resume.call_count,2);recover.assert_not_called()
+            ledger=driver._ledger(run_db)
+            state=ledger.execute('SELECT status,attempt,journal_path,detail FROM papers WHERE paper_id=?',('000',)).fetchone()
+            ledger.close()
+            self.assertEqual(state[:3],('verified',3,str(accepted)))
+            detail=json.loads(state[3]);self.assertEqual(detail['unresolved_chunks'],[7])
+            self.assertIn('preflight rejected',detail['bounded_retry_error']['error'])
+            self.assertEqual(accepted.read_bytes(),accepted_bytes)
+
+    def test_long_exact_identity_label_runs_from_frozen_rowmap_to_verified(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             cache_dir, section_dir = root / "chunk_cache", root / "section_cache"
             source_dir, latex_dir = root / "fulltext_cache", root / "latex_cache"
             for path in (cache_dir, section_dir, source_dir, latex_dir): path.mkdir()
-            aid = "2401.00002"
+            aid = "acl:https://lrec.elra.info/lrec2026-main-001"
             point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, aid + "#0"))
             unresolved_id = str(uuid.uuid5(uuid.NAMESPACE_URL, aid + "#1"))
-            old_chunk = {"chunk_index": 0, "text": "Exact cached source", "section_title": "Misc",
-                         "section_type": "other", "element_type": "prose"}
+            proposed_invalid_title = "Long source heading " + ("y" * 530)
+            source_text = "# Methods\n\nExact cached source\n\n# " + proposed_invalid_title + "\n\nAnother exact cached source."
+            parsed_chunks, _ = extractor.build_chunks_markdown(source_text, document_kind="paper")
+            old_chunk = dict(parsed_chunks[0], section_title="Misc", section_type="other")
             old_invalid_title = "Existing invalid label " + ("x" * 530)
-            unresolved_chunk = {"chunk_index": 1, "text": "Another exact cached source",
-                                "section_title": old_invalid_title, "section_type": "other",
-                                "element_type": "prose"}
-            cache_path = cache_dir / (aid + ".json")
+            unresolved_chunk = dict(parsed_chunks[1])
+            unresolved_chunk.update(section_title=old_invalid_title, section_type="other")
+            cache_path = cache_dir / (document_cache.safe_id(aid) + ".json")
             cache_path.write_text(json.dumps([old_chunk, unresolved_chunk]), encoding="utf-8")
-            source_path = source_dir / (aid + ".tex")
-            source_path.write_text("source snapshot", encoding="utf-8")
+            source_path = source_dir / (document_cache.safe_id(aid) + ".tex")
+            source_path.write_text(source_text, encoding="utf-8")
+            initial_cache = cache_path.read_bytes()
+            initial_manifest = document_cache.make_section_manifest(aid,
+                [old_chunk, unresolved_chunk], initial_cache, source_path.read_bytes(),
+                "markdown", "test-source-parser")
+            document_cache.publish_section_manifest(section_dir /
+                (document_cache.safe_id(aid) + ".json"), initial_manifest)
+            self.assertEqual(initial_manifest["source_sha256"], hashlib.sha256(source_path.read_bytes()).hexdigest())
             state_path = root / "state.db"
             state = sqlite3.connect(state_path)
             state.execute("CREATE TABLE papers(arxiv_id TEXT PRIMARY KEY,status TEXT)")
@@ -172,13 +284,12 @@ class CorpusLabelDriverTests(unittest.TestCase):
             census = sqlite3.connect(census_path)
             census.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
             census.execute("INSERT INTO meta VALUES ('run_complete','1')")
-            census.execute("CREATE TABLE papers(paper_id,candidate_status,exact_text_ids,cache_sha256,source_sha256,source_location,candidate_changes_json,candidate_label_map_json,labels_source_verified INTEGER DEFAULT 0)")
-            proposed_invalid_title = "Invalid proposal " + ("y" * 530)
-            full_labels = [{"chunk_index": 0, "section_title": "Methods", "section_type": "method"},
-                           {"chunk_index": 1, "section_title": proposed_invalid_title, "section_type": "related_work"}]
-            census.execute("INSERT INTO papers(paper_id,candidate_status,exact_text_ids,cache_sha256,source_sha256,source_location,candidate_changes_json,candidate_label_map_json) VALUES (?,?,?,?,?,?,?,?)", (aid, "candidate", 1,
+            census.execute("CREATE TABLE papers(paper_id,candidate_status,exact_text_ids,cache_sha256,source_sha256,source_location,candidate_changes_json,candidate_label_map_json,labels_source_verified INTEGER DEFAULT 0,fulltext_source,parser_mode)")
+            full_labels = [{"chunk_index": chunk["chunk_index"], "section_title": chunk["section_title"],
+                            "section_type": chunk["section_type"]} for chunk in parsed_chunks]
+            census.execute("INSERT INTO papers(paper_id,candidate_status,exact_text_ids,cache_sha256,source_sha256,source_location,candidate_changes_json,candidate_label_map_json,fulltext_source,parser_mode) VALUES (?,?,?,?,?,?,?,?,?,?)", (aid, "candidate", 1,
                 hashlib.sha256(cache_path.read_bytes()).hexdigest(), hashlib.sha256(source_path.read_bytes()).hexdigest(),
-                "fulltext_cache", json.dumps(full_labels), json.dumps(full_labels)))
+                "fulltext_cache", json.dumps(full_labels), json.dumps(full_labels), "acl-pdf", None))
             census.commit(); census.close()
             qdrant = FakeQdrant({"id": point_id, "payload": {"arxiv_id": aid, "chunk_index": 0,
                 "text": old_chunk["text"], "section_title": "Misc", "section_type": "other"}, "vector": [0.1]})
@@ -192,27 +303,68 @@ class CorpusLabelDriverTests(unittest.TestCase):
                 run_db=None, collection="papers_fulltext", limit=0, max_seconds=0,
                 verify_completed=False, retry_failed=False)
             result = driver.run(args, qdrant)
+            if result["failed"]:
+                debug = sqlite3.connect(journal_dir / "repair-run.sqlite3")
+                failure = debug.execute("SELECT detail FROM papers WHERE paper_id=?", (aid,)).fetchone()[0]
+                debug.close()
+                self.fail(f"source-grounded long-label repair failed: {failure}")
             self.assertEqual(result, {"verified": 1, "failed": 0, "skipped_verified": 0,
                 "skipped_failed": 0, "candidates": 1, "scheduled": 1, "pending": 0,
-                "verified_with_unresolved": 1, "unresolved_chunks": 1})
+                "verified_with_unresolved": 0, "unresolved_chunks": 0})
             # Resume verifies the durable after-image before consulting the now-stale
             # pre-migration cache hash from the read-only census.
             self.assertEqual(driver.run(args, qdrant), {"verified": 0, "failed": 0,
                 "skipped_verified": 1, "skipped_failed": 0, "candidates": 1,
-                "scheduled": 0, "pending": 0, "verified_with_unresolved": 1,
-                "unresolved_chunks": 1})
+                "scheduled": 0, "pending": 0, "verified_with_unresolved": 0,
+                "unresolved_chunks": 0})
             self.assertEqual(qdrant.point["payload"]["section_type"], "method")
             repaired_cache = json.loads(cache_path.read_text(encoding="utf-8"))
             self.assertEqual(repaired_cache[0]["section_title"], "Methods")
-            self.assertEqual(repaired_cache[1]["section_title"], old_invalid_title)
-            self.assertEqual(qdrant.points[unresolved_id]["payload"]["section_title"], old_invalid_title)
+            self.assertEqual(repaired_cache[1]["section_title"], proposed_invalid_title)
+            self.assertEqual(qdrant.points[unresolved_id]["payload"]["section_title"], proposed_invalid_title)
             ledger = sqlite3.connect(journal_dir / "repair-run.sqlite3")
             self.assertEqual(ledger.execute("SELECT status FROM papers WHERE paper_id=?", (aid,)).fetchone()[0], "verified")
-            detail = json.loads(ledger.execute("SELECT detail FROM papers WHERE paper_id=?", (aid,)).fetchone()[0])
-            self.assertEqual(detail["unresolved_chunks"][0]["chunk_index"], 1)
-            ledger.close()
+            self.assertIsNone(ledger.execute("SELECT detail FROM papers WHERE paper_id=?", (aid,)).fetchone()[0])
             plan = driver._latest_journal(journal_dir, aid)[2]
-            self.assertEqual(plan["papers"][0]["unresolved_chunks"][0]["reason"], "invalid_candidate_label")
+            self.assertEqual(plan["papers"][0]["unresolved_chunks"], [])
+
+            # A verified-but-unresolved no-change retry still has to rebuild and
+            # verify the canonical manifest before it clears the unresolved ledger.
+            original_cache_sha = hashlib.sha256(json.dumps([old_chunk, unresolved_chunk]).encode()).hexdigest()
+            census = sqlite3.connect(census_path)
+            census.row_factory = sqlite3.Row
+            census.execute("ALTER TABLE papers ADD COLUMN frozen_cache_sha256 TEXT")
+            census.execute("UPDATE papers SET frozen_cache_sha256=?,cache_sha256=?,candidate_changes_json='[]' WHERE paper_id=?",
+                           (original_cache_sha, hashlib.sha256(cache_path.read_bytes()).hexdigest(), aid))
+            census.commit()
+            row = census.execute("SELECT * FROM papers WHERE paper_id=?", (aid,)).fetchone()
+            ledger.execute("UPDATE papers SET detail=? WHERE paper_id=?",
+                           (json.dumps({"unresolved_chunks": [1]}), aid))
+            ledger.commit()
+            rowmap_conn = driver._open_rowmap(rowmap_path, fts_path)
+            prior_journal = Path(ledger.execute("SELECT journal_path FROM papers WHERE paper_id=?",
+                                                (aid,)).fetchone()[0])
+            verify_after = driver._verify_after
+            def reject_historical_full_set(module, path, client):
+                if Path(path) == prior_journal:
+                    raise AssertionError("bounded retry consulted historical point-set after-image")
+                return verify_after(module, path, client)
+            with patch.object(driver, "_verify_after", side_effect=reject_historical_full_set):
+                driver._resume_one(row, state_db=state_path, fts_db=fts_path, census_db=census,
+                    rowmap_conn=rowmap_conn, qdrant=qdrant, cache_dir=cache_dir,
+                    section_cache_dir=section_dir, fulltext_cache_dir=source_dir,
+                    latex_cache_dir=latex_dir, journal_dir=journal_dir, ledger=ledger,
+                    collection="papers_fulltext", verify_completed=True)
+            nochange = driver._latest_journal(journal_dir, aid)[2]
+            self.assertEqual(nochange["phase"], "applied")
+            self.assertEqual(nochange["papers"][0]["changes"], [])
+            self.assertIn("cache_parent_journal", nochange)
+            self.assertEqual(ledger.execute("SELECT detail FROM papers WHERE paper_id=?", (aid,)).fetchone()[0], None)
+            manifest = document_cache.load_section_manifest(root, aid,
+                cache_dir=cache_dir, section_cache_dir=section_dir)
+            self.assertEqual([section["section_title"] for section in manifest["sections"]],
+                             [chunk["section_title"] for chunk in parsed_chunks])
+            census.close(); rowmap_conn.close(); ledger.close()
 
     def test_failed_apply_is_compensated_before_failed_status_and_can_retry(self):
         with tempfile.TemporaryDirectory() as temp:

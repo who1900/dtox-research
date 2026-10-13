@@ -121,8 +121,8 @@ try:
 except ImportError:
     try:
         from api.boilerplate import BOILERPLATE_FILTER, is_boilerplate_chunk
-    except ImportError:  # detector not deployed next to us: embed everything
-        BOILERPLATE_FILTER = False
+    except ImportError:
+        BOILERPLATE_FILTER = None
         is_boilerplate_chunk = None
 
 CANONICAL_TYPES = [
@@ -153,6 +153,8 @@ SKIP_ELEMENT_TYPES = {"figure"}
 
 def should_embed(chunk):
     """False if this chunk should be skipped for embedding/Qdrant upsert."""
+    if is_boilerplate_chunk is None:
+        raise RuntimeError("index eligibility requires the boilerplate policy module")
     if (chunk.get("section_type") in SKIP_SECTION_TYPES
             and chunk.get("element_type") in SKIP_ELEMENT_TYPES):
         return False

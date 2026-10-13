@@ -93,7 +93,7 @@ def read_bounded(path, limit=MAX_BYTES):
 
 
 def _label(value):
-    return (isinstance(value, str) and len(value) <= 512
+    return (isinstance(value, str) and len(value) <= MAX_BYTES
             and not any(ord(char) < 32 for char in value))
 
 

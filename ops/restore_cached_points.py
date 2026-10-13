@@ -5,6 +5,7 @@ supplies a verified 384D document embedding function and recipe.
 """
 import json
 import math
+import inspect
 from pathlib import Path
 import sqlite3
 import uuid
@@ -303,6 +304,8 @@ def _candidate_equal(actual, expected):
 
 
 def _verify(plan,client,mode):
+    if plan.get('operation')=='receipt-withdrawal':
+        return _verify_legacy_withdrawal(plan,client,mode)
     _read(plan['source_path'],plan['source_sha256']);_read(plan['cache_path'],plan['cache_sha256'])
     state=labels._connect(plan['state_db'],readonly=True);fts=labels._connect(plan['fts_db'],readonly=True)
     inventory=_inventory(plan['rowmap_db'],plan['fts_db'])
@@ -341,6 +344,10 @@ def apply_plan(journal_path,*,qdrant):
     if plan['phase']!='prepared':raise RepairError('restore must be prepared')
     _verify(plan,qdrant,'before');_phase(journal_path,plan,'applying')
     try:
+        if plan.get('operation')=='receipt-withdrawal':
+            _write_removed_points(qdrant,'papers_fulltext',plan['removed'],True)
+            _write_removed_fts_transaction(plan['fts_db'],plan['removed'],True)
+            _verify(plan,qdrant,'after');_phase(journal_path,plan,'applied');return plan
         # Plain records also support a small REST adapter on hosts without SDK.
         qdrant.upsert(collection_name='papers_fulltext',points=plan['points'],wait=True)
         fts=labels._connect(plan['fts_db'])
@@ -367,6 +374,10 @@ def rollback_plan(journal_path,*,qdrant):
     plan=_load(journal_path)
     if plan['phase']not in('applying','applied','rolling_back'):raise RepairError('restore has no started operation')
     _verify(plan,qdrant,'partial');_phase(journal_path,plan,'rolling_back')
+    if plan.get('operation')=='receipt-withdrawal':
+        _write_removed_points(qdrant,'papers_fulltext',plan['removed'],False)
+        _write_removed_fts_transaction(plan['fts_db'],plan['removed'],False)
+        _verify(plan,qdrant,'before');_phase(journal_path,plan,'rolled_back');return plan
     ids=[p['id']for p in plan['points']]
     # Exact IDs were independently verified; never delete using a paper filter.
     qdrant.delete(collection_name='papers_fulltext',points_selector=ids,wait=True)
@@ -385,3 +396,200 @@ def rollback_plan(journal_path,*,qdrant):
         fts.commit()
     finally:fts.close()
     _verify(plan,qdrant,'before');_phase(journal_path,plan,'rolled_back');return plan
+
+
+WITHDRAWAL_POLICY_SHA256='b827f11ceee3404af6c2ec3e4dccd50e89cb6eef961bc929857245ff4d191893'
+
+
+def _withdrawal_policy(expected):
+    from pipeline import extractor
+    function=extractor.is_boilerplate_chunk
+    if (expected!=WITHDRAWAL_POLICY_SHA256 or extractor.BOILERPLATE_FILTER is not True or function is None
+            or labels._sha(Path(inspect.getsourcefile(function)).read_bytes().replace(b'\r\n',b'\n'))!=expected):
+        raise RepairError('withdrawal requires the exact active boilerplate policy')
+    return extractor
+
+
+def _withdrawal_request(paper_id,point_ids,source_path,cache_path,expected_source_sha256,
+        expected_cache_sha256,rowmap_db,expected_policy_sha256,origin_journals,source_route):
+    if source_route not in ('latex','paper_markdown','spec_markdown'):raise RepairError('unsupported withdrawal source route')
+    return dict(arxiv_id=paper_id,point_ids=list(point_ids),source_path=str(Path(source_path).resolve()),
+        cache_path=str(Path(cache_path).resolve()),expected_source_sha256=expected_source_sha256,
+        expected_cache_sha256=expected_cache_sha256,rowmap_db=str(Path(rowmap_db).resolve()),
+        expected_policy_sha256=expected_policy_sha256,source_route=source_route,
+        origin_journals={pid:str(Path(path).resolve()) for pid,path in origin_journals.items()})
+
+
+def _prepare_withdrawals(request,live,fts,fts_db,client,source_parser=None):
+    aid=request['arxiv_id'];ids=request['point_ids']
+    if (not ids or len(ids)>3000 or len(set(ids))!=len(ids) or not set(ids)<=set(live)
+            or set(request['origin_journals'])!=set(ids)):
+        raise RepairError('unique current receipt-owned withdrawal IDs required')
+    policy=_withdrawal_policy(request['expected_policy_sha256'])
+    source=_read(request['source_path'],request['expected_source_sha256'])
+    chunks=json.loads(_read(request['cache_path'],request['expected_cache_sha256']))
+    by_index={c['chunk_index']:c for c in chunks}
+    if len(by_index)!=len(chunks):raise RepairError('duplicate withdrawal cache indices')
+    try:parsed,elements=parse_source_views(source,request['source_route'],source_parser)
+    except RepairError:parsed,elements=[],[]
+    _catalog(fts)
+    if fts.execute('SELECT complete FROM pipeline_fts_scope WHERE singleton=1').fetchone()!=(1,):
+        raise RepairError('withdrawal requires complete ownership')
+    if not labels._exists(fts,'dtox_cached_point_receipts'):raise RepairError('no accepted addition receipts')
+    inventory=_inventory(request['rowmap_db'],fts_db)
+    removed=[]
+    try:
+        for pid in ids:
+            p=live[pid];payload=p['payload'];c=by_index.get(payload.get('chunk_index'))
+            if (payload.get('arxiv_id')!=aid or c is None or any(payload.get(k)!=c.get(k) for k in
+                    ('text','chunk_index','section_title','section_type'))
+                    or payload.get('element_type','prose')!=c.get('element_type','prose')
+                    or policy.should_embed(c)):
+                raise RepairError('withdrawal point is not an exact currently excluded cache chunk')
+            if inventory.execute('SELECT 1 FROM rows WHERE point_id=? LIMIT 1',(pid,)).fetchone():
+                raise RepairError('original frozen baseline point cannot be withdrawn')
+            owned=_fts_point(fts,pid)
+            receipts=[list(r) for r in fts.execute('SELECT operation_id,point_id,row_id FROM dtox_cached_point_receipts WHERE point_id=?',(pid,))]
+            if owned is None or owned[1]!=_expected(p) or len(receipts)!=1 or receipts[0][2]!=owned[0]:
+                raise RepairError('withdrawal requires exact unique receipt/FTS ownership')
+            origin_path=Path(request['origin_journals'][pid])
+            origin_raw=document_cache.read_bounded(origin_path,64*1024*1024);origin=json.loads(origin_raw)
+            if origin.get('schema')!=1 or origin.get('phase')!='applied':raise RepairError('origin addition journal was not accepted')
+            if origin.get('kind')=='restore-cached-points' and not origin.get('operation'):
+                candidates=origin['points'];operation=origin['operation_id']
+                source_hash=origin['source_sha256'];route=origin['source_route']
+            elif origin.get('kind')=='published-label-replacement' and 'addition_proof' in origin.get('paper',{}):
+                candidates=origin['paper']['points_added'];operation=origin['paper']['addition_operation_id']
+                source_hash=origin['paper']['addition_proof']['expected_source_sha256'];route=origin['paper']['addition_proof']['source_route']
+            else:raise RepairError('origin journal does not prove a newly added point')
+            matches=[x for x in candidates if x['id']==pid]
+            if (len(matches)!=1 or receipts[0][0]!=operation or source_hash!=request['expected_source_sha256']
+                    or route!=request['source_route']):raise RepairError('origin receipt/source binding mismatch')
+            old=json.loads(json.dumps(matches[0]))
+            # Later accepted label repairs and snapshot markers do not change
+            # the original text/vector identity of an addition.
+            for key in ('section_title','section_type','publication_revision'):
+                if key in payload:old['payload'][key]=payload[key]
+                else:old['payload'].pop(key,None)
+            if (not snapshots._parent_payload_equal(payload,old['payload'])
+                    or not snapshots._vector_equal(p['vector'],old['vector'])):
+                raise RepairError('origin addition payload/vector identity changed')
+            reproduced=source_proven(c,parsed,elements)
+            removed.append(dict(point=p,fts_row=[owned[0],*owned[1]],receipt=receipts[0],
+                origin_path=str(origin_path),origin_sha256=labels._sha(origin_raw),
+                source_proof='current-typed-replay' if reproduced else 'accepted-source-bound-origin'))
+        if _retrieve(client,'papers_coarse_base',ids):raise RepairError('withdrawal coarse UUID collision')
+        if _retrieve(client,'papers_fulltext',ids)!={pid:live[pid] for pid in ids}:
+            raise RepairError('withdrawal global UUID ownership mismatch')
+        return removed
+    finally:inventory.close()
+
+
+def _verify_withdrawal_data(proof,removed,before,after,fts_before,fts,fts_db,client,mode):
+    policy=_withdrawal_policy(proof['expected_policy_sha256'])
+    _read(proof['source_path'],proof['expected_source_sha256'])
+    cache=json.loads(_read(proof['cache_path'],proof['expected_cache_sha256']))
+    by_index={c['chunk_index']:c for c in cache}
+    live=snapshots._scroll(client,'papers_fulltext',proof['arxiv_id'])
+    required=set(after) if mode=='after' else set(before) if mode=='before' else set(before)&set(after)
+    permitted=set(before) if mode in ('before','partial') else set(after)
+    if not required<=set(live)<=permitted:raise RepairError('withdrawal point set drift')
+    removed_ids={r['point']['id'] for r in removed}
+    for pid,point in live.items():
+        choices=[before[pid],after[pid]] if pid in after else [before[pid]]
+        allowed=choices if mode=='partial' else [after[pid] if mode=='after' else before[pid]]
+        if not any(point==p or pid in removed_ids and _candidate_equal(point,p) for p in allowed):
+            raise RepairError('withdrawal payload/vector drift')
+    actual_ids={r[0] for r in fts.execute('SELECT point_id FROM pipeline_fts_points WHERE arxiv_id=?',(proof['arxiv_id'],))}
+    if not set(after)<=actual_ids<=set(before):raise RepairError('withdrawal catalog point set drift')
+    for row in fts_before:
+        if row[2] not in removed_ids and _fts_point(fts,row[2])!=(row[0],tuple(row[1:])):
+            raise RepairError('retained withdrawal FTS row drift')
+    inventory=_inventory(proof['rowmap_db'],fts_db)
+    try:
+        _catalog(fts)
+        if fts.execute('SELECT complete FROM pipeline_fts_scope WHERE singleton=1').fetchone()!=(1,):raise RepairError('withdrawal ownership completeness changed')
+        global_points=_retrieve(client,'papers_fulltext',list(removed_ids))
+        if set(global_points)!=(set(live)&removed_ids):raise RepairError('withdrawn UUID acquired another owner')
+        if _retrieve(client,'papers_coarse_base',list(removed_ids)):raise RepairError('withdrawal coarse UUID collision')
+        for r in removed:
+            point=r['point'];pid=point['id'];row=r['fts_row'];receipt=r['receipt']
+            c=by_index.get(point['payload']['chunk_index'])
+            if c is None or policy.should_embed(c):raise RepairError('withdrawal eligibility changed')
+            if labels._sha(document_cache.read_bounded(Path(r['origin_path']),64*1024*1024))!=r['origin_sha256']:
+                raise RepairError('withdrawal origin journal changed')
+            if inventory.execute('SELECT 1 FROM rows WHERE point_id=? LIMIT 1',(pid,)).fetchone():raise RepairError('withdrawal entered frozen baseline')
+            owned=_fts_point(fts,pid);actual=labels._fts_tuple(fts,row[0])
+            receipts=[list(x) for x in fts.execute('SELECT operation_id,point_id,row_id FROM dtox_cached_point_receipts WHERE point_id=?',(pid,))]
+            if owned is None:
+                if actual is not None or receipts:raise RepairError('withdrawn FTS/receipt/rowid collision')
+                if fts.execute("SELECT 1 FROM pipeline_fts_rows WHERE table_name='chunks' AND row_id=?",(row[0],)).fetchone():raise RepairError('withdrawn row ownership collision')
+            elif owned!=(row[0],tuple(row[1:])) or receipts!=[receipt]:raise RepairError('withdrawal receipt/FTS drift')
+            if mode=='before' and owned is None or mode=='after' and owned is not None:
+                raise RepairError('withdrawal FTS visibility mismatch')
+    finally:inventory.close()
+
+
+def _write_removed_points(client,collection,removed,forward):
+    if forward:client.delete(collection_name=collection,points_selector=[r['point']['id'] for r in removed],wait=True)
+    else:client.upsert(collection_name=collection,points=[r['point'] for r in removed],wait=True)
+
+
+def _write_removed_fts(fts,removed,forward):
+    for r in removed:
+        p=r['point'];row=r['fts_row'];receipt=r['receipt'];pid=p['id'];aid=p['payload']['arxiv_id']
+        if forward:
+            if _fts_point(fts,pid)!=(row[0],tuple(row[1:])):raise RepairError('withdrawal FTS changed before deletion')
+            fts.execute('DELETE FROM chunks WHERE rowid=?',(row[0],))
+            fts.execute('DELETE FROM pipeline_fts_points WHERE point_id=? AND arxiv_id=? AND row_id=?',(pid,aid,row[0]))
+            fts.execute("DELETE FROM pipeline_fts_rows WHERE table_name='chunks' AND arxiv_id=? AND row_id=?",(aid,row[0]))
+            changed=fts.execute('DELETE FROM dtox_cached_point_receipts WHERE operation_id=? AND point_id=? AND row_id=?',receipt).rowcount
+            if changed!=1:raise RepairError('withdrawal receipt changed before deletion')
+        elif _fts_point(fts,pid) is None:
+            if labels._fts_tuple(fts,row[0]) is not None:raise RepairError('withdrawal rollback rowid collision')
+            fts.execute('INSERT INTO chunks(rowid,text,point_id,arxiv_id,section_type,element_type,layers,year) VALUES(?,?,?,?,?,?,?,?)',row)
+            fts.execute('INSERT INTO pipeline_fts_points VALUES(?,?,?)',(pid,aid,row[0]))
+            fts.execute("INSERT INTO pipeline_fts_rows VALUES('chunks',?,?)",(aid,row[0]))
+            fts.execute('INSERT INTO dtox_cached_point_receipts VALUES(?,?,?)',receipt)
+
+
+def _write_removed_fts_transaction(path,removed,forward):
+    fts=labels._connect(path)
+    try:
+        fts.execute('BEGIN IMMEDIATE');_write_removed_fts(fts,removed,forward);fts.commit()
+    finally:fts.close()
+
+
+def prepare_withdrawal_plan(paper_id,point_ids,*,source_path,cache_path,expected_source_sha256,
+        expected_cache_sha256,state_db,fts_db,rowmap_db,journal_path,qdrant,expected_policy_sha256,
+        origin_journals,source_route,source_parser=None,section_cache_dir=None):
+    if Path(journal_path).exists():raise RepairError('withdrawal journal already exists')
+    proof=_withdrawal_request(paper_id,point_ids,source_path,cache_path,expected_source_sha256,
+        expected_cache_sha256,rowmap_db,expected_policy_sha256,origin_journals,source_route)
+    state=labels._connect(state_db,readonly=True);fts=labels._connect(fts_db,readonly=True)
+    try:
+        row=_legacy(state,paper_id);live=snapshots._scroll(qdrant,'papers_fulltext',paper_id)
+        removed=_prepare_withdrawals(proof,live,fts,fts_db,qdrant,source_parser)
+        if len(removed)==len(live):raise RepairError('withdrawal must retain a nonempty legacy baseline')
+        rowids=[r[0] for r in fts.execute('SELECT row_id FROM pipeline_fts_points WHERE arxiv_id=?',(paper_id,))]
+        rows=snapshots._fts_rows(fts,paper_id,rowids)
+        if len(rows)!=len(live) or {r[2] for r in rows}!=set(live):raise RepairError('withdrawal full FTS set mismatch')
+        for r in rows:
+            if tuple(r[1:])!=_expected(live[r[2]]):raise RepairError('withdrawal baseline FTS differs')
+        plan=dict(schema=1,kind='restore-cached-points',operation='receipt-withdrawal',phase='prepared',
+            arxiv_id=paper_id,state_db=str(Path(state_db).resolve()),fts_db=str(Path(fts_db).resolve()),
+            state_before=row,withdrawal_proof=proof,removed=removed,points_before=list(live.values()),
+            fts_before=[list(r) for r in rows],points=[r['point'] for r in removed])
+        _verify_legacy_withdrawal(plan,qdrant,'before')
+        labels._atomic(journal_path,labels._json_bytes(plan));return plan
+    finally:state.close();fts.close()
+
+
+def _verify_legacy_withdrawal(plan,client,mode):
+    state=labels._connect(plan['state_db'],readonly=True);fts=labels._connect(plan['fts_db'],readonly=True)
+    try:
+        if _legacy(state,plan['arxiv_id'])!=plan['state_before']:raise RepairError('withdrawal paper state drift')
+        before={p['id']:p for p in plan['points_before']};ids={r['point']['id'] for r in plan['removed']}
+        after={pid:p for pid,p in before.items() if pid not in ids}
+        _verify_withdrawal_data(plan['withdrawal_proof'],plan['removed'],before,after,plan['fts_before'],fts,plan['fts_db'],client,mode)
+    finally:state.close();fts.close()

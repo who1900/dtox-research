@@ -1,4 +1,6 @@
 import json
+import base64
+import hashlib
 import sqlite3
 import unittest
 import uuid
@@ -16,6 +18,13 @@ from pipeline.publication import ensure_publication_schema
 
 
 class RestoreCorpusPointsTests(unittest.TestCase):
+    def test_policy_excluded_points_are_terminal_for_restore_recovery(self):
+        with sqlite3.connect(':memory:') as ledger:
+            ledger.execute('CREATE TABLE targets(paper_id,chunk_index,status,journal_path)')
+            ledger.execute("INSERT INTO targets VALUES('2401.00001',1,'excluded','withdrawal.json')")
+            self.assertEqual(driver._recover(ledger, self.args, self.qdrant, float('inf')), (0, 0))
+            self.assertEqual(ledger.execute('SELECT status FROM targets').fetchone()[0], 'excluded')
+
     def setUp(self):
         fixtures.RestoreCachedPointsTests.setUp(self)
         self.fulltext=self.root/'fulltext';self.fulltext.mkdir()
@@ -213,6 +222,45 @@ class RestoreCorpusPointsTests(unittest.TestCase):
         for aid in self.aids:
             pid=str(uuid.uuid5(uuid.NAMESPACE_URL,aid+'#1'))
             self.assertEqual(self.qdrant.points[pid]['payload']['section_title'],'Verified results')
+
+    def _label_chain(self, *, tamper_parent=False):
+        aid = self.aids[0]
+        before = json.dumps([dict(chunk_index=0, text='same text', element_type='prose',
+            section_title='Before', section_type='other')], separators=(',', ':')).encode()
+        middle = json.dumps([dict(chunk_index=0, text='same text', element_type='prose',
+            section_title='First label', section_type='method')], separators=(',', ':')).encode()
+        after = json.dumps([dict(chunk_index=0, text='same text', element_type='prose',
+            section_title='Final label', section_type='method')], separators=(',', ':')).encode()
+        encode = lambda data: base64.b64encode(data).decode()
+        parent = self.root/'parent-label.json'
+        parent_value = dict(schema=1, kind='section-label-repair', phase='applied',
+            papers=[dict(arxiv_id=aid, cache_before=encode(before), cache_after=encode(middle))])
+        parent_bytes = json.dumps(parent_value, separators=(',', ':')).encode()
+        parent.write_bytes(parent_bytes)
+        child = self.root/'child-label.json'
+        child_value = dict(schema=1, kind='section-label-repair', phase='applied',
+            cache_parent_journal=dict(path=str(parent.resolve()), sha256=hashlib.sha256(parent_bytes).hexdigest()),
+            papers=[dict(arxiv_id=aid, cache_before=encode(middle), cache_after=encode(after))])
+        child.write_text(json.dumps(child_value), encoding='utf-8')
+        if tamper_parent:
+            parent_value['tampered'] = True
+            parent.write_text(json.dumps(parent_value), encoding='utf-8')
+        ledger = self.root/'label-chain.sqlite'
+        with closing(sqlite3.connect(ledger)) as conn:
+            conn.execute('CREATE TABLE papers(paper_id TEXT PRIMARY KEY,status TEXT,journal_path TEXT)')
+            conn.execute('INSERT INTO papers VALUES(?,?,?)', (aid, 'verified', str(child)))
+            conn.commit()
+        row = {'paper_id': aid, 'cache_sha256': hashlib.sha256(before).hexdigest()}
+        return row, after, ledger
+
+    def test_label_cache_hash_accepts_hash_bound_parent_journal_chain(self):
+        row, current, ledger = self._label_chain()
+        self.assertEqual(driver._cache_hash(row, current, ledger), hashlib.sha256(current).hexdigest())
+
+    def test_label_cache_hash_rejects_tampered_parent_journal(self):
+        row, current, ledger = self._label_chain(tamper_parent=True)
+        with self.assertRaisesRegex(driver.DriverError, 'parent journal hash drift'):
+            driver._cache_hash(row, current, ledger)
 
     def test_budget_does_not_dispatch_new_operation(self):
         with patch.object(driver.time,'monotonic',side_effect=[0,100,100]):

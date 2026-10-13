@@ -14,6 +14,185 @@ from pipeline.fts_catalog import ensure_catalog
 from ops.tests.test_restore_cached_points import Client
 
 
+class AdoptionClient(Client):
+    def __init__(self,points):
+        super().__init__(points)
+        self.coarse={}
+    def scroll(self,**kwargs):
+        if kwargs['collection_name']=='papers_coarse_base':
+            aid=kwargs['scroll_filter']['must'][0]['match']['value']
+            return [p for p in self.coarse.values() if p['payload']['arxiv_id']==aid],None
+        return super().scroll(**kwargs)
+    def retrieve(self,*,collection_name,ids,**kwargs):
+        values=self.coarse if collection_name=='papers_coarse_base' else self.points
+        return [values[i] for i in ids if i in values]
+    def upsert(self,*,collection_name,points,wait=True):
+        values=self.coarse if collection_name=='papers_coarse_base' else self.points
+        for p in points:values[p['id']]=json.loads(json.dumps(p))
+    def delete(self,*,collection_name,points_selector,wait=True):
+        values=self.coarse if collection_name=='papers_coarse_base' else self.points
+        for pid in points_selector:values.pop(pid,None)
+    def overwrite_payload(self,*,collection_name,points,payload,wait=True):
+        for pid in points:self.points[pid]['payload']=dict(payload)
+        if getattr(self,'crash',False):
+            self.crash=False
+            raise fixtures.SimulatedCrash('after orphan marker')
+
+
+class OrphanAdoptionTests(unittest.TestCase):
+    def setUp(self):
+        import uuid
+        fixtures.SectionLabelRepairTests.setUp(self)
+        self.cache_path.unlink();self.manifest_path.unlink()
+        self.fulltext_dir=self.root/'fulltext_cache';self.fulltext_dir.mkdir()
+        self.canonical_source=self.fulltext_dir/(self.aid+'.tex')
+        self.source_path=self.root/'source.md';self.source_path.write_bytes(self.source_bytes)
+        with closing(sqlite3.connect(self.state_path)) as c:
+            c.execute('DELETE FROM papers')
+            for name in ('title','year','layers','source_url','abstract'):c.execute('ALTER TABLE papers ADD COLUMN '+name+' TEXT')
+            ensure_publication_schema(c);c.commit()
+        self.qdrant=AdoptionClient(list(self.qdrant.points.values()))
+        with closing(sqlite3.connect(self.fts_path)) as c:
+            ensure_catalog(c)
+            c.execute('INSERT INTO pipeline_fts_points VALUES(?,?,?)',(self.pid,self.aid,self.rowid))
+            c.execute("INSERT INTO pipeline_fts_rows VALUES('chunks',?,?)",(self.aid,self.rowid))
+            c.execute('UPDATE pipeline_fts_scope SET complete=1')
+            c.execute("UPDATE chunks SET element_type='prose',layers='' WHERE rowid=?",(self.rowid,))
+            c.commit()
+        self.pf=self.root/'paperfts.db'
+        with closing(sqlite3.connect(self.pf)) as c:
+            c.execute('CREATE VIRTUAL TABLE papers_fts USING fts5(arxiv_id UNINDEXED,title,abstract,layers UNINDEXED,year UNINDEXED)')
+            c.execute('CREATE TABLE pipeline_fts_papers(table_name TEXT,arxiv_id TEXT,PRIMARY KEY(table_name,arxiv_id))')
+            c.execute('CREATE TABLE pipeline_fts_rows(table_name TEXT,arxiv_id TEXT,row_id INTEGER,PRIMARY KEY(table_name,arxiv_id,row_id))')
+            c.commit()
+        self.coarse=dict(id=str(uuid.uuid5(uuid.NAMESPACE_URL,'coarse:'+self.aid)),vector=[768**-0.5]*768,payload={'arxiv_id':self.aid,'title':'Title','layers':[]})
+        self.qdrant.points[self.pid]['payload']['element_type']='prose'
+        self.qdrant.points[self.pid]['vector']=[384**-0.5]*384
+        self.state_after=dict(arxiv_id=self.aid,status='done',title='Title',year=None,layers=None,source_url='https://example.test/'+('a'*40)+'/source.md',abstract='')
+    tearDown=fixtures.SectionLabelRepairTests.tearDown
+    def prepare(self,**kwargs):
+        args=dict(state_db=self.state_path,fts_db=self.fts_path,paper_fts_db=self.pf,cache_dir=self.cache_dir,
+            section_cache_dir=self.section_dir,data_dir=self.root,journal_path=self.journal,qdrant=self.qdrant,
+            fulltext_cache_dir=self.fulltext_dir,
+            source_path=self.source_path,expected_source_sha256=replacement.labels._sha(self.source_bytes),
+            source_route='spec_markdown',source_binding=dict(url=self.state_after['source_url'],commit='a'*40,retrieved_at='2026-10-14T00:00:00Z'),
+            state_after=self.state_after,coarse_point=self.coarse,parser_revision=5,
+            source_parser=lambda raw,route:([self.chunk],[self.chunk]))
+        args.update(kwargs)
+        return replacement.prepare_orphan_adoption(self.aid,**args)
+    def test_exact_adoption_and_rollback(self):
+        before=json.loads(json.dumps(self.qdrant.points));self.prepare()
+        with self.assertRaises(replacement.RepairError):replacement.apply_plan(self.journal,qdrant=self.qdrant)
+        replacement.apply_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+        self.assertEqual(self.qdrant.points[self.pid]['vector'],before[self.pid]['vector'])
+        self.assertTrue(self.cache_path.exists());self.assertTrue(self.manifest_path.exists())
+        self.assertEqual(self.canonical_source.read_bytes(),self.source_bytes)
+        with closing(sqlite3.connect(self.state_path)) as c:
+            self.assertEqual(c.execute('SELECT status FROM papers').fetchone(),('done',))
+            self.assertEqual(c.execute('SELECT state FROM paper_publications').fetchone(),('published',))
+        replacement.rollback_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+        self.assertEqual(self.qdrant.points,before);self.assertEqual(self.qdrant.coarse,{})
+        self.assertFalse(self.cache_path.exists());self.assertFalse(self.manifest_path.exists())
+        self.assertFalse(self.canonical_source.exists())
+        with closing(sqlite3.connect(self.state_path)) as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM papers').fetchone(),(0,))
+            self.assertEqual(c.execute('SELECT count(*) FROM paper_publications').fetchone(),(0,))
+        with closing(sqlite3.connect(self.pf)) as c:self.assertEqual(c.execute('SELECT count(*) FROM papers_fts').fetchone(),(0,))
+        self.journal=self.root/'retry.json'
+        self.prepare()
+    def test_interruption_recovers_absent_marker_and_projections(self):
+        before=json.loads(json.dumps(self.qdrant.points));self.prepare();self.qdrant.crash=True
+        with self.assertRaises(fixtures.SimulatedCrash):replacement.apply_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+        replacement.rollback_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+        self.assertEqual(self.qdrant.points,before)
+    def test_source_replay_mismatch_rejected(self):
+        self.qdrant.points[self.pid]['payload']['text']='Different text'
+        with self.assertRaises(replacement.RepairError):self.prepare()
+        self.assertFalse(self.journal.exists())
+    def test_source_drift_blocks_apply(self):
+        self.prepare();self.source_path.write_bytes(b'changed')
+        with self.assertRaises(replacement.RepairError):replacement.apply_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+    def test_interruption_after_projection_commits_recovers(self):
+        self.prepare();before=json.loads(json.dumps(self.qdrant.points))
+        atomic=replacement.labels._atomic
+        def interrupt(path,data):
+            if Path(path)==self.cache_path:raise fixtures.SimulatedCrash('after projection commits')
+            return atomic(path,data)
+        with patch.object(replacement.labels,'_atomic',interrupt):
+            with self.assertRaises(fixtures.SimulatedCrash):replacement.apply_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+        replacement.rollback_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+        self.assertEqual(self.qdrant.points,before);self.assertEqual(self.qdrant.coarse,{})
+        with closing(sqlite3.connect(self.pf)) as c:self.assertEqual(c.execute('SELECT count(*) FROM papers_fts').fetchone(),(0,))
+    def test_coarse_collision_rejected_before_journal(self):
+        point=json.loads(json.dumps(self.coarse));point['payload']['arxiv_id']='another-paper'
+        self.qdrant.coarse[point['id']]=point
+        with self.assertRaises(replacement.RepairError):self.prepare()
+        self.assertFalse(self.journal.exists())
+    def test_interrupted_rollback_can_resume(self):
+        self.prepare();replacement.apply_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+        self.qdrant.crash=True
+        with self.assertRaises(fixtures.SimulatedCrash):replacement.rollback_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+        replacement.rollback_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+        with closing(sqlite3.connect(self.state_path)) as c:self.assertEqual(c.execute('SELECT count(*) FROM paper_publications').fetchone(),(0,))
+    def test_missing_candidate_cannot_be_marked_applied(self):
+        self.prepare()
+        switch=replacement._switch
+        def missing(plan,forward):
+            if forward:
+                with closing(sqlite3.connect(self.state_path)) as c:
+                    c.execute('DELETE FROM paper_publications');c.commit()
+            return switch(plan,forward)
+        with patch.object(replacement,'_switch',missing):
+            with self.assertRaises(replacement.RepairError):replacement.apply_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+        self.assertEqual(json.loads(self.journal.read_bytes())['phase'],'rolled_back')
+    def test_source_receipt_preserves_day_precision(self):
+        plan=self.prepare(source_binding=dict(url=self.state_after['source_url'],commit='a'*40,retrieved_at='2026-10-13',retrieval_precision='day'))
+        self.assertEqual(plan['paper']['artifact']['metadata']['source_binding']['retrieved_at'],'2026-10-13')
+    def test_unpinned_source_url_rejected(self):
+        with self.assertRaises(replacement.RepairError):
+            self.prepare(source_binding=dict(url='https://example.test/main/source.md',commit='a'*40,retrieved_at='2026-10-13'))
+        self.assertFalse(self.journal.exists())
+    def test_existing_exact_canonical_source_survives_rollback(self):
+        self.canonical_source.write_bytes(self.source_bytes);self.prepare()
+        replacement.apply_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+        replacement.rollback_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+        self.assertEqual(self.canonical_source.read_bytes(),self.source_bytes)
+    def test_source_proven_labels_replace_legacy_labels_and_rollback_exactly(self):
+        before=json.loads(json.dumps(self.qdrant.points))
+        candidate=dict(self.chunk,section_title='Methods',section_type='method')
+        plan=self.prepare(source_parser=lambda raw,route:([candidate],[candidate]))
+        self.assertEqual(plan['paper']['points_before'],list(before.values()))
+        replacement.apply_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+        payload=self.qdrant.points[self.pid]['payload']
+        self.assertEqual((payload['section_title'],payload['section_type']),('Methods','method'))
+        self.assertEqual(payload['text'],before[self.pid]['payload']['text'])
+        self.assertEqual(self.qdrant.points[self.pid]['vector'],before[self.pid]['vector'])
+        with closing(sqlite3.connect(self.fts_path)) as c:
+            self.assertEqual(c.execute('SELECT rowid,section_type FROM chunks').fetchone(),(self.rowid,'method'))
+        replacement.rollback_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+        self.assertEqual(self.qdrant.points,before)
+        with closing(sqlite3.connect(self.fts_path)) as c:
+            self.assertEqual(c.execute('SELECT rowid,section_type FROM chunks').fetchone(),(self.rowid,'other'))
+    def test_adoption_preserves_source_proven_points_even_when_ingestion_filter_excludes(self):
+        with patch('pipeline.extractor.should_embed',return_value=False):
+            plan=self.prepare()
+            replacement.apply_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+        self.assertEqual(set(self.qdrant.points),{self.pid})
+        self.assertEqual(len(plan['paper']['artifact']['points']),1)
+    def test_configured_physical_publication_directory_preserves_identity(self):
+        physical=self.root/'transport'/'payload';physical.mkdir(parents=True)
+        plan=self.prepare(publication_cache_dir=physical)
+        artifact=Path(plan['paper']['artifact_path'])
+        self.assertEqual(artifact.parent,physical)
+        replacement.apply_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+        self.assertEqual(json.loads(artifact.read_bytes()),plan['paper']['artifact'])
+        replacement.rollback_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+        self.assertTrue(artifact.exists())
+        self.assertFalse(self.canonical_source.exists())
+        with closing(sqlite3.connect(self.state_path)) as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM paper_publications').fetchone(),(0,))
+
+
 class PublishedLabelReplacementTests(unittest.TestCase):
     def setUp(self):
         fixtures.SectionLabelRepairTests.setUp(self)

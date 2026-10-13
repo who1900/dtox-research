@@ -12,7 +12,7 @@ dtox connects agents to research papers, protocol specifications and technical d
 
 ## The research index
 
-**183,854 documents · 11,102,542 indexed passages · 13 public MCP tools**
+**183,000+ documents · 11 million+ indexed passages · 13 public MCP tools**
 
 Index snapshot: **14 October 2026**.
 

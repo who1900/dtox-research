@@ -49,20 +49,47 @@ def candidate(cache, source_text):
         base["status"] = "source_section_text_mismatch"
         return base
 
+    exact_text_ids = _same_text_identity(cache, paper_chunks)
+    if exact_text_ids:
+        full_labels, changes = [], []
+        for chunk, parsed in zip(cache, paper_chunks):
+            item = {"chunk_index": chunk["chunk_index"],
+                    "section_title": parsed["section_title"],
+                    "section_type": parsed["section_type"]}
+            full_labels.append(item)
+            if (chunk.get("section_title", "") != item["section_title"]
+                    or chunk.get("section_type", "other") != item["section_type"]):
+                changes.append(item.copy())
+        base.update(source_heading_verified=True, exact_text_ids=True,
+                    full_label_map=full_labels, changes=changes,
+                    status="candidate" if changes else "no_label_changes")
+        return base
+
     label_pairs_by_old_heading = {}
     for old, new in zip(old_sections, paper_sections):
         key = old["section_title"]
         label_pairs_by_old_heading.setdefault(key, set()).add(
             (new["section_title"], new["section_type"]))
 
+    exact_paper_labels = {}
+    for section in paper_sections:
+        exact_paper_labels.setdefault(section["section_title"], set()).add(
+            (section["section_title"], section["section_type"]))
+
     full_labels, changes = [], []
     for chunk in cache:
         cached_title = chunk.get("section_title", "")
-        matches = set()
-        cleaned_cache_title = extractor._clean_scientific_heading(cached_title)
-        for old_title, pairs in label_pairs_by_old_heading.items():
-            if cached_title == old_title or cleaned_cache_title == extractor._clean_scientific_heading(old_title):
-                matches.update(pairs)
+        # Prefer the canonical paper-profile heading when the cached title is
+        # an exact source-derived title. The legacy spec-profile bridge can
+        # collapse distinct headings after normalization, so it is only a
+        # fallback for older cache titles that do not equal a paper title.
+        matches = set(exact_paper_labels.get(cached_title, ()))
+        if not matches:
+            cleaned_cache_title = extractor._clean_scientific_heading(cached_title)
+            for old_title, pairs in label_pairs_by_old_heading.items():
+                if (cached_title == old_title
+                        or cleaned_cache_title == extractor._clean_scientific_heading(old_title)):
+                    matches.update(pairs)
         if len(matches) != 1:
             base["status"] = "unmatched_or_ambiguous_cached_heading"
             return base
@@ -74,8 +101,7 @@ def candidate(cache, source_text):
                 or chunk.get("section_type", "other") != section_type):
             changes.append(item.copy())
 
-    exact_text_ids = _same_text_identity(cache, paper_chunks)
-    base.update(source_heading_verified=True, exact_text_ids=exact_text_ids,
+    base.update(source_heading_verified=True, exact_text_ids=False,
                 full_label_map=full_labels, changes=changes,
                 status="candidate" if changes else "no_label_changes")
     return base

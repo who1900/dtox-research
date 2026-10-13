@@ -35,6 +35,17 @@ class DocumentCacheTests(unittest.TestCase):
         self.assertEqual(json.loads(self.cache)[0]["text"], "before\n\nafter")
         self.assertEqual(result["coverage"], "parsed_source")
 
+    def test_section_title_uses_bounded_schema_limit_not_512_character_cutoff(self):
+        title = "A long source heading " * 30
+        chunks = [chunk("body", title=title)]
+        cache_bytes = json.dumps(chunks).encode()
+
+        manifest = dc.make_section_manifest(
+            "fixture", chunks, cache_bytes, b"body", "pylatexenc", "rev-4")
+
+        self.assertEqual(manifest["sections"][0]["section_title"], title)
+        dc.validate_section_manifest(manifest, "fixture", cache_bytes, b"body")
+
     def test_repeated_split_parts_rejected_without_overlap_guess(self):
         for kind in ("prose", "code"):
             parts = [dict(chunk("A" * 1700, part_index=i, part_total=2), element_type=kind) for i in range(2)]

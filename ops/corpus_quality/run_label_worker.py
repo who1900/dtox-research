@@ -9,10 +9,18 @@ import subprocess
 from types import SimpleNamespace
 import time
 import urllib.request
+import uuid
 
 from ops import repair_corpus_labels, restore_corpus_points
 
 UNIT = 'dtox-research-api-oracle-20261012.service'
+
+
+def _file_identity(path):
+    path = Path(path).resolve()
+    stat = path.stat()
+    return json.dumps([str(path), stat.st_dev, stat.st_ino, stat.st_size,
+                       stat.st_mtime_ns], separators=(',', ':'))
 
 
 class Qdrant:
@@ -75,8 +83,14 @@ def main():
     p.add_argument('--batch-pause', default=5, type=float)
     p.add_argument('--mode', choices=['labels','points'], default='labels')
     p.add_argument('--candidate-census', type=Path)
+    p.add_argument('--retry-failed', action='store_true',
+                   help='retry failed papers from the existing label ledger after journal recovery')
+    p.add_argument('--verify-completed', action='store_true',
+                   help='re-verify completed papers in a bounded source-proven label subset')
     p.add_argument('--sources', help='Optional comma separated point-restoration cohort')
     args = p.parse_args()
+    if args.verify_completed and args.mode != 'labels':
+        p.error('--verify-completed is only valid for label repairs')
     base = args.base.resolve()
     root = Path('/opt/dtox-research')
     prefix=('partial-label' if args.candidate_census else 'label') if args.mode=='labels' else ('point-latex' if args.sources=='latex' else 'point')
@@ -92,14 +106,36 @@ def main():
             raise RuntimeError('full frozen corpus census is not complete')
         candidate_db=args.candidate_census or base/'census.sqlite'
         with sqlite3.connect(candidate_db.as_uri()+'?mode=ro',uri=True) as candidate_conn:
-            candidates = candidate_conn.execute("SELECT COUNT(*) FROM papers WHERE (candidate_status='candidate' AND exact_text_ids=1) OR (candidate_status='heading_label_candidate' AND labels_source_verified=1 AND candidate_changes_json!='[]')").fetchone()[0]
+            candidate_meta = dict(candidate_conn.execute('SELECT key,value FROM meta'))
+            verified_unresolved = candidate_meta.get('candidate_subset') == 'verified-unresolved-label-retry'
+            candidate_filter = "(candidate_status='candidate' AND exact_text_ids=1) OR (candidate_status='heading_label_candidate' AND labels_source_verified=1"
+            candidate_filter += " AND candidate_label_map_json!='[]'" if verified_unresolved else " AND candidate_changes_json!='[]'"
+            candidate_filter += ")"
+            candidates = candidate_conn.execute('SELECT COUNT(*) FROM papers WHERE '+candidate_filter).fetchone()[0]
+        if args.retry_failed and not args.verify_completed:
+            if (not args.candidate_census
+                    or candidate_meta.get('candidate_subset') != 'failed-label-retry'
+                    or candidate_meta.get('source_census_identity') != _file_identity(base/'census.sqlite')):
+                raise RuntimeError('failed-label retry candidate does not match the current frozen census')
+        if args.verify_completed:
+            if (not args.candidate_census
+                    or not verified_unresolved
+                    or candidate_meta.get('source_census_identity') != _file_identity(base/'census.sqlite')
+                    or candidate_meta.get('source_verified_unresolved_count') != '403'
+                    or candidate_meta.get('source_unresolved_chunk_count') != '1758'
+                    or candidate_meta.get('source_bound_selected_count') != '343'
+                    or candidate_meta.get('source_bound_resolved_chunk_count') != '1134'
+                    or candidates != 343):
+                raise RuntimeError('verified-unresolved candidate does not match the frozen census, label ledger, and bounded selection')
+            prefix='verified-unresolved-label'
         config = SimpleNamespace(state_db=str((root/'state.db').resolve()), fts_db=str((root/'fts.db').resolve()),
             census_db=str(candidate_db), rowmap_db=str(base/'fts-rowmap.sqlite'),
             cache_dir=str((root/'chunk_cache').resolve()), section_cache_dir=str((root/'section_cache').resolve()),
             fulltext_cache_dir=str((root/'fulltext_cache').resolve()), latex_cache_dir=str((root/'latex_cache').resolve()),
             journal_dir=str(base/'label-journals'), run_db=str(base/'label-run.sqlite'),
             collection='papers_fulltext', limit=0, max_seconds=args.batch_seconds,
-            retry_failed=False, verify_completed=False)
+            retry_failed=args.retry_failed, verify_completed=args.verify_completed,
+            bounded_retry_id=str(uuid.uuid4()) if args.verify_completed and args.retry_failed else None)
         client = Qdrant()
         @contextmanager
         def publication_maintenance():

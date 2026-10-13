@@ -22,17 +22,23 @@ def execute(program, timeout=60):
 
 def stage():
     names = ['ops/audit_corpus_quality.py', 'ops/repair_section_labels.py',
-             'pipeline/document_cache.py', 'pipeline/extractor.py', 'pipeline/pdf_memory.py']
+             'pipeline/document_cache.py', 'pipeline/extractor.py', 'pipeline/pdf_memory.py',
+             'api/boilerplate.py']
     names += [name for name in ['ops/repair_corpus_labels.py', 'ops/replace_published_labels.py', 'ops/audit_projection_coverage.py', 'ops/restore_cached_points.py', 'ops/source_heading_labels.py', 'ops/extend_heading_candidates.py', 'ops/restore_corpus_points.py', 'ops/build_partial_heading_candidates.py',
+                                'ops/corpus_quality/prepare_label_boundaries.py',
+                                'ops/corpus_quality/audit_index_admission.py',
+                                'ops/corpus_quality/adopt_orphan_documents.py',
+                                'ops/corpus_quality/reconcile_index_admission.py',
+                                'ops/corpus_quality/run_label_worker.py',
                                 'ops/restore_cache_tails.py', 'pipeline/publication.py',
                                 'pipeline/payload_contract.py', 'pipeline/fts_catalog.py',
                                 'ops/reconcile_fts_catalog.py'] if (REPO / name).is_file()]
-    files = {name: base64.b64encode((REPO / name).read_bytes()).decode() for name in names}
-    files.update({'build_fts_rowmap.py': base64.b64encode((Path(__file__).parent / 'build_fts_rowmap.py').read_bytes()).decode(),
-                  'run_label_worker.py': base64.b64encode((Path(__file__).parent / 'run_label_worker.py').read_bytes()).decode(),
-                  'audit_projection_ids.py': base64.b64encode((Path(__file__).parent / 'audit_projection_ids.py').read_bytes()).decode(),
-                  'run_sequence.py': base64.b64encode((Path(__file__).parent / 'run_sequence.py').read_bytes()).decode(),
-                  'ops/__init__.py': '', 'pipeline/__init__.py': ''})
+    files = {name: base64.b64encode((REPO / name).read_bytes().replace(b'\r\n', b'\n')).decode() for name in names}
+    files.update({'build_fts_rowmap.py': base64.b64encode((Path(__file__).parent / 'build_fts_rowmap.py').read_bytes().replace(b'\r\n', b'\n')).decode(),
+                  'run_label_worker.py': base64.b64encode((Path(__file__).parent / 'run_label_worker.py').read_bytes().replace(b'\r\n', b'\n')).decode(),
+                  'audit_projection_ids.py': base64.b64encode((Path(__file__).parent / 'audit_projection_ids.py').read_bytes().replace(b'\r\n', b'\n')).decode(),
+                  'run_sequence.py': base64.b64encode((Path(__file__).parent / 'run_sequence.py').read_bytes().replace(b'\r\n', b'\n')).decode(),
+                  'ops/__init__.py': '', 'pipeline/__init__.py': '', 'api/__init__.py': ''})
     program = 'FILES = ' + repr(files) + '\nBASE = ' + repr(REMOTE) + '\n' + r'''
 import base64, hashlib, json, pathlib
 root=pathlib.Path(BASE); root.mkdir(exist_ok=True,mode=0o700)
@@ -133,6 +139,29 @@ for job in ('census','fts-rowmap','headings','projection','labels','points','poi
         except sqlite3.Error as exc:item['db_initializing']=str(exc)
         c.close()
     result[job]=item
+for job in ('index-admission-audit','index-admission-sequence','verified-unresolved-label'):
+    item={};pidfile=root/(job+'.pid')
+    if pidfile.exists():
+        pid=int(pidfile.read_text());item['pid']=pid
+        try:os.kill(pid,0);item['process_exists']=True
+        except ProcessLookupError:item['process_exists']=False
+    statusfile=root/(job+('-worker-status.json' if job=='verified-unresolved-label' else '-status.json'))
+    if statusfile.exists():item['status']=json.loads(statusfile.read_text())
+    log=root/(job+'.log')
+    if log.exists():
+        with log.open('rb') as f:f.seek(max(0,log.stat().st_size-1200));item['log_tail']=f.read().decode(errors='replace')
+    if job=='index-admission-audit':
+        db=root/(job+'.sqlite')
+        if db.exists():
+            c=sqlite3.connect(db.as_uri()+'?mode=ro',uri=True,timeout=2)
+            try:
+                item['meta']=dict(c.execute('SELECT key,value FROM meta'))
+                item['papers']=c.execute('SELECT COUNT(*) FROM papers').fetchone()[0]
+                item['candidates']=[list(row) for row in c.execute('SELECT ledger_status,outcome,receipt_state,COUNT(*) FROM candidates GROUP BY 1,2,3')]
+            finally:c.close()
+    result[job]=item
+statusfile=root/'index-admission-withdrawal-status.json'
+if statusfile.exists():result['index-admission-withdrawals']={'status':json.loads(statusfile.read_text())}
 print(json.dumps(result))
 '''
     return execute(program)
