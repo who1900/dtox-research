@@ -4,7 +4,7 @@ Serves the paper-level index only: 768-dim vectors for title + abstract and
 for queries. Chunk vectors stay on bge-small; re-embedding 9M chunks with a
 model three times slower is not on the table, 164k abstracts is.
 
-  POST /embed        {"text": "...", "query": true}  -> {"vector": [...]}
+  POST /embed        {"text": "...", "query": true}  -> {"vector": [...], "embedding": {...}}
   POST /embed_batch  {"texts": [...]}                -> {"vectors": [[...], ...]}
   GET  /healthz
 
@@ -17,6 +17,7 @@ lock, SMALL_THREADS=1 by default so it cannot starve bge-base queries.
   POST /small/embed        {"text": "...", "query": true}  -> {"vector": [...]}
   (503 when the engine is not configured)
 """
+import hashlib
 import os
 import threading
 
@@ -34,15 +35,36 @@ THREADS = int(os.getenv("EMBED_THREADS", "2"))
 MAX_LEN = int(os.getenv("EMBED_MAX_LEN", "384"))
 QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 
-_tok = Tokenizer.from_file(hf_hub_download(REPO, "tokenizer.json", revision=REVISION))
+_tokenizer_path = hf_hub_download(REPO, "tokenizer.json", revision=REVISION)
+_tok = Tokenizer.from_file(_tokenizer_path)
 _tok.enable_truncation(MAX_LEN)
 _tok.enable_padding()
 _opts = ort.SessionOptions()
 _opts.intra_op_num_threads = THREADS
-_sess = ort.InferenceSession(hf_hub_download(REPO, MODEL_FILE, revision=REVISION), _opts,
+_model_path = hf_hub_download(REPO, MODEL_FILE, revision=REVISION)
+_sess = ort.InferenceSession(_model_path, _opts,
                              providers=["CPUExecutionProvider"])
 _names = {i.name for i in _sess.get_inputs()}
 _lock = threading.Lock()
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _embedding_descriptor(model_path, tokenizer_path, dimension, max_length, query_instruction):
+    return {"model_sha256": _file_sha256(model_path),
+            "tokenizer_sha256": _file_sha256(tokenizer_path),
+            "query_instruction": query_instruction, "dimension": dimension,
+            "max_length": max_length, "pooling": "CLS/L2"}
+
+
+_embedding = _embedding_descriptor(_model_path, _tokenizer_path,
+                                   _sess.get_outputs()[0].shape[-1], MAX_LEN, QUERY_INSTRUCTION)
 
 
 def encode(texts, query=False):
@@ -123,7 +145,7 @@ class EmbedBatchRequest(BaseModel):
 
 @app.post("/embed")
 def embed(body: EmbedRequest):
-    return {"vector": encode([body.text], query=body.query)[0]}
+    return {"vector": encode([body.text], query=body.query)[0], "embedding": dict(_embedding)}
 
 
 @app.post("/embed_batch")
@@ -147,4 +169,5 @@ def small_embed_batch(body: EmbedBatchRequest):
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok", "model": REPO, "small": _small is not None}
+    return {"status": "ok", "model": REPO, "small": _small is not None,
+            "embedding": dict(_embedding)}

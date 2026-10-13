@@ -49,7 +49,7 @@ LOCK_FILE = BASE_DIR / "service.lock"
 LOG_FILE = BASE_DIR / "pipeline.log"
 STAGE_HEARTBEAT_FILE = BASE_DIR / "stage_heartbeats.json"
 LATEX_CACHE_DIR = BASE_DIR / "latex_cache"
-EXTRACTOR_VERSION = 4
+EXTRACTOR_VERSION = 5
 
 
 def _pipeline_log_handlers():
@@ -171,7 +171,7 @@ PAPER_FTS_ENABLED = os.getenv("PAPER_FTS_ENABLED", "0") == "1"
 
 # --- speed tuning (fulltext/chunk/embed only; harvest/quality untouched) ---
 FULLTEXT_CYCLE_LIMIT = 150       # quality_checked papers considered per cycle
-FULLTEXT_WORKERS = 4             # concurrent e-print downloads; 10 made arXiv rate-limit the whole IP
+FULLTEXT_WORKERS = 4             # download workers; extractor separately schedules native PDF jobs
 FULLTEXT_MIN_JITTER = 0.15
 FULLTEXT_MAX_JITTER = 0.6
 FULLTEXT_MAX_RETRIES = 3         # retries specifically for 429/503 with backoff
@@ -1364,6 +1364,10 @@ def get_conn():
 
 
 def init_db(conn):
+    try:
+        from pipeline.publication import ensure_publication_schema
+    except ModuleNotFoundError:
+        from publication import ensure_publication_schema
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS papers (
@@ -1411,6 +1415,14 @@ def init_db(conn):
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(papers)").fetchall()}
     if "extractor_version" not in cols:
         conn.execute("ALTER TABLE papers ADD COLUMN extractor_version INTEGER")
+    for name, declaration in (
+        ("parse_status", "TEXT"), ("parse_error", "TEXT"),
+        ("parse_retry_after", "REAL NOT NULL DEFAULT 0"),
+        ("parse_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("parser_mode", "TEXT"), ("parser_revision", "INTEGER"),
+    ):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE papers ADD COLUMN {name} {declaration}")
     # migration: abstract column (added with the lexical niche gate rewrite so
     # niche_match() can score title+abstract, not just title)
     if "abstract" not in cols:
@@ -1478,6 +1490,7 @@ def init_db(conn):
     conn.execute(
         "DELETE FROM harvest_cursor WHERE query_key LIKE 'cat:cs.%'"
     )
+    ensure_publication_schema(conn)
     conn.commit()
 
 
@@ -2435,10 +2448,118 @@ def read_latex_cache(arxiv_id: str):
     return None
 
 
-def write_latex_cache(arxiv_id: str, text: str):
+LATEX_BIB_MAX_FILES = 128
+LATEX_BIB_MAX_FILE_BYTES = 2_000_000
+LATEX_BIB_MAX_TOTAL_BYTES = 8_000_000
+LATEX_BIB_MAX_JSON_BYTES = 16_000_000
+
+
+def _bibliography_path(name):
+    if not isinstance(name, str) or not name or len(name) > 1024 or "\x00" in name or ":" in name:
+        raise ValueError("invalid bibliography path")
+    name = name.replace("\\", "/")
+    path = posixpath.normpath(name)
+    if name.startswith("/") or path == ".." or path.startswith("../"):
+        raise ValueError("unsafe bibliography path")
+    return path
+
+
+def _bibliography_files(files):
+    if not isinstance(files, list) or len(files) > LATEX_BIB_MAX_FILES:
+        raise ValueError("invalid bibliography files")
+    seen, total = set(), 0
+    for item in files:
+        if not isinstance(item, dict) or set(item) != {"path", "text"}:
+            raise ValueError("invalid bibliography file")
+        path = _bibliography_path(item["path"])
+        if path != item["path"] or not path.endswith((".bib", ".bbl")) or path in seen:
+            raise ValueError("duplicate or invalid bibliography path")
+        seen.add(path)
+        if not isinstance(item["text"], str):
+            raise ValueError("invalid bibliography text")
+        size = len(item["text"].encode("utf-8"))
+        total += size
+        if size > LATEX_BIB_MAX_FILE_BYTES or total > LATEX_BIB_MAX_TOTAL_BYTES:
+            raise ValueError("bibliography byte limit")
+    return files
+
+
+def _bibliography_json(value):
+    raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if len(raw) > LATEX_BIB_MAX_JSON_BYTES:
+        raise ValueError("bibliography JSON limit")
+    return raw
+
+
+def _bibliography_unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _latex_source_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1_048_576), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def read_latex_bibliography(arxiv_id):
+    source = latex_cache_path(arxiv_id)
+    sidecar = source.with_name("references.json")
+    try:
+        if source.is_symlink() or sidecar.is_symlink():
+            return []
+        with sidecar.open("rb") as stream:
+            raw = stream.read(LATEX_BIB_MAX_JSON_BYTES + 1)
+        if len(raw) > LATEX_BIB_MAX_JSON_BYTES:
+            return []
+        manifest = json.loads(raw.decode("utf-8"), object_pairs_hook=_bibliography_unique_object)
+        if not isinstance(manifest, dict) or set(manifest) != {"version", "source_sha256", "files", "manifest_sha256"}:
+            return []
+        signature = manifest.pop("manifest_sha256")
+        if type(manifest["version"]) is not int or manifest["version"] != 1:
+            return []
+        if signature != hashlib.sha256(_bibliography_json(manifest)).hexdigest():
+            return []
+        files = _bibliography_files(manifest["files"])
+        return files if manifest["source_sha256"] == _latex_source_sha256(source) else []
+    except (OSError, ValueError, TypeError, RecursionError):
+        return []
+
+
+def write_latex_cache(arxiv_id: str, text: str, bibliography_files=None):
+    source_bytes = text.replace("\n", os.linesep).encode("utf-8", errors="ignore")
+    references_bytes = None
+    if bibliography_files is not None:
+        _bibliography_files(bibliography_files)
+        manifest = {"version": 1, "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+                    "files": bibliography_files}
+        manifest["manifest_sha256"] = hashlib.sha256(_bibliography_json(manifest)).hexdigest()
+        references_bytes = _bibliography_json(manifest)
     p = latex_cache_path(arxiv_id)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(text, encoding="utf-8", errors="ignore")
+
+    def publish(path, raw):
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=p.parent, prefix=f".{path.stem}-", suffix=".tmp", delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    if references_bytes is not None:
+        publish(p.with_name("references.json"), references_bytes)
+    publish(p, source_bytes)
 
 
 _INC_RE = re.compile(
@@ -2463,7 +2584,7 @@ def _is_commented(text: str, pos: int) -> bool:
     return False
 
 
-def assemble_latex_source(arxiv_id: str, files):
+def assemble_latex_source(arxiv_id: str, files, bibliography_sink=None):
     r"""files: [(archive_path, content)]. Pick the main .tex and inline its
     \input/\include/\subfile/\import targets, resolved by archive path
     (relative to the including file, then the archive root, then a unique
@@ -2528,6 +2649,57 @@ def assemble_latex_source(arxiv_id: str, files):
         text, used, unresolved = build(key, c)
     if unresolved:
         log.warning(f"latex: {arxiv_id}: {len(unresolved)} unresolved include(s) in {key}: {sorted(set(unresolved))[:10]}")
+    if bibliography_sink is not None:
+        resources = {}
+        for name, content in files:
+            if not name.endswith((".bib", ".bbl")):
+                continue
+            try:
+                path = _bibliography_path(name)
+            except ValueError:
+                log.warning("latex: %s: unsafe bibliography path %r", arxiv_id, name)
+                continue
+            resources.setdefault(path, []).append(content)
+
+        def resolve(ref):
+            candidates = []
+            for base in (posixpath.dirname(key), ""):
+                try:
+                    candidate = _bibliography_path(posixpath.join(base, ref))
+                except ValueError:
+                    continue
+                candidates.append(candidate)
+                if candidate in resources:
+                    return candidate if len(resources[candidate]) == 1 else None
+            if not candidates:
+                return None
+            hits = [p for p in resources if posixpath.basename(p) == posixpath.basename(ref)]
+            if len(hits) == 1 and len(resources[hits[0]]) == 1:
+                return hits[0]
+            return None
+
+        selected = []
+        declarations = re.finditer(r"\\(bibliography|addbibresource)(?![A-Za-z@])\s*(?:\[[^\]]*\]\s*)?\{([^}]+)\}", text)
+        inline = any(not _is_commented(text, m.start()) for m in re.finditer(r"\\bibitem\b", text))
+        for declaration in declarations:
+            if inline or _is_commented(text, declaration.start()):
+                continue
+            for ref in declaration.group(2).split(","):
+                ref = ref.strip().replace("\\", "/")
+                stem = ref[:-4] if ref.endswith(".bib") else ref
+                selected.extend((stem + ".bib", stem + ".bbl"))
+            selected.append(posixpath.basename(key) + ".bbl")
+        collected = []
+        for ref in dict.fromkeys(selected):
+            hit = resolve(ref)
+            if hit is None:
+                log.warning("latex: %s: unresolved/ambiguous bibliography %r", arxiv_id, ref)
+            elif not any(item["path"] == hit for item in collected):
+                collected.append({"path": hit, "text": resources[hit][0]})
+        try:
+            bibliography_sink.extend(_bibliography_files(collected))
+        except ValueError:
+            log.warning("latex: %s: bibliography bounds rejected", arxiv_id)
     return text
 
 
@@ -2566,20 +2738,30 @@ def fetch_latex_source(arxiv_id: str, session: requests.Session = None):
         # try tar.gz first
         tf = tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz")
         members = []
+        bibliography_count = bibliography_bytes = 0
         for member in tf.getmembers():
             if not member.isfile():
                 continue
             is_tex = member.name.endswith(".tex")
+            is_bibliography = member.name.endswith((".bib", ".bbl"))
+            if is_bibliography:
+                bibliography_count += 1
+                bibliography_bytes += member.size
+                if (member.size > LATEX_BIB_MAX_FILE_BYTES or bibliography_count > LATEX_BIB_MAX_FILES
+                        or bibliography_bytes > LATEX_BIB_MAX_TOTAL_BYTES):
+                    log.warning("latex: %s: bibliography archive limit: %r", arxiv_id, member.name)
+                    continue
             # extensionless files can be \input targets (\input{body}); only
             # read small ones, they are otherwise binaries/figures
-            if not is_tex and ("." in member.name.rsplit("/", 1)[-1] or member.size > 2_000_000):
+            if not is_tex and not is_bibliography and ("." in member.name.rsplit("/", 1)[-1] or member.size > 2_000_000):
                 continue
             content = tf.extractfile(member).read().decode("utf-8", errors="ignore")
             members.append((member.name, content))
         if not any(n.endswith(".tex") for n, _ in members):
             return None, "no-tex-in-archive"
-        combined = assemble_latex_source(arxiv_id, members)
-        write_latex_cache(arxiv_id, combined)
+        bibliography = []
+        combined = assemble_latex_source(arxiv_id, members, bibliography_sink=bibliography)
+        write_latex_cache(arxiv_id, combined, bibliography_files=bibliography)
         return combined, "latex"
     except tarfile.ReadError:
         # Might be a single gzip'd .tex file, not a tar
@@ -2587,7 +2769,7 @@ def fetch_latex_source(arxiv_id: str, session: requests.Session = None):
             decompressed = gzip.decompress(raw)
             text = decompressed.decode("utf-8", errors="ignore")
             if "\\documentclass" in text or "\\section" in text:
-                write_latex_cache(arxiv_id, text)
+                write_latex_cache(arxiv_id, text, bibliography_files=[])
                 return text, "latex"
         except Exception:
             pass
@@ -2653,8 +2835,7 @@ def _fetch_acl_fulltext(paper_id, stored_abstract=None):
             tmp.write(resp.content)
             tmp_path = tmp.name
         try:
-            import pymupdf4llm
-            text = pymupdf4llm.to_markdown(tmp_path, show_progress=False)
+            text = extractor.convert_pdf_isolated(tmp_path, timeout=90)
         finally:
             try:
                 os.unlink(tmp_path)
@@ -2663,6 +2844,9 @@ def _fetch_acl_fulltext(paper_id, stored_abstract=None):
         if text and len(text) > 500:
             return paper_id, text, "acl-pdf"
         raise ValueError("pdf produced no usable text")
+    except extractor.PDFConversionError as e:
+        log.warning("acl fulltext %s: retryable %s", ident, e)
+        return paper_id, None, None
     except Exception as e:
         log.debug(f"acl fulltext {ident}: {e}")
     if stored_abstract:
@@ -2684,8 +2868,7 @@ def _fetch_openalex_fulltext(paper_id, pdf_url, stored_abstract=None):
             tmp.write(resp.content)
             tmp_path = tmp.name
         try:
-            import pymupdf4llm
-            text = pymupdf4llm.to_markdown(tmp_path, show_progress=False)
+            text = extractor.convert_pdf_isolated(tmp_path, timeout=120)
         finally:
             try:
                 os.unlink(tmp_path)
@@ -2694,6 +2877,9 @@ def _fetch_openalex_fulltext(paper_id, pdf_url, stored_abstract=None):
         if text and len(text) > 500:
             return paper_id, text, "openalex-oa-pdf"
         raise ValueError("pdf produced no usable text")
+    except extractor.PDFConversionError as e:
+        log.warning("openalex fulltext %s: retryable %s", paper_id, e)
+        return paper_id, None, None
     except Exception as e:
         log.debug(f"openalex fulltext {paper_id}: {e}")
     if stored_abstract:
@@ -2741,7 +2927,9 @@ def _fetch_one_fulltext(arxiv_id, stored_abstract=None, source_url=None):
 
 def fulltext_step(conn, limit=FULLTEXT_CYCLE_LIMIT):
     rows = conn.execute(
-        "SELECT arxiv_id, abstract, source_url FROM papers WHERE status='quality_checked' LIMIT ?", (limit,)
+        "SELECT arxiv_id, abstract, source_url FROM papers p WHERE status='quality_checked' "
+        "AND EXISTS (SELECT 1 FROM completion_history h WHERE h.arxiv_id=p.arxiv_id "
+        "AND h.first_known=1 AND h.completed=0) LIMIT ?", (limit,)
     ).fetchall()
     if not rows:
         return 0
@@ -2756,10 +2944,23 @@ def fulltext_step(conn, limit=FULLTEXT_CYCLE_LIMIT):
     # mid-batch leaves in-flight papers at 'quality_checked' and they are retried
     # from scratch next cycle (nothing partially written to state.db).
     with ThreadPoolExecutor(max_workers=FULLTEXT_WORKERS) as pool:
-        futures = {pool.submit(_fetch_one_fulltext, aid, abstracts.get(aid),
-                               source_urls.get(aid)): aid for aid in ids}
-        for future in as_completed(futures):
-            arxiv_id = futures[future]
+        queued = iter(ids)
+        futures = {}
+
+        def submit_next():
+            try:
+                aid = next(queued)
+            except StopIteration:
+                return
+            futures[pool.submit(_fetch_one_fulltext, aid, abstracts.get(aid),
+                                source_urls.get(aid))] = aid
+
+        for _ in range(FULLTEXT_WORKERS):
+            submit_next()
+        while futures:
+            future = next(as_completed(futures))
+            arxiv_id = futures.pop(future)
+            submit_next()
             try:
                 arxiv_id, text, source = future.result()
             except Exception as e:
@@ -2768,12 +2969,27 @@ def fulltext_step(conn, limit=FULLTEXT_CYCLE_LIMIT):
             if text is None:
                 # transient failure - leave status alone, retried next cycle
                 continue
-            (FULLTEXT_DIR / f"{safe_id(arxiv_id)}.tex").write_text(text, encoding="utf-8", errors="ignore")
-            conn.execute(
-                "UPDATE papers SET status='fulltext_fetched', fulltext_source=?, updated_at=? WHERE arxiv_id=?",
-                (source, now_iso(), arxiv_id),
-            )
+            path = FULLTEXT_DIR / f"{safe_id(arxiv_id)}.tex"
+            temporary = path.with_name(path.name + ".tmp")
+            try:
+                temporary.write_text(text, encoding="utf-8", errors="ignore")
+                changed = conn.execute(
+                    "UPDATE papers SET status='fulltext_fetched', fulltext_source=?, updated_at=? "
+                    "WHERE arxiv_id=? AND status='quality_checked' "
+                    "AND EXISTS (SELECT 1 FROM completion_history h WHERE h.arxiv_id=papers.arxiv_id "
+                    "AND h.first_known=1 AND h.completed=0)", (source, now_iso(), arxiv_id),
+                ).rowcount
+                if not changed:
+                    conn.rollback()
+                    temporary.unlink(missing_ok=True)
+                    continue
+                os.replace(temporary, path)
+            except Exception:
+                conn.rollback()
+                temporary.unlink(missing_ok=True)
+                raise
             conn.commit()
+            stage_heartbeat("fulltext", "progress", 1)
             processed += 1
     return processed
 
@@ -2784,6 +3000,8 @@ def fulltext_step(conn, limit=FULLTEXT_CYCLE_LIMIT):
 # ---------------------------------------------------------------------------
 
 CHUNK_DIR = BASE_DIR / "chunk_cache"
+PARSE_RETRY_BASE_SECONDS = 60
+PARSE_RETRY_MAX_SECONDS = 3600
 
 
 def _make_embed_fn(session):
@@ -2792,18 +3010,79 @@ def _make_embed_fn(session):
     return embed_fn
 
 
+def _record_parse_failure(conn, row, status, error, mode=None):
+    delay = min(PARSE_RETRY_MAX_SECONDS,
+                PARSE_RETRY_BASE_SECONDS * 2 ** min(row["parse_attempts"], 6))
+    conn.execute(
+        "UPDATE papers SET parse_status=?,parse_error=?,parse_retry_after=?, "
+        "parse_attempts=parse_attempts+1,parser_mode=?,parser_revision=?,updated_at=? "
+        "WHERE arxiv_id=? AND status='fulltext_fetched'",
+        (status, error, time.time() + delay, mode, EXTRACTOR_VERSION, now_iso(), row["arxiv_id"]),
+    )
+    conn.commit()
+    log.warning("chunk: %s %s (%s); retry in %ss", row["arxiv_id"], status, error, delay)
+
+
+def _write_parse_cache(arxiv_id, chunks, source_bytes, mode, canonical_sections=None):
+    if __package__:
+        from .document_cache import ManifestInvalid, make_section_manifest, publish_section_manifest
+    else:
+        from document_cache import ManifestInvalid, make_section_manifest, publish_section_manifest
+    cache_bytes = json.dumps(chunks).encode("utf-8")
+    manifest = None
+    if canonical_sections:
+        try:
+            manifest = make_section_manifest(arxiv_id, canonical_sections, cache_bytes, source_bytes,
+                                             mode, EXTRACTOR_VERSION)
+        except ManifestInvalid:
+            log.warning("chunk: %s degraded read view (ManifestInvalid); canonical assembly unverified", arxiv_id)
+    else:
+        log.warning("chunk: %s degraded read view; canonical sections unavailable", arxiv_id)
+    path = CHUNK_DIR / f"{safe_id(arxiv_id)}.json"
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", dir=path.parent,
+                                         prefix=f".{path.name}.", suffix=".tmp", delete=False) as output:
+            temporary = Path(output.name)
+            output.write(cache_bytes)
+            output.flush()
+            os.fsync(output.fileno())
+        if manifest is not None:
+            section_path = BASE_DIR / "section_cache" / path.name
+            section_path.parent.mkdir(exist_ok=True)
+            publish_section_manifest(section_path, manifest)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def chunk_step(conn, session, limit=CHUNK_CYCLE_LIMIT):
-    rows = conn.execute("SELECT arxiv_id, fulltext_source FROM papers WHERE status='fulltext_fetched' LIMIT ?",
-                        (limit,)).fetchall()
+    rows = conn.execute("SELECT arxiv_id,fulltext_source,parse_attempts FROM papers "
+                        "WHERE status='fulltext_fetched' AND parse_retry_after<=? "
+                        "AND EXISTS (SELECT 1 FROM completion_history h WHERE h.arxiv_id=papers.arxiv_id "
+                        "AND h.first_known=1 AND h.completed=0) "
+                        "ORDER BY parse_retry_after,updated_at LIMIT ?", (time.time(), limit)).fetchall()
     processed = 0
     CHUNK_DIR.mkdir(exist_ok=True)
     embed_fn = _make_embed_fn(session)
     for row in rows:
         arxiv_id = row["arxiv_id"]
-        tex_path = FULLTEXT_DIR / f"{safe_id(arxiv_id)}.tex"
-        if not tex_path.exists():
+        history = conn.execute("SELECT first_known,completed FROM completion_history WHERE arxiv_id=?",
+                               (arxiv_id,)).fetchone()
+        if history is None or not history[0] or history[1]:
             continue
-        text = tex_path.read_text(encoding="utf-8", errors="ignore")
+        tex_path = FULLTEXT_DIR / f"{safe_id(arxiv_id)}.tex"
+        try:
+            source_bytes = tex_path.read_bytes()
+            text = source_bytes.decode("utf-8")
+        except (OSError, UnicodeError) as exc:
+            _record_parse_failure(conn, row, "failed", f"source_unavailable:{type(exc).__name__}")
+            continue
+        if not text.strip() or "\x00" in text:
+            _record_parse_failure(conn, row, "failed", "empty_or_invalid_source")
+            continue
+        section_sink = []
         try:
             # ACL arrives as markdown too (pymupdf4llm keeps the headings), so
             # it takes the markdown path rather than the LaTeX parser, which
@@ -2812,24 +3091,46 @@ def chunk_step(conn, session, limit=CHUNK_CYCLE_LIMIT):
             # (ops/iacr_oa_fulltext.py); it is a PDF conversion, so markdown too
             if is_spec_source(arxiv_id) or row["fulltext_source"] == "oa-mirror-pdf" or str(arxiv_id).startswith(
                     (ACL_ID_PREFIX, OPENALEX_ID_PREFIX, PMLR_ID_PREFIX, HAL_ID_PREFIX)):
-                chunks, mode = extractor.build_chunks_markdown(text)
+                chunks, mode = extractor.build_chunks_markdown(
+                    text, section_sink=section_sink,
+                    document_kind="spec" if is_spec_source(arxiv_id) else "paper")
             else:
-                chunks, mode = extractor.build_chunks(text, embed_fn=embed_fn)
-        except Exception as e:
-            log.warning(f"chunk: extractor crashed for {arxiv_id}, using bare fallback: {e}")
-            chunks = [{
-                "chunk_index": 0, "section_type": "other", "section_title": "full text",
-                "element_type": "prose", "has_math": False, "has_algorithm": False,
-                "part_index": 0, "part_total": 1, "text": text[:extractor.CHUNK_CHAR_LIMIT],
-            }] if text.strip() else []
-            mode = "legacy"
-        (CHUNK_DIR / f"{safe_id(arxiv_id)}.json").write_text(json.dumps(chunks), encoding="utf-8")
-        conn.execute(
-            "UPDATE papers SET status='chunked', extractor_version=?, updated_at=? WHERE arxiv_id=?",
-            (EXTRACTOR_VERSION, now_iso(), arxiv_id),
-        )
+                chunks, mode = extractor.build_chunks(text, embed_fn=embed_fn, section_sink=section_sink)
+        except Exception as exc:
+            _record_parse_failure(conn, row, "failed", f"parser_exception:{type(exc).__name__}")
+            continue
+        if not isinstance(chunks, list) or not chunks or any(
+                not isinstance(chunk, dict) or not isinstance(chunk.get("text"), str)
+                or not chunk["text"].strip() for chunk in chunks):
+            _record_parse_failure(conn, row, "failed", "empty_or_invalid_parser_output", mode)
+            continue
+        if mode == "legacy":
+            _record_parse_failure(conn, row, "degraded", "legacy_parser_output", mode)
+            continue
+        if not isinstance(mode, str) or not mode:
+            _record_parse_failure(conn, row, "failed", "missing_parser_mode")
+            continue
+        if mode not in {"pylatexenc", "pylatexenc_recovered", "markdown"}:
+            _record_parse_failure(conn, row, "failed", "unsupported_parser_mode", mode)
+            continue
+        try:
+            _write_parse_cache(arxiv_id, chunks, source_bytes, mode, canonical_sections=section_sink)
+        except Exception as exc:
+            _record_parse_failure(conn, row, "failed", f"cache_publish_failed:{type(exc).__name__}", mode)
+            continue
+        spec_markdown = (mode == "markdown" and is_spec_source(arxiv_id)
+                         and not (row["fulltext_source"] or "").endswith("-pdf"))
+        changed = conn.execute(
+            "UPDATE papers SET status='chunked',extractor_version=?,parse_status='ok',parse_error=NULL, "
+            "fulltext_source=CASE WHEN ? THEN 'spec-markdown' ELSE fulltext_source END, "
+            "parse_retry_after=0,parse_attempts=0,parser_mode=?,parser_revision=?,updated_at=? "
+            "WHERE arxiv_id=? AND status='fulltext_fetched'",
+            (EXTRACTOR_VERSION, spec_markdown, mode, EXTRACTOR_VERSION, now_iso(), arxiv_id),
+        ).rowcount
         conn.commit()
-        processed += 1
+        if changed:
+            stage_heartbeat("chunk", "progress", 1)
+            processed += 1
     return processed
 
 
@@ -2958,7 +3259,11 @@ def _fts_rowids(fts, table, arxiv_id, fresh=False):
 
 
 def fts_write(points, paper_ids=None, fresh_ids=()):
-    """Atomically replace complete paper snapshots, deduplicated by point ID."""
+    """Write through the shared exact point-ID catalog."""
+    try:
+        from pipeline import fts_catalog
+    except ModuleNotFoundError:
+        import fts_catalog
     paper_ids = set(paper_ids or []) | {pt["payload"]["arxiv_id"] for pt in points}
     if not paper_ids:
         return True
@@ -2969,25 +3274,15 @@ def fts_write(points, paper_ids=None, fresh_ids=()):
         return False
     try:
         fts.execute("BEGIN IMMEDIATE")
-        rows = {}
-        for pt in points:
-            pay = pt.get("payload") or {}
-            if pay.get("text"):
-                rows[str(pt["id"])] = (pay["text"], str(pt["id"]), pay["arxiv_id"],
-                                       pay.get("section_type"), pay.get("element_type"),
-                                       str(pay.get("layers") or ""), pay.get("year"))
         for arxiv_id in paper_ids:
-            old = _fts_rowids(fts, "chunks", arxiv_id, fresh=arxiv_id in fresh_ids)
-            fts.executemany("DELETE FROM chunks WHERE rowid=?", [(rowid,) for rowid in old])
-            fts.execute("DELETE FROM pipeline_fts_rows WHERE table_name='chunks' AND arxiv_id=?", (arxiv_id,))
-        for row in rows.values():
-            cursor = fts.execute(
-                "INSERT INTO chunks (text, point_id, arxiv_id, section_type, "
-                "element_type, layers, year) VALUES (?,?,?,?,?,?,?)", row)
-            fts.execute("INSERT INTO pipeline_fts_rows VALUES ('chunks',?,?)", (row[2], cursor.lastrowid))
+            paper_points = [point for point in points
+                            if str((point.get("payload") or {}).get("arxiv_id")) == str(arxiv_id)]
+            if fts_catalog.replace_paper(fts, arxiv_id, paper_points,
+                                         fresh=arxiv_id in set(fresh_ids)) is not True:
+                raise fts_catalog.CatalogBlocked("paper replacement not acknowledged")
         fts.commit()
         return True
-    except sqlite3.Error as e:
+    except (sqlite3.Error, fts_catalog.CatalogBlocked) as e:
         fts.rollback()
         log.warning(f"fts: write failed: {e}")
         return False
@@ -3069,16 +3364,6 @@ def _fresh_fts_ids(conn, arxiv_id):
 
 def _sync_chunk_fts_owned(conn, row):
     arxiv_id = row["arxiv_id"]
-    path = CHUNK_DIR / f"{safe_id(arxiv_id)}.json"
-    if path.exists():
-        chunks = json.loads(path.read_text(encoding="utf-8"))
-        points = [{"id": str(uuid.uuid5(NAMESPACE_URL, f"{arxiv_id}#{chunk['chunk_index']}")),
-                   "payload": {"arxiv_id": arxiv_id, "text": chunk["text"], "year": row["year"],
-                               "layers": (row["layers"] or "").split(",") if row["layers"] else [],
-                               "section_type": chunk["section_type"], "element_type": chunk.get("element_type", "prose")}}
-                  for chunk in chunks if extractor.should_embed(chunk)]
-        history = conn.execute("SELECT first_known FROM completion_history WHERE arxiv_id=?", (arxiv_id,)).fetchone()
-        return fts_write(points, [arxiv_id], [arxiv_id] if history and history[0] else [])
     fts = sqlite3.connect(f"file:{FTS_DB_PATH}?mode=rw", uri=True, timeout=30)
     try:
         fts.execute("BEGIN IMMEDIATE")
@@ -3093,7 +3378,8 @@ def _sync_chunk_fts_owned(conn, row):
 
 
 def _sync_qdrant_metadata(session, row):
-    payload = {key: row[key] for key in ("title", "year", "citation_count", "venue", "niche_score")}
+    payload = {key: row[key] for key in ("title", "year", "citation_count", "venue", "niche_score",
+                                       "parse_status", "parser_mode", "parser_revision")}
     payload.update(layers=(row["layers"] or "").split(",") if row["layers"] else [],
                    terms=json.loads(row["matched_terms"] or "[]")[:12], url=row["source_url"])
     response = session.post(f"{QDRANT_URL}/collections/{COLLECTION_NAME}/points/payload",
@@ -3125,11 +3411,61 @@ def _upsert_chunk_snapshot(session, arxiv_id, points):
         return False
 
 
-def _complete_paper(conn, arxiv_id):
-    changed = conn.execute("UPDATE papers SET status='done',updated_at=? WHERE arxiv_id=? AND status='chunked'",
+def _preflight_chunk_snapshot(session, job, points):
+    try:
+        from pipeline.publication import PublicationBlocked
+    except ModuleNotFoundError:
+        from publication import PublicationBlocked
+
+    paper_id, revision = job["paper_id"], job["revision"]
+    ids = []
+    for point in points:
+        payload = point.get("payload") or {}
+        if payload.get("arxiv_id") != paper_id or payload.get("publication_revision") != revision:
+            raise PublicationBlocked("preflight_marker_mismatch", "candidate point does not match publication job")
+        ids.append(str(point["id"]))
+
+    for offset in range(0, len(ids), 200):
+        batch_ids = set(ids[offset:offset + 200])
+        response = session.post(
+            f"{QDRANT_URL}/collections/{COLLECTION_NAME}/points",
+            timeout=60,
+            json={"ids": ids[offset:offset + 200], "with_payload": True, "with_vector": False},
+        )
+        response.raise_for_status()
+        existing = response.json().get("result")
+        if not isinstance(existing, list):
+            raise ValueError("Qdrant preflight retrieve response is invalid")
+        for point in existing:
+            payload = point.get("payload") or {}
+            if (str(point.get("id")) not in batch_ids or payload.get("arxiv_id") != paper_id
+                    or payload.get("publication_revision") != revision):
+                raise PublicationBlocked("legacy_uuid_collision", "candidate UUID already belongs to another point")
+
+    response = session.post(
+        f"{QDRANT_URL}/collections/{COLLECTION_NAME}/points/scroll",
+        timeout=60,
+        json={"filter": {
+            "must": [{"key": "arxiv_id", "match": {"value": paper_id}}],
+            "must_not": [{"key": "publication_revision", "match": {"value": revision}}],
+        }, "limit": 1, "with_payload": ["arxiv_id", "publication_revision"], "with_vector": False},
+    )
+    response.raise_for_status()
+    existing = response.json().get("result", {}).get("points")
+    if not isinstance(existing, list):
+        raise ValueError("Qdrant preflight scroll response is invalid")
+    if existing:
+        raise PublicationBlocked("legacy_paper_collision", "paper already has an unmarked or other-revision point")
+    return True
+
+
+def _complete_paper(conn, arxiv_id, commit=True):
+    changed = conn.execute("UPDATE papers SET status='done',updated_at=? WHERE arxiv_id=? AND status='chunked' "
+                           "AND COALESCE(parse_status,'') NOT IN ('failed','degraded','missing_source','pending')",
                            (now_iso(), arxiv_id)).rowcount
     if not changed:
-        conn.commit()
+        if commit:
+            conn.commit()
         return False
     history = conn.execute("SELECT first_known,completed FROM completion_history WHERE arxiv_id=?",
                            (arxiv_id,)).fetchone()
@@ -3138,7 +3474,8 @@ def _complete_paper(conn, arxiv_id):
                  "ON CONFLICT(arxiv_id) DO UPDATE SET completed=1", (arxiv_id,))
     conn.execute(f"UPDATE completion_totals SET {kind}={kind}+1 WHERE singleton=1")
     _queue_index_sync(conn, arxiv_id)
-    conn.commit()
+    if commit:
+        conn.commit()
     return True
 
 
@@ -3152,6 +3489,7 @@ def _reconcile_index_sync(conn, session, limit=1):
     completed = 0
     for row in rows:
         arxiv_id, revision = row["arxiv_id"], row["revision"]
+        synced = 0
         done = set(json.loads(row["sync_completed"] or "[]")) if row["progress_revision"] == revision else set()
         operations = (
             ("qdrant", lambda: _sync_qdrant_metadata(session, row)),
@@ -3175,21 +3513,59 @@ def _reconcile_index_sync(conn, session, limit=1):
             conn.execute("UPDATE paper_index_sync SET retry_after=? WHERE arxiv_id=? AND revision=?",
                          (time.time() + STAGE_ERROR_SLEEP, arxiv_id, revision))
         else:
-            completed += conn.execute("DELETE FROM paper_index_sync WHERE arxiv_id=? AND revision=?",
-                                      (arxiv_id, revision)).rowcount
+            synced = conn.execute("DELETE FROM paper_index_sync WHERE arxiv_id=? AND revision=?",
+                                  (arxiv_id, revision)).rowcount
+            completed += synced
             conn.execute("DELETE FROM paper_index_sync_progress WHERE arxiv_id=? AND revision=?", (arxiv_id, revision))
         conn.commit()
+        if synced:
+            stage_heartbeat("embed", "progress", synced)
     return completed
 
 
 def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT):
-    processed = _reconcile_index_sync(conn, session)
+    try:
+        from pipeline.publication import prepare_snapshot, publish_snapshot, reconcile_publications
+    except ModuleNotFoundError:
+        from publication import prepare_snapshot, publish_snapshot, reconcile_publications
+
+    def _preflight(current, snapshot):
+        return _preflight_chunk_snapshot(session, current, snapshot)
+
+    def _publish(arxiv_id, points):
+        job = prepare_snapshot(conn, BASE_DIR, arxiv_id, points,
+                               CHUNK_DIR / f"{safe_id(arxiv_id)}.json")
+        published = publish_snapshot(
+            conn, job,
+            lambda current, snapshot: _upsert_chunk_snapshot(session, current["paper_id"], snapshot),
+            lambda current, snapshot: fts_write(snapshot, [current["paper_id"]],
+                                                _fresh_fts_ids(conn, current["paper_id"])),
+            lambda paper_id, commit=False: _complete_paper(conn, paper_id, commit=commit),
+            _preflight)
+        if published:
+            stage_heartbeat("embed", "progress", 1)
+        return published
+
+    processed = reconcile_publications(
+        conn, BASE_DIR,
+        lambda current, snapshot: _upsert_chunk_snapshot(session, current["paper_id"], snapshot),
+        lambda current, snapshot: fts_write(snapshot, [current["paper_id"]],
+                                            _fresh_fts_ids(conn, current["paper_id"])),
+        lambda paper_id, commit=False: _complete_paper(conn, paper_id, commit=commit),
+        _preflight, limit=limit,
+        on_success=lambda _job: stage_heartbeat("embed", "progress", 1))
+    processed += _reconcile_index_sync(conn, session)
     # Specs and docs first, oldest first after that: they are short, and while
     # thousands of reprocessed 300-chunk papers queued ahead of them, Geyser,
     # RISC Zero and Aave v3 sat unsearchable for a day
     rows = conn.execute(
         "SELECT arxiv_id, title, year, layers, citation_count, venue, niche_score, matched_terms, "
-        "source_url FROM papers WHERE status='chunked' "
+        "source_url,parse_status,parser_mode,parser_revision FROM papers WHERE status='chunked' "
+        "AND parse_status='ok' "
+        "AND NOT EXISTS (SELECT 1 FROM paper_publications j WHERE j.arxiv_id=papers.arxiv_id "
+        "AND j.kind='snapshot') "
+        "AND EXISTS (SELECT 1 FROM completion_history h WHERE h.arxiv_id=papers.arxiv_id "
+        "AND h.first_known=1 AND h.completed=0) "
         "ORDER BY CASE WHEN substr(arxiv_id, 1, 3) IN ('gh:', 'wp:') "
         "OR substr(arxiv_id, 1, 4) = 'eip:' OR substr(arxiv_id, 1, 5) = 'simd:' THEN 0 ELSE 1 END, "
         "updated_at LIMIT ?",
@@ -3212,10 +3588,11 @@ def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT):
         if not embeddable:
             # nothing left to embed after the filter (or paper had 0 chunks):
             # safe to close out immediately, still counted 'done' as usual.
-            if _upsert_chunk_snapshot(session, arxiv_id, []):
-                fts_write([], [arxiv_id], _fresh_fts_ids(conn, arxiv_id))
-                if _complete_paper(conn, arxiv_id):
+            try:
+                if _publish(arxiv_id, []):
                     processed += 1
+            except Exception as exc:
+                log.warning("publication: %s deferred: %s", arxiv_id, exc)
             continue
         paper_meta[arxiv_id] = row
         for c in embeddable:
@@ -3297,13 +3674,16 @@ def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT):
                     "terms": terms,
                     "repos": repos,
                     "url": row["source_url"],
+                    "parse_status": row["parse_status"],
+                    "parser_mode": row["parser_mode"],
+                    "parser_revision": row["parser_revision"],
                 },
             })
-        if not _upsert_chunk_snapshot(session, arxiv_id, points):
-            return
-        fts_write(points, [arxiv_id], _fresh_fts_ids(conn, arxiv_id))
-        if _complete_paper(conn, arxiv_id):
-            processed += 1
+        try:
+            if _publish(arxiv_id, points):
+                processed += 1
+        except Exception as exc:
+            log.warning("publication: %s deferred: %s", arxiv_id, exc)
 
     # Batches run concurrently against embed-small; qdrant upsert + status commit
     # happen per-paper, sequentially, in this (main) thread as soon as a paper's
@@ -3416,10 +3796,17 @@ _heartbeats_lock = threading.Lock()
 def stage_heartbeat(name, event="ready", processed=None):
     now = time.time()
     with _heartbeats_lock:
-        record = _heartbeats.setdefault(name, {})
+        record = _heartbeats.get(name, {})
+        if event == "progress" and (record.get("phase") != "busy" or not processed or processed <= 0):
+            return
+        _heartbeats.setdefault(name, record)
         record.update(heartbeat_at=now, event=event)
         if event == "start":
             record.update(phase="busy", started_at=now)
+            record.pop("cycle_progress_at", None)
+        elif event == "progress":
+            record.update(cycle_progress_at=now, last_progress_at=now)
+            record.pop("error_since_at", None)
         elif event == "end":
             record.update(phase="idle" if not processed else "waiting",
                           ended_at=now, last_success_at=now, processed=processed)
@@ -3484,7 +3871,8 @@ def stalled_stages(now=None):
                 stalled[name] = "repeated errors without a successful cycle"
                 continue
             busy = record.get("phase") == "busy"
-            since = record["started_at"] if busy else record["heartbeat_at"]
+            since = (max(record["started_at"], record.get("cycle_progress_at", record["started_at"]))
+                     if busy else record["heartbeat_at"])
             if now - since > WATCHDOG_STALL_SECONDS:
                 stalled[name] = "stuck call" if busy else "stale heartbeat"
         return stalled
@@ -4074,9 +4462,13 @@ def graph_harvest_step(conn, session):
         if not paper or not paper.get("title"):
             # Nothing to classify it with. Parked so the scan does not offer it
             # again on every pass; it is not a rejection on the merits.
-            conn.execute(
+            inserted = conn.execute(
                 "INSERT OR IGNORE INTO papers (arxiv_id, title, status, niche_score, updated_at) "
                 "VALUES (?,?,?,?,?)", (pid, "", "graph_unresolved", 0, now_iso()))
+            if (inserted.rowcount and not conn.execute(
+                    "SELECT 1 FROM completion_history WHERE arxiv_id=?", (pid,)).fetchone()):
+                conn.execute("INSERT INTO completion_history(arxiv_id,first_known,completed) VALUES (?,1,0)",
+                             (pid,))
             unresolved += 1
             continue
         upsert_discovered(conn, pid, paper["title"], paper.get("year"), "llm-slm",

@@ -23,7 +23,7 @@ def load_functions(*names, **globals_):
                 if isinstance(node, ast.FunctionDef) and node.name in names]
     assert len(selected) == len(names)
     namespace = {"sqlite3": sqlite3, "json": json, "uuid": uuid, "time": time,
-                 "log": Mock(),
+                 "log": Mock(), "stage_heartbeat": Mock(),
                  **globals_}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(source), "exec"), namespace)
     return types.SimpleNamespace(**namespace)
@@ -167,6 +167,18 @@ class StateRegressionTests(unittest.TestCase):
         self.assertEqual(self.paper("p")["status"], "off_niche")
         self.assertEqual(self.paper("p")["layers"], "")
 
+    def test_new_graph_placeholder_and_first_known_history_commit_together(self):
+        worker = load_functions(
+            "graph_harvest_step", _graph_queue=["new-missing"], GRAPH_HARVEST_BATCH=1,
+            GRAPH_HARVEST_MIN_CITES=1, fetch_s2_titles=lambda _session, _ids: {},
+            now_iso=lambda: "fixture-time", upsert_discovered=Mock(), log=Mock())
+        self.assertEqual(worker.graph_harvest_step(self.conn, None), 0)
+        self.assertEqual(tuple(self.conn.execute(
+            "SELECT status FROM papers WHERE arxiv_id='new-missing'").fetchone()), ("graph_unresolved",))
+        self.assertEqual(tuple(self.conn.execute(
+            "SELECT first_known,completed FROM completion_history WHERE arxiv_id='new-missing'").fetchone()), (1, 0))
+        self.assertFalse(self.conn.in_transaction)
+
     def test_done_rediscovery_marks_changed_indexes_without_reopening_paper(self):
         self.service.upsert_discovered(self.conn, "p", "Old blockchain title", 2025, "web3", abstract="old")
         self.conn.execute("UPDATE papers SET status='done' WHERE arxiv_id='p'")
@@ -289,6 +301,30 @@ class StateRegressionTests(unittest.TestCase):
             with contextlib.closing(sqlite3.connect(path)) as fts, fts:
                 self.assertEqual(fts.execute("SELECT text,layers,year FROM chunks").fetchall(), [("original", "['web3']", 2026)])
 
+    def test_new_metadata_does_not_rewrite_fts_body_from_changed_chunk_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "fts.db")
+            cache = Path(directory) / "p.json"
+            cache.write_text('[{"chunk_index":0,"text":"unpublished new body"}]', encoding="utf-8")
+            before_cache = cache.read_bytes()
+            with contextlib.closing(sqlite3.connect(path)) as fts, fts:
+                fts.execute("CREATE VIRTUAL TABLE chunks USING fts5(text,point_id UNINDEXED,arxiv_id UNINDEXED,layers UNINDEXED,year UNINDEXED)")
+                load_functions("_fts_rowids")._fts_rowids(fts, "chunks", "p", fresh=True)
+                rowid = fts.execute("INSERT INTO chunks VALUES ('published body','id','p','old',2025)").lastrowid
+                fts.execute("INSERT INTO pipeline_fts_rows VALUES ('chunks','p',?)", (rowid,))
+            self.conn.execute("INSERT INTO papers(arxiv_id,title,year,layers,status,matched_terms) "
+                              "VALUES ('p','New metadata',2026,'web3','done','[]')")
+            self.service._queue_index_sync(self.conn, "p")
+            self.conn.commit()
+            session = Mock()
+            self.assertEqual(self.reconciliation_service(path)._reconcile_index_sync(self.conn, session), 1)
+            with contextlib.closing(sqlite3.connect(path)) as fts:
+                self.assertEqual(fts.execute("SELECT rowid,point_id,text,layers,year FROM chunks").fetchall(),
+                                 [(rowid, "id", "published body", "['web3']", 2026)])
+            self.assertEqual(cache.read_bytes(), before_cache)
+            self.assertEqual(session.post.call_args.kwargs["json"]["payload"]["title"], "New metadata")
+            self.assertEqual(self.paper("p")["status"], "done")
+
     def test_legacy_fts_defer_does_not_block_qdrant_or_coarse_and_successes_are_retained(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "fts.db")
@@ -396,7 +432,7 @@ class StateRegressionTests(unittest.TestCase):
                                 [("old", "old-id", "legacy"), ("tail", "tail-id", "legacy")])
             chunks = [{"chunk_index": 0, "text": "current", "section_type": "method", "section_title": "Method"}]
             (Path(directory) / "legacy.json").write_text(json.dumps(chunks), encoding="utf-8")
-            self.conn.execute("INSERT INTO papers(arxiv_id,status) VALUES ('legacy','chunked')")
+            self.conn.execute("INSERT INTO papers(arxiv_id,status,parse_status) VALUES ('legacy','chunked','ok')")
             self.conn.commit()
             coarse = Mock(return_value=True)
             reconciler = self.reconciliation_service(path, coarse=coarse, embed_filter=embeddable)
@@ -405,12 +441,13 @@ class StateRegressionTests(unittest.TestCase):
                 connect=lambda *a, **kw: connect(*a, **kw, factory=NoLegacyScanConnection),
                 Error=sqlite3.Error, OperationalError=sqlite3.OperationalError)
             fts_writer = load_functions("fts_write", "_fts_rowids", FTS_DB_PATH=path, sqlite3=guarded_sqlite)
+            chunk_fts = Mock(wraps=fts_writer.fts_write)
             batch_embed = Mock(side_effect=lambda session, batch, slots: (batch, [[0.1] for _ in batch]))
             worker = load_functions("embed_step", "_upsert_chunk_snapshot", "_fresh_fts_ids", "_complete_paper", "_queue_index_sync",
                                     EMBED_CYCLE_LIMIT=1, _reconcile_index_sync=reconciler._reconcile_index_sync,
-                                    CHUNK_DIR=Path(directory), safe_id=lambda value: value,
+                                    CHUNK_DIR=Path(directory), BASE_DIR=Path(directory), safe_id=lambda value: value,
                                     extractor=types.SimpleNamespace(should_embed=lambda _: embeddable),
-                                    fts_write=fts_writer.fts_write, UPSERT_BATCH_SIZE=1,
+                                    fts_write=chunk_fts, UPSERT_BATCH_SIZE=1,
                                     QDRANT_URL="http://fixture", COLLECTION_NAME="chunks",
                                     requests=types.SimpleNamespace(RequestException=RuntimeError),
                                     now_iso=lambda: "2026-10-03T00:00:00Z", EMBED_BATCH_TEXTS=8,
@@ -426,32 +463,23 @@ class StateRegressionTests(unittest.TestCase):
 
             session.put.side_effect = http
             session.post.side_effect = http
-            self.assertEqual(worker.embed_step(self.conn, session), 1)
-            self.assertEqual(self.paper("legacy")["status"], "done")
             self.assertEqual(worker.embed_step(self.conn, session), 0)
-            self.assertEqual(session.put.call_count, 1)
-            self.assertEqual(batch_embed.call_count, 1 if embeddable else 0)
-            coarse.assert_called_once()
-            self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM paper_index_sync").fetchone()[0], 1)
-            self.assertEqual(tuple(self.conn.execute("SELECT first_completed,reprocessed,unknown FROM completion_totals").fetchone()), (0, 0, 1))
-            with contextlib.closing(sqlite3.connect(path)) as fts, fts:
-                self.assertEqual(fts.execute("SELECT text FROM chunks").fetchall(), [("old",), ("tail",)])
-                fts_writer._fts_rowids(fts, "chunks", "legacy", fresh=True)
-                fts.executemany("INSERT INTO pipeline_fts_rows VALUES ('chunks','legacy',?)", [(1,), (2,)])
-            self.conn.execute("UPDATE paper_index_sync SET retry_after=0")
-            self.conn.commit()
-            self.assertEqual(worker.embed_step(self.conn, session), 1)
-            self.assertEqual(session.put.call_count, 1)
-            self.assertEqual(batch_embed.call_count, 1 if embeddable else 0)
-            coarse.assert_called_once()
+            self.assertEqual(self.paper("legacy")["status"], "chunked")
+            self.assertEqual(worker.embed_step(self.conn, session), 0)
+            self.assertEqual(session.mock_calls, [])
+            batch_embed.assert_not_called()
+            coarse.assert_not_called()
+            chunk_fts.assert_not_called()
             self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM paper_index_sync").fetchone()[0], 0)
+            self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM paper_publications").fetchone()[0], 0)
+            self.assertEqual(tuple(self.conn.execute("SELECT first_completed,reprocessed,unknown FROM completion_totals").fetchone()), (0, 0, 0))
             with contextlib.closing(sqlite3.connect(path)) as fts:
-                self.assertEqual(fts.execute("SELECT text FROM chunks").fetchall(), [("current",)] if embeddable else [])
+                self.assertEqual(fts.execute("SELECT text FROM chunks").fetchall(), [("old",), ("tail",)])
 
-    def test_unmapped_legacy_completes_once_without_repeated_embedding_and_fts_retries(self):
+    def test_unmapped_legacy_blocks_embedding_and_publication(self):
         self.legacy_completion_case(embeddable=True)
 
-    def test_empty_chunk_legacy_completes_once_even_when_fts_is_deferred(self):
+    def test_empty_chunk_legacy_stays_blocked_without_completion(self):
         self.legacy_completion_case(embeddable=False)
 
 
@@ -475,7 +503,7 @@ class FtsRegressionTests(unittest.TestCase):
     def point(self, point_id, text="new", paper="p", year=2026):
         return {"id": point_id, "payload": {"arxiv_id": paper, "text": text, "year": year}}
 
-    def test_replay_deduplicates_point_ids_and_removes_old_version_tail(self):
+    def test_duplicate_point_ids_reject_and_preserve_legacy_baseline(self):
         self.conn.executemany("INSERT INTO chunks(text,point_id,arxiv_id) VALUES (?,?,?)",
                               [("stale", "1", "p"), ("duplicate", "1", "p"), ("tail", "2", "p"), ("other", "3", "other")])
         self.conn.commit()
@@ -483,9 +511,21 @@ class FtsRegressionTests(unittest.TestCase):
         self.conn.executemany("INSERT INTO pipeline_fts_rows VALUES ('chunks','p',?)", [(1,), (2,), (3,)])
         self.conn.commit()
         points = [self.point("1", "earlier"), self.point("1", "replacement")]
+        baseline = self.conn.execute("SELECT rowid,point_id,text,arxiv_id FROM chunks ORDER BY rowid").fetchall()
+        catalog = self.conn.execute("SELECT * FROM pipeline_fts_rows ORDER BY row_id").fetchall()
+        self.assertFalse(self.service.fts_write(points))
+        self.assertEqual(self.conn.execute("SELECT rowid,point_id,text,arxiv_id FROM chunks ORDER BY rowid").fetchall(), baseline)
+        self.assertEqual(self.conn.execute("SELECT * FROM pipeline_fts_rows ORDER BY row_id").fetchall(), catalog)
+
+    def test_managed_unique_replay_removes_tail_and_preserves_other_paper(self):
+        self.assertTrue(self.service.fts_write([self.point("1", "stale"), self.point("2", "tail"),
+                                               self.point("3", "other", paper="other")], fresh_ids=["p", "other"]))
+        points = [self.point("1", "replacement")]
         self.assertTrue(self.service.fts_write(points))
+        row = self.conn.execute("SELECT rowid,point_id,text FROM chunks WHERE arxiv_id='p'").fetchall()
+        self.assertEqual([(pid, text) for _rid, pid, text in row], [("1", "replacement")])
         self.assertTrue(self.service.fts_write(points))
-        self.assertEqual(self.conn.execute("SELECT point_id,text FROM chunks WHERE arxiv_id='p'").fetchall(), [("1", "replacement")])
+        self.assertEqual(self.conn.execute("SELECT rowid,point_id,text FROM chunks WHERE arxiv_id='p'").fetchall(), row)
         self.assertEqual(self.conn.execute("SELECT text FROM chunks WHERE arxiv_id='other'").fetchall(), [("other",)])
 
     def test_empty_snapshot_clears_only_one_paper(self):
@@ -513,7 +553,8 @@ class FtsRegressionTests(unittest.TestCase):
         self.assertTrue(self.service.fts_write([self.point("id")], fresh_ids=["p"]))
         plan = self.conn.execute("EXPLAIN QUERY PLAN SELECT row_id FROM pipeline_fts_rows "
                                  "WHERE table_name=? AND arxiv_id=?", ("chunks", "p")).fetchall()
-        self.assertTrue(any("SEARCH" in row[3] and "pipeline_fts_rows_paper" in row[3] for row in plan))
+        self.assertTrue(any("SEARCH" in row[3].upper() and "pipeline_fts_rows" in row[3] for row in plan))
+        self.assertFalse(any("SCAN" in row[3].upper() for row in plan))
 
 
 class VectorAndLoggingRegressionTests(unittest.TestCase):

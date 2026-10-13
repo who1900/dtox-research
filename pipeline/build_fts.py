@@ -18,6 +18,10 @@ import sqlite3
 import sys
 import time
 import urllib.request
+if __package__:
+    from pipeline.fts_catalog import CatalogBlocked, _scope_complete, append_points
+else:
+    from fts_catalog import CatalogBlocked, _scope_complete, append_points
 
 QDRANT = "http://localhost:6333/collections/papers_fulltext"
 FTS_DB = "/opt/dtox-research/fts.db"
@@ -56,8 +60,9 @@ def topup(conn):
     later, so everything embedded in between exists as a vector and not as
     text: 81k chunks findable by meaning and invisible to an exact term. This
     walks the whole collection once and fills the holes."""
-    have = {row[0] for row in conn.execute("SELECT point_id FROM chunks")}
-    print(f"already indexed: {len(have)}")
+    if not _scope_complete(conn):
+        raise CatalogBlocked("partial legacy catalog prevents topup")
+    conn.commit()
     offset, added, seen, started = None, 0, 0, time.time()
     while True:
         body = {"limit": PAGE, "with_payload": True, "with_vector": False}
@@ -67,24 +72,12 @@ def topup(conn):
         points = result["points"]
         if not points:
             break
-        rows = []
+        page_points = []
         for pt in points:
             seen += 1
-            pid = str(pt["id"])
-            if pid in have:
-                continue
-            p = pt.get("payload") or {}
-            if not p.get("text"):
-                continue
-            rows.append((p["text"], pid, p.get("arxiv_id"), p.get("section_type"),
-                         p.get("element_type"), str(p.get("layers") or ""), p.get("year")))
-            have.add(pid)
-        if rows:
-            conn.executemany(
-                "INSERT INTO chunks (text, point_id, arxiv_id, section_type, "
-                "element_type, layers, year) VALUES (?,?,?,?,?,?,?)", rows)
-            conn.commit()
-            added += len(rows)
+            page_points.append(pt)
+        if page_points:
+            added += append_points(conn, page_points)
         offset = result.get("next_page_offset")
         if seen % 100000 < PAGE:
             print(f"  scanned {seen}, added {added}, {seen / max(1, time.time() - started):.0f}/s")
@@ -116,7 +109,14 @@ def main():
 
     row = conn.execute("SELECT value FROM build_state WHERE key='offset'").fetchone()
     offset = json.loads(row[0]) if row else None
-    done = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    completed = conn.execute("SELECT value FROM build_state WHERE key='completed'").fetchone()
+    if (completed and json.loads(completed[0]) is True) or (row and offset is None):
+        print("build already completed")
+        return 0
+    if not _scope_complete(conn):
+        raise CatalogBlocked("partial legacy catalog prevents build")
+    conn.commit()
+    done = 0
     started, page = time.time(), 0
 
     while True:
@@ -125,24 +125,21 @@ def main():
             body["offset"] = offset
         result = post("/points/scroll", body)["result"]
         points = result["points"]
-        if not points:
-            break
-        rows = []
+        page_points = []
+        if not isinstance(points, list):
+            raise ValueError("scroll response points must be a list")
         for pt in points:
-            p = pt.get("payload") or {}
-            text = p.get("text")
-            if not text:
-                continue
-            rows.append((text, str(pt["id"]), p.get("arxiv_id"), p.get("section_type"),
-                         p.get("element_type"), str(p.get("layers") or ""), p.get("year")))
-        conn.executemany(
-            "INSERT INTO chunks (text, point_id, arxiv_id, section_type, element_type, "
-            "layers, year) VALUES (?,?,?,?,?,?,?)", rows)
-        done += len(rows)
-        offset = result.get("next_page_offset")
-        conn.execute("INSERT OR REPLACE INTO build_state (key, value) VALUES ('offset', ?)",
-                     (json.dumps(offset),))
-        conn.commit()
+            page_points.append(pt)
+        next_offset = result["next_page_offset"]
+        conn.execute("BEGIN IMMEDIATE")
+        with conn:
+            inserted = append_points(conn, page_points)
+            conn.execute("INSERT OR REPLACE INTO build_state (key, value) VALUES ('offset', ?)",
+                         (json.dumps(next_offset),))
+            conn.execute("INSERT OR REPLACE INTO build_state (key, value) VALUES ('completed', ?)",
+                         (json.dumps(next_offset is None),))
+        done += inserted
+        offset = next_offset
         page += 1
         if page % 20 == 0:
             rate = done / max(1, time.time() - started)

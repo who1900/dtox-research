@@ -9,12 +9,14 @@ ERC-4337 among them). The pipeline now reads ERCs through its own source
 what is already indexed. For each eip:N whose cached text is a stub it
 
   1. downloads ERCS/erc-N.md from raw.githubusercontent.com (no API quota),
-  2. writes it to latex_cache/<id>/source.tex,
-  3. deletes the paper's Qdrant points (wait=true) and fts.db rows,
-  4. removes fulltext_cache and chunk_cache,
-  5. sets title/year/abstract from the ERC front matter and status='quality_checked'
-     with extractor_version and fulltext_source cleared: fulltext_step reads the
-     cache, chunk_step re-extracts, embed_step re-embeds.
+  2. validates a usable, non-withdrawn source and stages its UTF-8 bytes plus
+     metadata in the publication journal only.
+
+The old published source, paper metadata/status, caches, Qdrant points and FTS
+rows remain untouched. Staging is not publication: historical replacements
+cannot be applied until the revision-aware migration gate is available. Dry
+run remains the default; it fetches and validates candidate ERCs but writes
+nothing. With --apply, candidates are staged and explicitly reported as staged.
 
 Dry run by default (reads state.db read-only, downloads ERC files, writes nothing).
 Every paper is its own commit (sqlite timeout 30). ERCs that are Withdrawn or
@@ -37,6 +39,11 @@ import time
 import requests
 
 import reprocess_lost_body as rlb
+
+try:
+    from pipeline.publication import PublicationBlocked, stage_source
+except ImportError:  # standalone deployment keeps ops/ and pipeline/ side by side
+    from publication import PublicationBlocked, stage_source
 
 RAW_BASE = "https://raw.githubusercontent.com/ethereum/ERCs/master/ERCS/"
 LIST_URL = "https://api.github.com/repos/ethereum/ERCs/contents/ERCS"
@@ -167,42 +174,14 @@ def erc_fields(text):
     }
 
 
-def write_cache(data_dir, arxiv_id, text):
-    d = os.path.join(data_dir, "latex_cache", rlb.safe_id(arxiv_id))
-    os.makedirs(d, exist_ok=True)
-    tmp = os.path.join(d, "source.tex.tmp")
-    with open(tmp, "w", encoding="utf-8", errors="ignore") as f:
-        f.write(text)
-    os.replace(tmp, os.path.join(d, "source.tex"))
-
-
-def remove_derived(data_dir, arxiv_id):
-    """fulltext_cache and chunk_cache only; latex_cache holds the new text."""
-    sid = rlb.safe_id(arxiv_id)
-    for p in (os.path.join(data_dir, "fulltext_cache", f"{sid}.tex"),
-              os.path.join(data_dir, "chunk_cache", f"{sid}.json")):
-        with contextlib.suppress(FileNotFoundError):
-            os.remove(p)
-
-
 def refresh_one(conn, session, args, arxiv_id, text, fts_ids):
-    """Returns False when the paper left the live statuses meanwhile."""
+    """Stage an ERC replacement; return False if its catalog row is no longer live."""
     row = conn.execute("SELECT status FROM papers WHERE arxiv_id=?", (arxiv_id,)).fetchone()
     if row is None or row["status"] not in LIVE_STATUSES:
         return False
-    f = erc_fields(text)
-    write_cache(args.data_dir, arxiv_id, text)
-    rlb.qdrant_delete(session, args.qdrant, args.collection, arxiv_id)
-    rlb.fts_delete(args.fts, fts_ids)
-    remove_derived(args.data_dir, arxiv_id)
-    marks = ",".join("?" * len(LIVE_STATUSES))
-    conn.execute(
-        "UPDATE papers SET title=COALESCE(?, title), year=COALESCE(?, year), abstract=?, "
-        "status='quality_checked', extractor_version=NULL, fulltext_source=NULL, updated_at=? "
-        f"WHERE arxiv_id=? AND status IN ({marks})",
-        (f["title"], f["year"], f["abstract"], rlb.now_iso(), arxiv_id) + LIVE_STATUSES)
-    conn.commit()
-    return True
+    stage_source(conn=conn, data_dir=args.data_dir, paper_id=arxiv_id, source_bytes=text.encode("utf-8"),
+                 metadata={**erc_fields(text), "source": "erc@all"})
+    return "staged"
 
 
 def list_erc_numbers(session):
@@ -247,23 +226,22 @@ def run(conn, session, args, log=print):
             log(f"ERC listing failed: {e}")
         log("dry run, nothing written (use --apply)")
         return len(plan)
-    rowids = {} if args.skip_fts else rlb.fts_rowids(args.fts, [c["arxiv_id"] for c, _ in plan])
     n = 0
     for c, text in plan:
         aid = c["arxiv_id"]
         try:
             mark(args.progress, aid, "start")
-            ok = refresh_one(conn, session, args, aid, text, rowids.get(aid, []))
-        except (requests.RequestException, sqlite3.Error, OSError) as e:
+            outcome = refresh_one(conn, session, args, aid, text, [])
+        except (PublicationBlocked, requests.RequestException, sqlite3.Error, OSError, UnicodeError) as e:
             log(f"failed {aid}: {e}")  # stays 'start': retried on the next run
             continue
-        mark(args.progress, aid, "done")
-        if ok:
+        if outcome == "staged":
             n += 1
-            log(f"refreshed {aid} erc_chars={len(text)} fts_rows={len(rowids.get(aid, []))}")
+            mark(args.progress, aid, "staged")
+            log(f"staged {aid} erc_chars={len(text)} reason=awaiting_revision_aware_publication")
         else:
             log(f"skipped {aid}: status changed")
-    log(f"refreshed {n} of {len(plan)}")
+    log(f"staged {n} of {len(plan)}; none published")
     return n
 
 

@@ -10,14 +10,23 @@ everything else (id "wp:<slug>", layer web3, chunked and embedded normally).
 Usage: python whitepapers.py [--dry-run]
 """
 import io
+import os
 import re
 import sqlite3
 import sys
+import tempfile
 import time
 import urllib.request
+from pathlib import Path
 
-sys.path.insert(0, "/opt/dtox-research")
-import service  # noqa: E402
+def _load_service():
+    sys.path.insert(0, "/opt/dtox-research")
+    try:
+        import service
+    except ModuleNotFoundError:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import service
+    return service
 
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
@@ -150,6 +159,15 @@ def html_to_text(raw):
     return re.sub(r"[ \t]+", " ", text)
 
 
+def html_to_structured(raw, **limits):
+    """Opt-in diagnostic structure; exact edition binding is an external adoption gate."""
+    if __package__:
+        from .structured_html import extract_html
+    else:
+        from structured_html import extract_html
+    return extract_html(raw, **limits)
+
+
 ABSTRACT_CHARS = 1200
 _ABSTRACT_HEAD = re.compile(r"(?im)^[#*_\s]*abstract\b[*_:.\s]*")
 _MARKUP = re.compile(r"<sup>.*?</sup>|<[^>]+>|[#*_`]+")
@@ -176,15 +194,102 @@ def whitepaper_abstract(text):
     return " ".join(_MARKUP.sub(" ", text).split())[:ABSTRACT_CHARS]
 
 
+def _atomic_source_cache(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = text.encode("utf-8")
+    if path.exists():
+        if path.read_bytes() != encoded:
+            raise ValueError("source cache already contains different data")
+        return False
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
+            temporary = stream.name
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        temporary = None
+        return True
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def apply_source(conn, data_dir, cache_path, paper_id, title, year, url, text,
+                 dry_run=False, secondary_cache_path=None):
+    """Stage source for done papers; acquire source only for a genuinely new ID."""
+    if dry_run:
+        return {"status": "dry_run", "published": False}
+    row = conn.execute("SELECT status FROM papers WHERE arxiv_id=?", (paper_id,)).fetchone()
+    if row and row[0] != "done":
+        return {"status": "busy", "published": False}
+    if row and row[0] == "done":
+        try:
+            try:
+                from pipeline.publication import stage_source
+            except ModuleNotFoundError:
+                from publication import stage_source
+            return stage_source(conn, data_dir, paper_id, text.encode("utf-8"),
+                                {"origin": url, "format": "extracted-whitepaper-text"})
+        except Exception as exc:
+            return {"status": "failed", "published": False,
+                    "error": f"source_staging_blocked:{type(exc).__name__}"}
+
+    written_caches = []
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT status FROM papers WHERE arxiv_id=?", (paper_id,)).fetchone()
+        if row:
+            conn.rollback()
+            if row[0] != "done":
+                return {"status": "busy", "published": False}
+            return apply_source(conn, data_dir, cache_path, paper_id, title, year, url, text,
+                                secondary_cache_path=secondary_cache_path)
+        if conn.execute("SELECT 1 FROM completion_history WHERE arxiv_id=?", (paper_id,)).fetchone():
+            conn.rollback()
+            return {"status": "busy", "published": False}
+        if len(text.strip()) < 2000 or "\x00" in text:
+            raise ValueError("source failed acquisition validation")
+        for path in (cache_path, secondary_cache_path):
+            if path is not None and _atomic_source_cache(path, text):
+                written_caches.append(path)
+        conn.execute(
+            "INSERT INTO papers (arxiv_id,title,year,layers,status,passed,abstract,fulltext_source,updated_at,niche_score) "
+            "VALUES (?,?,?,'web3','fulltext_fetched',1,?,'whitepaper-pdf',?,20)",
+            (paper_id, title, year, whitepaper_abstract(text), time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+        )
+        conn.execute("INSERT INTO completion_history(arxiv_id,first_known,completed) VALUES (?,1,0)", (paper_id,))
+        conn.commit()
+        return {"status": "acquired", "published": False, "first_acquisition": True}
+    except Exception as exc:
+        conn.rollback()
+        for path in written_caches:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+        return {"status": "failed", "published": False,
+                "error": f"source_acquisition_blocked:{type(exc).__name__}"}
+
+
 def main():
     dry = "--dry-run" in sys.argv
-    conn = sqlite3.connect(service.DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    service.FULLTEXT_DIR.mkdir(exist_ok=True)
+    service = None if dry else _load_service()
+    conn = None if dry else sqlite3.connect(service.DB_PATH, timeout=30)
+    if conn is not None:
+        conn.row_factory = sqlite3.Row
+        service.FULLTEXT_DIR.mkdir(exist_ok=True)
 
     ok = failed = 0
     for slug, title, year, url in WHITEPAPERS:
         pid = f"wp:{slug}"
+        if conn is not None:
+            existing = conn.execute("SELECT status FROM papers WHERE arxiv_id=?", (pid,)).fetchone()
+            if existing and existing[0] != "done":
+                print(f"  BUSY {slug}: existing status {existing[0]}", flush=True)
+                failed += 1
+                continue
         try:
             raw, ctype = fetch(url)
         except Exception as e:
@@ -207,29 +312,25 @@ def main():
             continue
 
         print(f"  OK   {slug}: {len(text)} chars", flush=True)
-        ok += 1
         if dry:
+            ok += 1
             continue
-
-        service.write_latex_cache(pid, text)
-        (service.FULLTEXT_DIR / f"{service.safe_id(pid)}.tex").write_text(
-            text, encoding="utf-8", errors="ignore")
-        abstract = whitepaper_abstract(text)
-        conn.execute(
-            """INSERT INTO papers (arxiv_id, title, year, layers, status, passed,
-                                   abstract, fulltext_source, updated_at, niche_score)
-               VALUES (?,?,?,?,'fulltext_fetched',1,?, 'whitepaper-pdf', ?, 20)
-               ON CONFLICT(arxiv_id) DO UPDATE SET
-                   title=excluded.title, year=excluded.year, layers=excluded.layers,
-                   status='fulltext_fetched', abstract=excluded.abstract,
-                   fulltext_source=excluded.fulltext_source, updated_at=excluded.updated_at""",
-            (pid, title, year, "web3", abstract, service.now_iso()),
-        )
-        conn.commit()
+        result = apply_source(conn, service.BASE_DIR,
+                              service.FULLTEXT_DIR / f"{service.safe_id(pid)}.tex",
+                              pid, title, year, url, text,
+                              secondary_cache_path=service.latex_cache_path(pid))
+        if result["status"] in ("acquired", "staged"):
+            ok += 1
+            label = "ACQUIRED first source" if result["status"] == "acquired" else "STAGED source-only"
+            print(f"  {label}: {slug}", flush=True)
+        else:
+            failed += 1
+            print(f"  FAIL {slug}: {result['status']} {result.get('error', '')}", flush=True)
         time.sleep(1)
 
     print(f"итого: получено {ok}, не удалось {failed}")
-    conn.close()
+    if conn is not None:
+        conn.close()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,113 @@
+[
+  {
+    "originaliacr_id": "2016/260",
+    "title": "On the Size of Pairing-Based Non-interactive Arguments",
+    "authors": ["Jens Groth"],
+    "year": 2016,
+    "copy_url": "https://discovery.ucl.ac.uk/id/eprint/1501201/1/Groth_SNARK9.pdf",
+    "landing_url": "https://discovery.ucl.ac.uk/id/eprint/1501201/",
+    "identity_source": "https://discovery.ucl.ac.uk/id/eprint/1501201/",
+    "kind": "pdf",
+    "license": "unknown"
+  },
+  {
+    "originaliacr_id": "2019/1021",
+    "title": "Halo: Recursive Proof Composition without a Trusted Setup",
+    "original_title_aliases": ["Recursive Proof Composition without a Trusted Setup"],
+    "authors": ["Sean Bowe", "Jack Grigg", "Daira Hopwood"],
+    "year": 2019,
+    "copy_url": "https://www.doc.ic.ac.uk/~ids/dotdot/crypto_papers_etc_worth_reading/coin_mixing/Halo_iacr_2019_1021.pdf",
+    "landing_url": "https://zodl.com/halo-recursive-proof-composition-without-a-trusted-setup/",
+    "identity_source": "https://www.doc.ic.ac.uk/~ids/dotdot/crypto_papers_etc_worth_reading/coin_mixing/Halo_iacr_2019_1021.pdf",
+    "kind": "pdf",
+    "license": "unknown"
+  },
+  {
+    "originaliacr_id": "2018/046",
+    "title": "Scalable, transparent, and post-quantum secure computational integrity",
+    "authors": ["Eli Ben-Sasson", "Iddo Bentov", "Yinon Horesh", "Michael Riabzev"],
+    "year": 2018,
+    "copy_url": "https://starkware.co/wp-content/uploads/2022/05/STARK-paper.pdf",
+    "landing_url": "https://starkware.co/wp-content/uploads/2022/05/STARK-paper.pdf",
+    "identity_source": "https://starkware.co/wp-content/uploads/2022/05/STARK-paper.pdf",
+    "kind": "pdf",
+    "license": "unknown"
+  },
+  {
+    "originaliacr_id": "2017/1066",
+    "title": "Bulletproofs: Short Proofs for Confidential Transactions and More",
+    "authors": ["Benedikt Bünz", "Jonathan Bootle", "Dan Boneh", "Andrew Poelstra", "Pieter Wuille", "Greg Maxwell"],
+    "year": 2017,
+    "copy_url": "https://web.stanford.edu/~buenz/pubs/bulletproofs.pdf",
+    "landing_url": "https://crypto.stanford.edu/bulletproofs/",
+    "identity_source": "https://crypto.stanford.edu/bulletproofs/",
+    "kind": "pdf",
+    "license": "unknown"
+  },
+  {
+    "originaliacr_id": "2021/370",
+    "title": "Nova: Recursive Zero-Knowledge Arguments from Folding Schemes",
+    "authors": ["Abhiram Kothapalli", "Srinath Setty", "Ioanna Tzialla"],
+    "year": 2021,
+    "copy_url": "https://www.andrew.cmu.edu/user/bparno/papers/nova.pdf",
+    "landing_url": "https://www.andrew.cmu.edu/user/bparno/papers/nova.pdf",
+    "identity_source": "https://www.andrew.cmu.edu/user/bparno/papers/nova.pdf",
+    "kind": "pdf",
+    "license": "unknown"
+  },
+  {
+    "originaliacr_id": null,
+    "title": "Fast Reed-Solomon Interactive Oracle Proofs of Proximity",
+    "authors": ["Eli Ben-Sasson", "Iddo Bentov", "Yinon Horesh", "Michael Riabzev"],
+    "year": 2018,
+    "doi": "10.4230/LIPIcs.ICALP.2018.14",
+    "copy_url": "https://drops.dagstuhl.de/storage/00lipics/lipics-vol107-icalp2018/LIPIcs.ICALP.2018.14/LIPIcs.ICALP.2018.14.pdf",
+    "landing_url": "https://doi.org/10.4230/LIPIcs.ICALP.2018.14",
+    "identity_source": "https://drops.dagstuhl.de/entities/document/10.4230/LIPIcs.ICALP.2018.14",
+    "kind": "pdf",
+    "license": "CC-BY-3.0",
+    "curated_standalone": true
+  },
+  {
+    "originaliacr_id": "2010/009",
+    "title": "Constant-Size Commitments to Polynomials and Their Applications",
+    "authors": ["Aniket Kate", "Gregory M. Zaverucha", "Ian Goldberg"],
+    "year": 2010,
+    "copy_url": "https://www.cypherpunks.ca/~iang/pubs/PolyCommit-AsiaCrypt.pdf",
+    "landing_url": "https://www.cypherpunks.ca/~iang/pubs/PolyCommit-AsiaCrypt.pdf",
+    "identity_source": "https://cypherpunks.ca/~iang/cv.html",
+    "kind": "pdf",
+    "license": "unknown",
+    "curated_standalone": true
+  },
+  {
+    "originaliacr_id": "2018/627",
+    "title": "Simple Verifiable Delay Functions",
+    "authors": ["Krzysztof Pietrzak"],
+    "year": 2018,
+    "doi": "10.4230/LIPIcs.ITCS.2019.60",
+    "copy_url": "https://drops.dagstuhl.de/storage/00lipics/lipics-vol124-itcs2019/LIPIcs.ITCS.2019.60/LIPIcs.ITCS.2019.60.pdf",
+    "landing_url": "https://drops.dagstuhl.de/entities/document/10.4230/LIPIcs.ITCS.2019.60",
+    "identity_source": "https://drops.dagstuhl.de/entities/document/10.4230/LIPIcs.ITCS.2019.60",
+    "kind": "pdf",
+    "license": "CC-BY-3.0",
+    "copy_publication_year": 2019,
+    "copy_version": "ITCS 2019 publisher version; related version is IACR ePrint 2018/627, not asserted to be identical",
+    "curated_standalone": true
+  },
+  {
+    "originaliacr_id": "2018/623",
+    "title": "Efficient Verifiable Delay Functions",
+    "authors": ["Benjamin Wesolowski"],
+    "year": 2018,
+    "doi": "10.1007/s00145-020-09364-x",
+    "copy_url": "https://ir.cwi.nl/pub/30021/Wesolowski2020_Article_EfficientVerifiableDelayFuncti.pdf",
+    "landing_url": "https://ir.cwi.nl/pub/30021/",
+    "identity_source": "https://ir.cwi.nl/pub/30021/",
+    "kind": "pdf",
+    "license": "unknown",
+    "copy_publication_year": 2020,
+    "copy_version": "Journal of Cryptology final version (2020); related to IACR ePrint 2018/623, exact-version equivalence not asserted",
+    "curated_standalone": true
+  }
+]

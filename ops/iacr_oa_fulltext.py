@@ -10,22 +10,19 @@ these papers have other open copies, found through OpenAlex.
             each candidate and write a plan JSON. No PDF is downloaded and no
             state is written. Candidates are papers without an arXiv twin
             (twin_of / twins.json): canon first, then niche_score, then year.
-  (default) read the plan and act on it. Dry run unless --apply.
-  --apply   per paper, in its own commit (sqlite timeout 30):
-            * the best copy is on arXiv and the id is not in the corpus: insert
-              it as 'discovered' with twin_of set, so the normal pipeline fetches
-              the LaTeX; no PDF is downloaded. If the id is already in the
-              corpus only twin_of is filled in.
-            * otherwise download the PDF of the best repository / author copy
-              (robots.txt honoured per host, >= 3 s between requests to a host,
-              20 MB cap, redirects followed by hand and re-checked), convert it
-              with whitepapers.pdf_to_text, check that the text opens with the
-              paper's own title, then write fulltext_cache, drop the old Qdrant
-              points / fts rows / chunk caches (as reprocess_lost_body does) and
-              set status='fulltext_fetched', fulltext_source='oa-mirror-pdf',
-              source_url=<copy url>. chunk_step then re-chunks it as markdown
-              (needs the service.py that knows 'oa-mirror-pdf'; the script
-              refuses PDF items while the deployed service.py lacks it).
+  (default) read the plan and act on it. Dry run unless --apply; dry run does
+            not write pipeline state or source files.
+  --apply   arXiv twins absent from the corpus are inserted as 'discovered'
+            with twin_of set and enter the normal acquisition pipeline. Existing
+            twins are linked without changing their publication state.
+            Otherwise fetch an allowed PDF (robots.txt honoured per host, >= 3 s
+            between requests to a host, 20 MB cap, redirects re-checked), convert
+            it, and validate its text against the paper title. The validated
+            UTF-8 source is staged in the publication journal only. Existing
+            cache bytes, metadata, Qdrant/FTS indexes and the published paper
+            remain untouched. Historical publication cannot be applied until
+            the revision-aware migration gate is available; staging is not
+            publication.
   --feed    with --apply: only as many PDF papers as the pipeline queue has
             room for (--target minus quality_checked+fulltext_fetched+chunked,
             at most --batch), so a timer can trickle the work in.
@@ -54,6 +51,11 @@ from urllib import robotparser
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import reprocess_lost_body as rlb  # noqa: E402
 import requests  # noqa: E402
+
+try:
+    from pipeline.publication import PublicationBlocked, stage_source
+except ImportError:  # standalone deployment keeps ops/ and pipeline/ side by side
+    from publication import PublicationBlocked, stage_source
 
 DATA_DIR = os.getenv("DTOX_DATA_DIR", "/opt/dtox-research")
 UA = "dtox-research/1.1 (research pipeline; mailto:danik1900@gmail.com)"
@@ -422,6 +424,9 @@ def queue_arxiv(conn, entry, now=None):
             "matched_terms, twin_of, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (aid, entry["title"], entry["year"], src["layers"] or "web3", "discovered",
              src["abstract"], src["niche_score"], src["matched_terms"], entry["id"], now or rlb.now_iso()))
+        conn.execute(
+            "INSERT INTO completion_history(arxiv_id, first_known, completed) VALUES (?,1,0) "
+            "ON CONFLICT(arxiv_id) DO NOTHING", (aid,))
         outcome = "queued"
     else:
         if have["twin_of"] is None:
@@ -431,18 +436,8 @@ def queue_arxiv(conn, entry, now=None):
     return outcome
 
 
-def write_text(data_dir, paper_id, text):
-    d = os.path.join(data_dir, "fulltext_cache")
-    os.makedirs(d, exist_ok=True)
-    path = os.path.join(d, f"{rlb.safe_id(paper_id)}.tex")
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, path)
-
-
 def apply_pdf(conn, session, fetcher, args, entry, fts_ids, to_text, log=print):
-    """Returns (outcome, url). Nothing is changed unless a copy yields good text."""
+    """Acquire and stage a validated source without changing published state."""
     pid = entry["id"]
     text, url = None, None
     tries = [c for c in entry["copies"] if c["kind"] == "pdf" and c["pdf"]][:args.max_copies]
@@ -466,21 +461,9 @@ def apply_pdf(conn, session, fetcher, args, entry, fts_ids, to_text, log=print):
         break
     if text is None:
         return "no_usable_copy", None
-    write_text(args.data_dir, pid, text)
-    rlb.qdrant_delete(session, args.qdrant, args.collection, pid)
-    rlb.fts_delete(args.fts, fts_ids)
-    sid = rlb.safe_id(pid)
-    with contextlib.suppress(FileNotFoundError):
-        os.remove(os.path.join(args.data_dir, "chunk_cache", f"{sid}.json"))
-    with contextlib.suppress(OSError):
-        os.remove(os.path.join(args.data_dir, "latex_cache", sid, "source.tex"))
-        os.rmdir(os.path.join(args.data_dir, "latex_cache", sid))
-    conn.execute("UPDATE papers SET status='fulltext_fetched', fulltext_source=?, source_url=?, "
-                 "extractor_version=NULL, updated_at=? WHERE arxiv_id=? AND status='done' "
-                 "AND fulltext_source='iacr-abstract'",
-                 (FULLTEXT_SOURCE, url, rlb.now_iso(), pid))
-    conn.commit()
-    return "ok", url
+    stage_source(conn=conn, data_dir=args.data_dir, paper_id=pid, source_bytes=text.encode("utf-8"),
+                 metadata={"source_url": url, "title": entry["title"], "source": FULLTEXT_SOURCE})
+    return "staged", url
 
 
 def service_supports_mirror(path):
@@ -502,9 +485,7 @@ def apply_plan(conn, session, args, to_text=None, fetcher=None, log=print):
         items = json.load(f)["items"]
     done = rlb.load_progress(args.progress)
     items = [i for i in items if i["id"] not in done and i["action"] in ("pdf", "queue_arxiv")]
-    pdf_ok = service_supports_mirror(args.service_file)
-    if not pdf_ok:
-        log(f"{args.service_file} lacks '{FULLTEXT_SOURCE}' support: PDF items skipped, deploy service.py first")
+    pdf_ok = True
     room_pdf = args.limit or 10**9
     if args.feed:
         queue = rlb.queue_size(conn)
@@ -530,8 +511,6 @@ def apply_plan(conn, session, args, to_text=None, fetcher=None, log=print):
         return len(chosen)
     fetcher = fetcher or Fetcher(session)
     to_text = to_text or default_to_text
-    pdf_ids = [i["id"] for i in chosen if i["action"] == "pdf"]
-    rowids = {} if args.skip_fts else rlb.fts_rowids(args.fts, pdf_ids)
     n = 0
     for it in chosen:
         pid = it["id"]
@@ -548,14 +527,14 @@ def apply_plan(conn, session, args, to_text=None, fetcher=None, log=print):
             if it["action"] == "queue_arxiv":
                 outcome = queue_arxiv(conn, it)
             else:
-                outcome, _ = apply_pdf(conn, session, fetcher, args, it, rowids.get(pid, []), to_text, log)
-        except (requests.RequestException, sqlite3.Error, OSError) as e:
+                outcome, _ = apply_pdf(conn, session, fetcher, args, it, [], to_text, log)
+        except (PublicationBlocked, requests.RequestException, sqlite3.Error, OSError, UnicodeError) as e:
             log(f"failed {pid}: {type(e).__name__}: {e}")  # not marked: retried next run
             continue
         rlb.mark_progress(args.progress, pid)
-        n += outcome in ("ok", "queued", "twin_in_corpus")
+        n += outcome in ("staged", "queued", "twin_in_corpus")
         log(f"{outcome} {pid} {it['source_url'] or ''}")
-    log(f"{verb} {n} of {len(chosen)}")
+    log(f"{verb} {n} staged/queued of {len(chosen)}")
     return n
 
 

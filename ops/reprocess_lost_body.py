@@ -1,45 +1,39 @@
 #!/usr/bin/env python3
-"""Re-run papers whose LaTeX body was lost to the old \\input resolver.
+"""Read-only recovery planning for papers affected by the old \\input resolver.
 
 assemble_latex_source used to look \\input{sections/x} up by basename and
 silently replace a miss with nothing, so about a quarter of the LaTeX papers
 kept only a preamble and an abstract (SWE-bench 2310.06770 had 2 chunks, has
-154 after the fix). The fix only acts on a fresh download, so finished papers
-have to go back through the pipeline: this drops what they left behind and puts
-them at 'quality_checked', where fulltext_step picks them up again.
+154 after the fix). APPLY is retired: changing a published paper's pipeline
+status hides it from readers, and stable UUID overwrites are not atomic.
+Revision-aware publication is required before recovery can be applied.
+Text lost from historical caches may still require a separate fresh acquisition.
 
-Two modes, both read-only unless --apply is given:
+Two planning modes; neither mutates paper state, caches or indexes:
 
   --build-list   pick status='done' LaTeX papers with an arXiv id and fewer than
                  --max-chunks points in Qdrant, most cited first (then fewest
                  chunks), and write them to --list. --limit N looks only at the
                  N most cited candidates, for a quick sample.
   --feed         (default) count the pipeline queue (quality_checked +
-                 fulltext_fetched + chunked); if it is under --target, reset the
-                 next (target - queue) papers of the list, at most --batch.
+                 fulltext_fetched + chunked); if it is under --target, inspect the
+                 next (target - queue) candidates, at most --batch. A nonempty
+                 cached input only makes a ready planning candidate.
 
-A reset removes the paper's Qdrant points, its fts.db rows, fulltext_cache,
-latex_cache and chunk_cache files, then sets status='quality_checked' with
-extractor_version and fulltext_source cleared. Every paper is its own commit
-(sqlite timeout 30): a transaction held across the run once stalled the live
-pipeline for three hours on "database is locked". Finished ids go to --progress
-(one JSON line each), so a rerun continues instead of starting over.
-
-papers_fts.db and the coarse index replace their own rows when the paper is
-finished again, so they are left alone. fts.db is an FTS5 table with an
-unindexed arxiv_id, so finding a paper's rows is a full scan (minutes at 14 GB):
-one scan serves the whole batch, then rows go by rowid.
-
-Run under nice; a lock file keeps two runs from overlapping.
+Historical --progress is read but never extended. --skip-fts is accepted for
+compatibility. A lock prevents concurrent build-list artifact writes.
+Legacy helpers remain exported for other ops scripts; this planner never calls
+their destructive or progress-writing paths.
 
   reprocess_lost_body.py --build-list
-  reprocess_lost_body.py --feed             # dry run: prints what it would reset
-  reprocess_lost_body.py --feed --apply
+  reprocess_lost_body.py --feed             # read-only candidate inspection
+  reprocess_lost_body.py --feed --apply     # refused, exit code 2
 """
 import argparse
 import contextlib
 import json
 import os
+from pathlib import Path
 import re
 import sqlite3
 import sys
@@ -55,6 +49,10 @@ import requests
 DATA_DIR = os.getenv("DTOX_DATA_DIR", "/opt/dtox-research")
 QUEUE_STATUSES = ("quality_checked", "fulltext_fetched", "chunked")
 ARXIV_ID = re.compile(r"^\d{4}\.\d{4,5}(v\d+)?$")
+
+
+class RetiredDestructiveHelper(RuntimeError):
+    """Legacy destructive recovery is forbidden without revision-aware publication."""
 
 
 def now_iso():
@@ -99,10 +97,7 @@ def qdrant_count(session, url, collection, arxiv_id):
 
 
 def qdrant_delete(session, url, collection, arxiv_id):
-    r = session.post(f"{url}/collections/{collection}/points/delete", params={"wait": "true"},
-                     json={"filter": {"must": [{"key": "arxiv_id", "match": {"value": arxiv_id}}]}},
-                     timeout=120)
-    r.raise_for_status()
+    raise RetiredDestructiveHelper("Qdrant deletion retired; stage a revision-aware publication instead")
 
 
 def order_candidates(items):
@@ -175,44 +170,38 @@ def fts_rowids(fts_path, ids):
 
 
 def fts_delete(fts_path, rowids):
-    if not rowids:
-        return
-    conn = sqlite3.connect(fts_path, timeout=30)
-    try:
-        conn.executemany("DELETE FROM chunks WHERE rowid=?", [(r,) for r in rowids])
-        conn.commit()
-    finally:
-        conn.close()
+    raise RetiredDestructiveHelper("FTS deletion retired; stage a revision-aware publication instead")
 
 
 def remove_caches(data_dir, arxiv_id):
-    sid = safe_id(arxiv_id)
-    latex = os.path.join(data_dir, "latex_cache", sid)
-    for p in (os.path.join(data_dir, "fulltext_cache", f"{sid}.tex"),
-              os.path.join(latex, "source.tex"),
-              os.path.join(data_dir, "chunk_cache", f"{sid}.json")):
-        with contextlib.suppress(FileNotFoundError):
-            os.remove(p)
-    with contextlib.suppress(OSError):
-        os.rmdir(latex)
+    raise RetiredDestructiveHelper("cache removal retired; preserve published sources and stage a revision")
+
+
+def _cached_reparse_input(args, arxiv_id):
+    path = os.path.join(args.data_dir, "fulltext_cache", f"{safe_id(arxiv_id)}.tex")
+    with open(path, "rb") as source:
+        text = source.read().decode("utf-8")
+    if not text.strip() or "\x00" in text:
+        raise ValueError("cached fulltext is empty or invalid")
+
+
+def _refuse_apply(log=print, paper_id=None):
+    message = {"status": "retired", "error": "revision-aware publication required"}
+    if paper_id is not None:
+        message["id"] = paper_id
+    log(json.dumps(message))
+    return 2
 
 
 def reset_one(conn, session, args, arxiv_id, fts_ids):
-    """Returns False when the paper is no longer 'done' and was left alone."""
-    row = conn.execute("SELECT status FROM papers WHERE arxiv_id=?", (arxiv_id,)).fetchone()
-    if row is None or row["status"] != "done":
-        return False
-    qdrant_delete(session, args.qdrant, args.collection, arxiv_id)
-    fts_delete(args.fts, fts_ids)
-    remove_caches(args.data_dir, arxiv_id)
-    conn.execute("UPDATE papers SET status='quality_checked', extractor_version=NULL, "
-                 "fulltext_source=NULL, updated_at=? WHERE arxiv_id=? AND status='done'",
-                 (now_iso(), arxiv_id))
-    conn.commit()
-    return True
+    """Retired compatibility entry point; always leave the paper unchanged."""
+    _refuse_apply(paper_id=arxiv_id)
+    return False
 
 
 def feed(conn, session, args, log=print):
+    if args.apply:
+        return _refuse_apply(log)
     items = []
     if os.path.exists(args.list):
         with open(args.list) as f:
@@ -220,36 +209,25 @@ def feed(conn, session, args, log=print):
     done = load_progress(args.progress)
     queue = queue_size(conn)
     need = min(args.target - queue, args.batch)
-    log(f"queue {queue}, target {args.target}, list {len(items)}, already reset {len(done)}")
+    log(f"queue {queue}, target {args.target}, list {len(items)}, historical progress {len(done)}")
     if need <= 0:
-        log("queue is full, nothing to reset")
+        log("queue is full, no candidates inspected")
         return 0
     chosen = pick(items, done, need)
-    verb = "reset" if args.apply else "would reset"
-    if not args.apply:
-        for it in chosen:
-            log(f"{verb} {it['id']} chunks={it['chunks']} citations={it['citations']}")
-        log(f"{verb} {len(chosen)}")
-        return len(chosen)
-    rowids = {} if args.skip_fts else fts_rowids(args.fts, [it["id"] for it in chosen])
-    n = 0
+    ready = 0
     for it in chosen:
         try:
-            ok = reset_one(conn, session, args, it["id"], rowids.get(it["id"], []))
-        except (requests.RequestException, sqlite3.Error, OSError) as e:
-            # nothing is marked done, the next run retries the paper
-            log(f"failed {it['id']}: {e}")
+            _cached_reparse_input(args, it["id"])
+        except (OSError, UnicodeError, ValueError) as exc:
+            log(f"refused {it['id']}: cached input unavailable ({type(exc).__name__})")
             continue
-        if ok:
-            mark_progress(args.progress, it["id"])
-            n += 1
-            log(f"reset {it['id']} chunks={it['chunks']} citations={it['citations']} "
-                f"fts_rows={len(rowids.get(it['id'], []))}")
-        else:
-            mark_progress(args.progress, it["id"])
-            log(f"skipped {it['id']}: not 'done' any more")
-    log(f"{verb} {n} of {len(chosen)}")
-    return n
+        row = conn.execute("SELECT status FROM papers WHERE arxiv_id=?", (it["id"],)).fetchone()
+        if row is None or row["status"] != "done":
+            continue
+        log(f"ready candidate {it['id']} chunks={it['chunks']} citations={it['citations']}")
+        ready += 1
+    log(f"ready candidates {ready} of {len(chosen)}; planning only")
+    return ready
 
 
 def parse_args(argv=None):
@@ -257,7 +235,7 @@ def parse_args(argv=None):
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--build-list", action="store_true")
     mode.add_argument("--feed", action="store_true")
-    ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--apply", action="store_true", help="retired: refused with exit code 2")
     ap.add_argument("--db", default=os.path.join(DATA_DIR, "state.db"))
     ap.add_argument("--fts", default=os.getenv("FTS_DB_PATH", os.path.join(DATA_DIR, "fts.db")))
     ap.add_argument("--data-dir", default=DATA_DIR)
@@ -277,20 +255,22 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    with single_instance(args.lock) as got:
+    if args.apply:
+        return _refuse_apply()
+    lock = single_instance(args.lock) if args.build_list else contextlib.nullcontext(True)
+    with lock as got:
         if not got:
             print("another run holds the lock, exiting", flush=True)
             return 0
-        conn = connect(args.db)
-        session = requests.Session()
-        try:
-            run(conn, session, args)
-        finally:
-            conn.close()
-    return 0
+        with contextlib.closing(sqlite3.connect(Path(args.db).resolve().as_uri() + "?mode=ro",
+                                               uri=True, timeout=30)) as conn, requests.Session() as session:
+            conn.row_factory = sqlite3.Row
+            return run(conn, session, args)
 
 
 def run(conn, session, args):
+    if args.apply:
+        return _refuse_apply()
     if args.build_list:
         done = load_progress(args.progress)
         items, looked = build_list(conn, session, args.qdrant, args.collection,
@@ -303,6 +283,7 @@ def run(conn, session, args):
         print(f"{len(items)} candidates of {looked} looked at -> {args.list}", flush=True)
     else:
         feed(conn, session, args)
+    return 0
 
 
 if __name__ == "__main__":

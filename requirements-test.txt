@@ -1,0 +1,5 @@
+# Offline tests and the optional PDF Unicode candidate tool.
+fonttools==4.62.1
+numpy==2.4.4
+pypdf==6.11.0
+pytest==9.1.1

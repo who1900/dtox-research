@@ -85,7 +85,7 @@ class LatexCommentRegressionTests(unittest.TestCase):
         table = "\\begin{tabular}{l}\\verb|x % 2|\\end{tabular}"
         source = "\\section{Method}\nBefore\n" + algorithm + "\nBetween\n" + table + "\nAfter"
         with patch.object(extractor, "_extract_elements_latex",
-                          side_effect=lambda text: [("prose", text.strip())]):
+                          side_effect=lambda text, **kwargs: [("prose", text.strip())]):
             chunks, mode = extractor.build_chunks(source)
         self.assertEqual(mode, "pylatexenc")
         self.assertEqual([c["text"] for c in chunks], ["Before", algorithm, "Between", table, "After"])
