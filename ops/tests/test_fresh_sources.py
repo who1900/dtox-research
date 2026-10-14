@@ -63,6 +63,20 @@ class FreshSourceTests(unittest.TestCase):
                 "2408.11826", original_kind="HTML", edition="v1",
                 session=_Session(response))
 
+    def test_html_parser_limit_is_per_source_so_route_fallback_can_continue(self):
+        from pipeline.structured_html import HTMLLimitError
+        raw = b"<html><body>arXiv:2408.11826v1<article><h1>Paper</h1></article></body></html>"
+        artifact = fresh_sources.FreshArtifact(
+            canonical_id="2408.11826", source_url="https://arxiv.org/html/2408.11826v1",
+            request_url="https://arxiv.org/html/2408.11826v1",
+            retrieval_url="https://arxiv.org/html/2408.11826v1", original_kind="HTML",
+            edition="v1", retrieved_at="2026-10-14T00:00:00Z",
+            raw_sha256=hashlib.sha256(raw).hexdigest(), raw_size_bytes=len(raw), raw_bytes=raw)
+        with patch("pipeline.structured_html.extract_html",
+                   side_effect=HTMLLimitError("HTML node cap exceeded")):
+            with self.assertRaisesRegex(fresh_sources.FreshSourceError, "parser limits"):
+                fresh_sources.parse_fresh_artifact(artifact)
+
     def test_generic_pdf_uses_exact_url_and_hash_edition(self):
         raw = b"%PDF-1.7\nsource fixture"
         response = _Response(raw)

@@ -97,6 +97,33 @@ class BatchTests(unittest.TestCase):
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_interrupted_run_uses_matching_controller_stop_time_for_rate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            conn = worker._connect(worker.db_path(base))
+            try:
+                worker._schema(conn)
+                conn.executemany("INSERT INTO targets(paper_id,cache_ufffd,source_ufffd,empty_fulltext,status,created_at,updated_at) VALUES(?,0,0,0,?,'now','now')",
+                                 [(f'p{i}', 'applied' if i <= 10 else 'pending') for i in range(1, 21)])
+                conn.commit()
+            finally:
+                conn.close()
+            (base / 'bulk-controller-status.json').write_text(json.dumps({
+                'worker_pid': 321, 'phase': 'bulk_interrupted', 'time': 200.0}), encoding='utf-8')
+            run = {'run_id': 'r1', 'target_ids': [f'p{i}' for i in range(1, 21)], 'started_epoch': 100.0,
+                   'pid': 321, 'finished': False, 'phase_seconds': {}}
+            with patch.object(worker.os, 'kill', side_effect=ProcessLookupError), \
+                 patch.object(worker.time, 'time', side_effect=[1000.0, 2000.0]):
+                first = worker.status_snapshot(base, run)['run']
+                snapshot = worker.status_snapshot(base, run)['run']
+
+            self.assertEqual(snapshot['phase'], 'interrupted')
+            self.assertEqual(snapshot['elapsed_seconds'], 100.0)
+            self.assertEqual(snapshot['elapsed_seconds'], first['elapsed_seconds'])
+            self.assertEqual(snapshot['throughput_docs_per_minute'], 6.0)
+            self.assertEqual(snapshot['considered_docs_per_minute'], 6.0)
+            self.assertIsNone(snapshot['eta_seconds'])
+
     def test_interrupted_apply_is_rolled_back_and_verified_before_dispatch(self):
         with tempfile.TemporaryDirectory() as directory:
             journal = Path(directory) / 'paper.json'

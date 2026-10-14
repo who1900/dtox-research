@@ -671,7 +671,11 @@ def parse_fresh_artifact(artifact, *, timeout=120, native_build=None, expected_t
         diagnostics["word_count"] = len((text or "").split())
     elif artifact.original_kind == "HTML":
         _, structured_html = _pipeline_modules()
-        ir = structured_html.extract_html(artifact.raw_bytes)
+        try:
+            ir = structured_html.extract_html(artifact.raw_bytes)
+        except structured_html.HTMLLimitError as exc:
+            raise FreshSourceError(
+                "HTML source exceeds the structured parser limits; try another route for this edition") from exc
         ir["_raw_text"] = artifact.raw_bytes.decode("utf-8", errors="strict")
         arxiv = _ARXIV_ID.fullmatch(artifact.canonical_id)
         if arxiv:

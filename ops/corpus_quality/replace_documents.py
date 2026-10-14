@@ -347,18 +347,37 @@ def status_snapshot(base=BASE, run=None):
         finally:
             conn.close()
         done = selected.get('applied', 0) + selected.get('deferred', 0) + selected.get('failed', 0)
-        stop_time = float(run.get('finished_epoch') or time.time())
-        elapsed = max(0.001, stop_time - float(run['started_epoch']))
-        rate = selected.get('applied', 0) / elapsed
-        considered_rate = done / elapsed
-        remaining = max(0, len(ids) - done)
+        started = float(run['started_epoch'])
+        now = time.time()
         stale = False
         if not run.get('finished'):
             try:
                 os.kill(int(run['pid']), 0)
             except (KeyError, TypeError, ValueError, OSError):
                 stale = True
-        eta = round(remaining / considered_rate, 1) if considered_rate > 0 and done >= 10 and not stale else None
+        stop_time = float(run['finished_epoch']) if run.get('finished_epoch') is not None else None
+        if stale:
+            # A dead worker's last run timestamp is meaningful only when the
+            # controller records a terminal event for that exact worker PID.
+            try:
+                controller = json.loads((base / 'bulk-controller-status.json').read_text(encoding='utf-8'))
+                controller_time = float(controller.get('time', controller.get('epoch')))
+                if (controller.get('worker_pid') == int(run['pid'])
+                        and controller.get('phase') in ('bulk_interrupted', 'bulk_complete')
+                        and math.isfinite(controller_time)
+                        and started <= controller_time <= now):
+                    stop_time = controller_time
+                else:
+                    stop_time = None
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                stop_time = None
+        elif stop_time is None:
+            stop_time = now
+        elapsed = max(0.001, stop_time - started) if stop_time is not None and started <= stop_time else None
+        rate = selected.get('applied', 0) / elapsed if elapsed is not None else None
+        considered_rate = done / elapsed if elapsed is not None else None
+        remaining = max(0, len(ids) - done)
+        eta = round(remaining / considered_rate, 1) if considered_rate and considered_rate > 0 and done >= 10 and not stale else None
         progress = dict(run_id=run.get('run_id'), phase=('complete' if run.get('finished') else 'interrupted' if stale else 'running'),
                         scope='selected run subset only', selected_documents=len(ids),
                         completed_documents=done, applied_documents=selected.get('applied', 0),
@@ -367,8 +386,9 @@ def status_snapshot(base=BASE, run=None):
                         remaining_documents=remaining, phase_counts=selected,
                         phase_seconds={key: round(value, 3) for key, value in phase_seconds.items()},
                         journal_size_bytes=run.get('journal_size_bytes', {}),
-                        elapsed_seconds=round(elapsed, 1), throughput_docs_per_minute=round(rate * 60, 3),
-                        considered_docs_per_minute=round(considered_rate * 60, 3),
+                        elapsed_seconds=round(elapsed, 1) if elapsed is not None else None,
+                        throughput_docs_per_minute=round(rate * 60, 3) if rate is not None else None,
+                        considered_docs_per_minute=round(considered_rate * 60, 3) if considered_rate is not None else None,
                         eta_seconds=eta, eta_scope='selected run subset only; never whole corpus')
     return dict(schema=SCHEMA, phase=(progress or {}).get('phase', 'status'), scope='frozen replacement candidates only',
                 candidate_count=total, statuses=counts, whole_corpus_quality_complete=False,
