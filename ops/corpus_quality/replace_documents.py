@@ -350,6 +350,7 @@ def status_snapshot(base=BASE, run=None):
         stop_time = float(run.get('finished_epoch') or time.time())
         elapsed = max(0.001, stop_time - float(run['started_epoch']))
         rate = selected.get('applied', 0) / elapsed
+        considered_rate = done / elapsed
         remaining = max(0, len(ids) - done)
         stale = False
         if not run.get('finished'):
@@ -357,7 +358,7 @@ def status_snapshot(base=BASE, run=None):
                 os.kill(int(run['pid']), 0)
             except (KeyError, TypeError, ValueError, OSError):
                 stale = True
-        eta = round(remaining / rate, 1) if rate > 0 and selected.get('applied', 0) >= 2 and not stale else None
+        eta = round(remaining / considered_rate, 1) if considered_rate > 0 and done >= 10 and not stale else None
         progress = dict(run_id=run.get('run_id'), phase=('complete' if run.get('finished') else 'interrupted' if stale else 'running'),
                         scope='selected run subset only', selected_documents=len(ids),
                         completed_documents=done, applied_documents=selected.get('applied', 0),
@@ -367,6 +368,7 @@ def status_snapshot(base=BASE, run=None):
                         phase_seconds={key: round(value, 3) for key, value in phase_seconds.items()},
                         journal_size_bytes=run.get('journal_size_bytes', {}),
                         elapsed_seconds=round(elapsed, 1), throughput_docs_per_minute=round(rate * 60, 3),
+                        considered_docs_per_minute=round(considered_rate * 60, 3),
                         eta_seconds=eta, eta_scope='selected run subset only; never whole corpus')
     return dict(schema=SCHEMA, phase=(progress or {}).get('phase', 'status'), scope='frozen replacement candidates only',
                 candidate_count=total, statuses=counts, whole_corpus_quality_complete=False,

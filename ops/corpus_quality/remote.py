@@ -167,6 +167,20 @@ for job in ('index-admission-audit','index-admission-sequence','verified-unresol
     result[job]=item
 statusfile=root/'index-admission-withdrawal-status.json'
 if statusfile.exists():result['index-admission-withdrawals']={'status':json.loads(statusfile.read_text())}
+replacement=root/'whole-document-replacement-20261014'
+if (replacement/'whole-document-replacement.sqlite').exists():
+    import sys
+    sys.path.insert(0,str(root))
+    from ops.corpus_quality import replace_documents
+    item={'status':replace_documents.status_snapshot(replacement)}
+    controller=replacement/'bulk-controller-status.json'
+    if controller.exists():item['controller']=json.loads(controller.read_text())
+    pidfile=replacement/'bulk-controller.pid'
+    if pidfile.exists():
+        pid=int(pidfile.read_text());item['pid']=pid
+        proc=pathlib.Path('/proc')/str(pid)/'stat'
+        item['process_exists']=proc.exists() and proc.read_text().split()[2]!='Z'
+    result['whole-document-replacement']=item
 print(json.dumps(result))
 '''
     return execute(program)
