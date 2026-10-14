@@ -76,6 +76,52 @@ class WholeDocumentTests(unittest.TestCase):
         owner.rollback_plan(self.journal,qdrant=self.qdrant,maintenance=True)
         self.assertEqual(self.snapshot(),before)
 
+    def directory_alias(self, name, target):
+        alias=self.root/name
+        try:alias.symlink_to(target,target_is_directory=True)
+        except OSError as exc:self.skipTest('directory symlink unavailable: '+str(exc))
+        return alias
+
+    def retain_publication(self,path):
+        with closing(sqlite3.connect(self.state_path)) as c:
+            c.execute("INSERT INTO paper_publications(arxiv_id,revision,kind,artifact_path,state) VALUES (?,?,'snapshot',?,'published')",
+                (self.aid,'old',str(path)));c.commit()
+
+    def test_retained_directory_alias_readback_and_exact_rollback(self):
+        root=self.root/'publication_cache'
+        retained=root/'old.json';retained.write_bytes(b'original retained artifact')
+        alias=self.directory_alias('legacy_publications',root)
+        stored=alias/retained.name
+        self.retain_publication(stored)
+        before=self.snapshot();plan=self.prepare()
+        self.assertEqual(plan['paper']['publications_before'][0][3],str(stored))
+        self.assertEqual(plan['paper']['retained_artifacts'],[
+            dict(path=str(retained),sha256=owner.labels._sha(retained.read_bytes()))])
+        owner.apply_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+        with closing(sqlite3.connect(self.state_path)) as c:
+            self.assertEqual(c.execute("SELECT artifact_path FROM paper_publications WHERE revision='old'").fetchone(),(str(stored),))
+        owner.rollback_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+        self.assertEqual(self.snapshot(),before)
+        self.assertEqual(retained.read_bytes(),b'original retained artifact')
+
+    def test_retained_outside_directory_alias_rejected_before_writes(self):
+        outside=self.root/'outside';outside.mkdir()
+        (outside/'old.json').write_bytes(b'outside')
+        alias=self.directory_alias('legacy_publications',outside)
+        self.retain_publication(alias/'old.json');before=self.snapshot()
+        with self.assertRaises(owner.RepairError):self.prepare()
+        self.assertFalse(self.journal.exists());self.assertEqual(self.snapshot(),before)
+
+    def test_retained_leaf_symlink_rejected_before_writes(self):
+        root=self.root/'publication_cache'
+        target=root/'target.json';target.write_bytes(b'retained')
+        leaf=root/'old.json'
+        try:leaf.symlink_to(target)
+        except OSError as exc:self.skipTest('file symlink unavailable: '+str(exc))
+        self.retain_publication(leaf);before=self.snapshot()
+        with self.assertRaises(document_cache.ManifestInvalid):self.prepare()
+        self.assertFalse(self.journal.exists());self.assertEqual(self.snapshot(),before)
+
     def test_preflight_drift_and_foreign_uuid_reject_before_writes(self):
         original=self.qdrant.points[self.newid]
         self.qdrant.points[self.newid]=dict(self.point,payload=dict(self.point['payload'],arxiv_id='foreign'))

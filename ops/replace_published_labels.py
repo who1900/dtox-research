@@ -246,7 +246,7 @@ def prepare_document_replacement(paper_id, *, candidate, state_db, fts_db, paper
             'pipeline_fts_rows':[['chunks',paper_id,r[0]] for r in after_rows]}
         retained_artifacts=[]
         for row in publications:
-            path=document_cache._plain_path(row[3])
+            path=_retained_publication_path(row[3],publication_cache_dir)
             raw=document_cache.read_bounded(path,64*1024*1024) if path.exists() else None
             retained_artifacts.append(dict(path=str(path),sha256=labels._sha(raw) if raw is not None else None))
         paper = dict(arxiv_id=paper_id,revision=revision,artifact=artifact,artifact_path=str(artifact_path),cache_sha256=labels._sha(cache),
@@ -265,6 +265,16 @@ def prepare_document_replacement(paper_id, *, candidate, state_db, fts_db, paper
         labels._atomic(journal_path,_jbytes(plan))
         return plan
     finally: state.close();fts.close();pf.close()
+
+
+def _retained_publication_path(stored_path, publication_cache_dir):
+    # Historical rows may name a directory alias, but only the configured
+    # physical root may supply the retained file. Never resolve the leaf.
+    path = Path(stored_path).absolute()
+    root = document_cache._cache_directory(publication_cache_dir)
+    if ".." in path.parts or path.parent.resolve(strict=True) != root:
+        raise RepairError('retained publication artifact outside configured root')
+    return document_cache._plain_path(root / path.name)
 
 
 def _document_binding(plan):

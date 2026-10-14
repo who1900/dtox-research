@@ -277,6 +277,61 @@ class FaultPolicyTests(unittest.TestCase):
             self.assertEqual(acquire.call_count, 4)
             self.assertEqual(result['statuses'], {'deferred': 4})
 
+    def test_manifest_invalid_prepare_defers_one_document_but_unknown_errors_stop(self):
+        from concurrent.futures import Future
+        from pipeline import document_cache
+        from unittest.mock import Mock
+        class ImmediatePool:
+            def __init__(self, **kwargs):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def submit(self, call, *args):
+                result = Future()
+                result.set_result(call(*args))
+                return result
+        for error in (document_cache.ManifestInvalid('symlinked document path'), RuntimeError('unknown defect')):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory)
+                conn = worker._connect(worker.db_path(base))
+                worker._schema(conn)
+                conn.executemany("INSERT INTO targets(paper_id,cache_ufffd,source_ufffd,empty_fulltext,status,created_at,updated_at) VALUES(?,0,0,0,'pending','now','now')",
+                                 [('a-invalid',), ('b-valid',)])
+                conn.commit()
+                conn.close()
+                prepare = Mock(side_effect=[error, {'phase': 'prepared'}])
+                owner = types.SimpleNamespace(RepairError=type('RepairError', (Exception,), {}),
+                                              prepare_document_replacement=prepare)
+                runtime = dict(self.runtime(), owner=owner, client=object(), worker=object(),
+                               document_cache=document_cache, paths={})
+                applied = []
+                def apply(plans, runtime, base, service):
+                    for paper_id, journal, metrics in plans:
+                        applied.append(paper_id)
+                        worker._update(base, paper_id, 'applied', metrics=metrics)
+                with patch.object(worker, '_locks', return_value=contextlib.nullcontext()), \
+                        patch.object(worker, '_load_runtime', return_value=runtime), \
+                        patch.object(worker, '_runtime_preflight'), patch.object(worker, '_rowid_floors', return_value={}), \
+                        patch.object(worker, '_check_storage'), patch.object(worker, 'ThreadPoolExecutor', ImmediatePool), \
+                        patch.object(worker.os, 'kill', return_value=None), patch.object(worker, '_state_row', return_value={}), \
+                        patch.object(worker, '_acquire_one', return_value=({}, {})), \
+                        patch.object(worker, '_prepare_candidate', return_value={}), \
+                        patch.object(worker, '_advance_rowid_floors'), patch.object(worker, '_compress_applied_journal'), \
+                        patch.object(worker, '_apply_batch', side_effect=apply):
+                    if isinstance(error, document_cache.ManifestInvalid):
+                        result = worker.run(base, base)
+                        self.assertEqual(result['statuses'], {'applied': 1, 'deferred': 1})
+                        self.assertEqual(applied, ['b-valid'])
+                        self.assertEqual(prepare.call_count, 2)
+                        self.assertIn('ManifestInvalid:', worker._get_targets(base, ('deferred',))[0]['reason'])
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'unknown defect'):
+                            worker.run(base, base)
+                        self.assertEqual(applied, [])
+                        self.assertEqual(prepare.call_count, 1)
+
     def test_http_retry_after_is_bounded_and_404_not_retried(self):
         from unittest.mock import Mock
         from ops.corpus_quality import fresh_sources

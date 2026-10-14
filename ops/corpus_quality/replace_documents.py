@@ -467,6 +467,8 @@ def _load_runtime(base, root=ROOT):
         'fulltext_cache_dir': (root / 'fulltext_cache').resolve(strict=True),
         'publication_cache_dir': (root / 'publication_cache').resolve(strict=True),
     }
+    for key in ('cache_dir', 'section_cache_dir', 'fulltext_cache_dir', 'publication_cache_dir'):
+        document_cache._cache_directory(paths[key])
     if not Path(NATIVE_BUILD).is_dir():
         raise WorkerError('verified PDF native build is unavailable')
     code_root = Path(__file__).resolve().parents[2]
@@ -1309,7 +1311,7 @@ def run(base=BASE, root=ROOT, *, papers=None, limit=None, retry_deferred=False):
                     prepared.append((paper_id, journal, metrics))
                 except DeferredPaper as exc:
                     _record_error(base, paper_id, exc, metrics, defer=True)
-                except runtime['owner'].RepairError as exc:
+                except (runtime['owner'].RepairError, runtime['document_cache'].ManifestInvalid) as exc:
                     _record_error(base, paper_id, exc, metrics, defer=True)
                 except WorkerError:
                     raise
