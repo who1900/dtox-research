@@ -77,6 +77,14 @@ class FreshSourceTests(unittest.TestCase):
             with self.assertRaisesRegex(fresh_sources.FreshSourceError, "parser limits"):
                 fresh_sources.parse_fresh_artifact(artifact)
 
+    def test_invalid_source_section_contract_is_per_route_fallback(self):
+        sections = [{"section_title": "Result 1: First line\nSecond line",
+                     "section_type": "experiments", "text": "Grounded source body."}]
+        with self.assertRaisesRegex(fresh_sources.FreshSourceError,
+                                    "canonical document-cache contract"):
+            fresh_sources._validate_candidate_sections(
+                "2606.07316", sections, "Grounded source body.", "pylatexenc_recovered", sections)
+
     def test_generic_pdf_uses_exact_url_and_hash_edition(self):
         raw = b"%PDF-1.7\nsource fixture"
         response = _Response(raw)

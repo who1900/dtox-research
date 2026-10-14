@@ -658,6 +658,28 @@ def _normalize_title(value):
     return " ".join(re.sub(r"[^\w]+", " ", value.casefold()).split())
 
 
+def _validate_candidate_sections(paper_id, sections, source_text, parser_mode, chunks):
+    """Reject source sections that the publication-side cache contract cannot accept."""
+    import sys
+    root = str(_repo_root())
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    try:
+        from pipeline import document_cache
+    except (ImportError, OSError) as exc:
+        raise FreshSourceDependencyError("existing document-cache validator is unavailable") from exc
+    try:
+        # Validate the actual candidate with the same cache serialization and
+        # unsplit section records that the publication owner will receive.
+        cache_bytes = json.dumps(chunks, ensure_ascii=False, sort_keys=True,
+                                 separators=(",", ":")).encode("utf-8")
+        document_cache.make_section_manifest(
+            paper_id, sections, cache_bytes, source_text.encode("utf-8"), parser_mode, 5)
+    except document_cache.ManifestInvalid as exc:
+        raise FreshSourceError(
+            "fresh source sections do not satisfy the canonical document-cache contract") from exc
+
+
 def parse_fresh_artifact(artifact, *, timeout=120, native_build=None, expected_title=None):
     """Parse a sealed artifact with the existing PDF or structured HTML adapter."""
     if not isinstance(artifact, FreshArtifact):
@@ -887,6 +909,7 @@ def acquire_and_parse(row, stage_dir, *, timeout=120, session=None, fetched_at=N
             text, section_sink=sections, element_sink=elements, document_kind="paper")
     else:
         chunks, mode = extractor.build_chunks(text, section_sink=sections, element_sink=elements)
+    _validate_candidate_sections(paper_id, sections, text, mode, chunks)
     diagnostics["chunk_build_seconds"] = round(time.perf_counter() - chunk_started, 6)
     result.update(chunks=chunks, sections=sections, elements=elements, parser_mode=mode)
     return result
