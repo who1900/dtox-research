@@ -193,19 +193,31 @@ def resolve_arxiv_version(canonical_id, *, session=None, timeout=30):
         import requests
         session = requests.Session()
     resolver_url = "https://export.arxiv.org/api/query?id_list=" + bare
-    response = session.get(resolver_url, timeout=timeout,
-                           headers={"User-Agent": _USER_AGENT}, allow_redirects=True)
     try:
-        if getattr(response, "status_code", None) != 200:
-            raise FreshSourceError("arXiv version resolver returned non-200")
-        final = _url_parts(getattr(response, "url", resolver_url))
-        if final.hostname != "export.arxiv.org":
-            raise FreshSourceError("arXiv version resolver redirected off host")
-        body = _response_bytes(response, 2 * 1024 * 1024)
-    finally:
-        close = getattr(response, "close", None)
-        if callable(close):
-            close()
+        response = session.get(resolver_url, timeout=timeout,
+                               headers={"User-Agent": _USER_AGENT}, allow_redirects=True)
+        try:
+            if getattr(response, "status_code", None) != 200:
+                raise FreshSourceError("arXiv version resolver returned non-200")
+            final = _url_parts(getattr(response, "url", resolver_url))
+            if final.hostname != "export.arxiv.org":
+                raise FreshSourceError("arXiv version resolver redirected off host")
+            body = _response_bytes(response, 2 * 1024 * 1024)
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+    except Exception as exc:
+        # The export API can be unavailable while the publisher's abstract page
+        # remains live. Restrict fallback to transport failures and its explicit
+        # non-200 response; identity/parse failures below remain hard errors.
+        import requests
+        if not isinstance(exc, requests.RequestException) and not (
+                isinstance(exc, FreshSourceError) and "non-200" in str(exc)):
+            raise
+        return _resolve_arxiv_abs_version(
+            bare, session=session, timeout=timeout, started=started,
+            fallback_reason="export_api_unavailable")
     import xml.etree.ElementTree as ET
     try:
         root = ET.fromstring(body)
@@ -225,6 +237,78 @@ def resolve_arxiv_version(canonical_id, *, session=None, timeout=30):
     return {"fresh_version": "v" + str(version), "title": title,
             "resolver_url": resolver_url, "resolved_at": _utc_now(),
             "resolution": "public_atom_exact_id",
+            "resolver_seconds": round(time.perf_counter() - started, 6)}
+
+
+def _resolve_arxiv_abs_version(bare, *, session, timeout, started, fallback_reason):
+    """Read exact latest edition/title from the publisher abstract page."""
+    from html.parser import HTMLParser
+
+    url = "https://arxiv.org/abs/" + bare
+    response = session.get(url, timeout=timeout,
+                           headers={"User-Agent": _USER_AGENT}, allow_redirects=True)
+    try:
+        if getattr(response, "status_code", None) != 200:
+            raise FreshSourceError("arXiv abstract-page version resolver returned non-200")
+        final = _url_parts(getattr(response, "url", url))
+        if final.hostname != "arxiv.org":
+            raise FreshSourceError("arXiv abstract-page resolver redirected off host")
+        body = _response_bytes(response, 2 * 1024 * 1024)
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+    try:
+        page = body.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise FreshSourceError("arXiv abstract page is not valid UTF-8") from exc
+
+    class _Metadata(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.title = None
+            self.dateline = []
+            self.breadcrumb = []
+            self._in_dateline = False
+            self._in_breadcrumb = False
+
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag.lower() == "meta" and attrs.get("name", "").lower() == "citation_title":
+                self.title = attrs.get("content", "").strip() or self.title
+            if tag.lower() == "div" and "dateline" in attrs.get("class", "").split():
+                self._in_dateline = True
+            if tag.lower() == "div" and "header-breadcrumbs" in attrs.get("class", "").split():
+                self._in_breadcrumb = True
+
+        def handle_endtag(self, tag):
+            if tag.lower() == "div" and self._in_dateline:
+                self._in_dateline = False
+            if tag.lower() == "div" and self._in_breadcrumb:
+                self._in_breadcrumb = False
+
+        def handle_data(self, data):
+            if self._in_dateline:
+                self.dateline.append(data)
+            if self._in_breadcrumb:
+                self.breadcrumb.append(data)
+
+    parsed = _Metadata()
+    parsed.feed(page)
+    # Bind identity to the visible page breadcrumb, not related-paper links or
+    # arbitrary occurrences elsewhere in the HTML.
+    breadcrumb = " ".join(" ".join(parsed.breadcrumb).split())
+    id_witness = re.search(r"\barXiv:" + re.escape(bare) + r"(?:v[1-9]\d*)?\b", breadcrumb)
+    data = " ".join(" ".join(parsed.dateline).split())
+    latest = re.search(r"this version,\s*v([1-9]\d*)", data, flags=re.I)
+    if not latest and not re.search(r"\blast revised\b", data, flags=re.I):
+        latest = re.search(r"Submitted on[^\]]*\(\s*v([1-9]\d*)\s*\)\s*\]", data, flags=re.I)
+    if not id_witness or not latest or not parsed.title:
+        raise FreshSourceError("arXiv abstract page lacks exact ID, version-history, or title evidence")
+    return {"fresh_version": "v" + latest.group(1), "title": " ".join(parsed.title.split()),
+            "resolver_url": url, "resolved_at": _utc_now(),
+            "resolution": "publisher_abs_exact_id_version_history",
+            "fallback_reason": fallback_reason,
             "resolver_seconds": round(time.perf_counter() - started, 6)}
 
 

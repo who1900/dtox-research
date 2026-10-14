@@ -106,6 +106,86 @@ class FreshSourceTests(unittest.TestCase):
         self.assertEqual(resolved["fresh_version"], "v1")
         self.assertEqual(resolved["title"], "Research title")
 
+    def test_arxiv_resolver_uses_exact_publisher_history_if_export_times_out(self):
+        import requests
+
+        class _FallbackSession:
+            def __init__(self):
+                self.urls = []
+
+            def get(self, url, **kwargs):
+                self.urls.append(url)
+                if "export.arxiv.org" in url:
+                    raise requests.ReadTimeout("fixture timeout")
+                response = _Response((
+                    b'<html><head><meta name="citation_title" content="A &amp; B: Results"></head>'
+                    b'<body><div class="header-breadcrumbs">arXiv:2606.07316 (cs)</div>'
+                    b'<div class="dateline">[Submitted on 5 Jun 2026 ( v1 ), '
+                    b'last revised 13 Aug 2026 (this version, v2)]</div></body></html>'))
+                response.url = url
+                return response
+
+        session = _FallbackSession()
+        resolved = fresh_sources.resolve_arxiv_version("2606.07316", session=session)
+        self.assertEqual(session.urls, [
+            "https://export.arxiv.org/api/query?id_list=2606.07316",
+            "https://arxiv.org/abs/2606.07316"])
+        self.assertEqual(resolved["fresh_version"], "v2")
+        self.assertEqual(resolved["title"], "A & B: Results")
+        self.assertEqual(resolved["resolution"], "publisher_abs_exact_id_version_history")
+
+    def test_arxiv_abs_fallback_requires_exact_version_evidence(self):
+        import requests
+
+        class _IncompleteSession:
+            def get(self, url, **kwargs):
+                if "export.arxiv.org" in url:
+                    raise requests.ReadTimeout("fixture timeout")
+                response = _Response(
+                    b'<html><meta name="citation_title" content="Title">'
+                    b'<body>arXiv:2606.07316</body></html>')
+                response.url = url
+                return response
+
+        with self.assertRaisesRegex(fresh_sources.FreshSourceError, "lacks exact ID"):
+            fresh_sources.resolve_arxiv_version("2606.07316", session=_IncompleteSession())
+
+    def test_arxiv_abs_fallback_does_not_take_identity_from_related_links(self):
+        import requests
+
+        class _RelatedIdSession:
+            def get(self, url, **kwargs):
+                if "export.arxiv.org" in url:
+                    raise requests.ReadTimeout("fixture timeout")
+                response = _Response(
+                    b'<html><meta name="citation_title" content="Title"><body>'
+                    b'<a href="/abs/2606.07316">Related paper</a>'
+                    b'<div class="dateline">[Submitted on 5 Jun 2026 (v1)]</div>'
+                    b'</body></html>')
+                response.url = url
+                return response
+
+        with self.assertRaisesRegex(fresh_sources.FreshSourceError, "lacks exact ID"):
+            fresh_sources.resolve_arxiv_version("2606.07316", session=_RelatedIdSession())
+
+    def test_arxiv_abs_fallback_wont_assume_v1_if_revision_history_is_incomplete(self):
+        import requests
+
+        class _IncompleteHistorySession:
+            def get(self, url, **kwargs):
+                if "export.arxiv.org" in url:
+                    raise requests.ReadTimeout("fixture timeout")
+                response = _Response(
+                    b'<html><meta name="citation_title" content="Title"><body>'
+                    b'<div class="header-breadcrumbs">arXiv:2606.07316</div>'
+                    b'<div class="dateline">[Submitted on 5 Jun 2026 (v1), '
+                    b'last revised 13 Aug 2026]</div></body></html>')
+                response.url = url
+                return response
+
+        with self.assertRaisesRegex(fresh_sources.FreshSourceError, "lacks exact ID"):
+            fresh_sources.resolve_arxiv_version("2606.07316", session=_IncompleteHistorySession())
+
     def test_html_alttext_projects_without_placeholder_text(self):
         raw = (b'<html><body>arXiv:2408.11826v1<article><h1>Paper</h1><p>Claim '
                b'<math alttext="x squared"><mi>x</mi></math> is tested.</p>'
