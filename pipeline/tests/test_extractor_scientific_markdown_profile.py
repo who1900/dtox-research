@@ -4,6 +4,23 @@ from pipeline import extractor
 
 
 class ScientificMarkdownProfileTests(unittest.TestCase):
+    def test_explicit_structures_remain_typed_and_code_is_not_reinterpreted(self):
+        equation = "$$\nx = \\sum_i y_i\n$$"
+        table = "<table><tr><td>Model</td><td>Score</td></tr></table>"
+        gfm = "| Model | Score |\n| --- | --- |\n| A | 9 |\n"
+        code = "```html\n<table><tr><td>example</td></tr></table>\n```"
+        text = "## Method\nBody\n\n" + equation + "\n\n" + table + "\n\n" + gfm + "\n" + code
+        elements, sections = [], []
+        chunks, _ = extractor.build_chunks_markdown(
+            text, document_kind="paper", element_sink=elements, section_sink=sections)
+        self.assertEqual([e["element_type"] for e in elements],
+                         ["prose", "equation", "table", "table", "code"])
+        self.assertEqual(elements[1]["text"], equation)
+        self.assertEqual(elements[2]["text"], table)
+        self.assertEqual(elements[-1]["text"], code)
+        self.assertTrue(next(c for c in chunks if c["element_type"] == "equation")["has_math"])
+        self.assertEqual(len(sections), 1)
+
     def test_paper_headings_are_classified_and_display_number_is_removed(self):
         text = ("# 1 Introduction\nContext\n"
                 "## **4. Methodology**\nProcedure\n"

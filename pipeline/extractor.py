@@ -32,6 +32,7 @@ class PDFConversionError(RuntimeError):
 _PDF_CONVERSION_SCRIPT = """
 import pathlib
 import sys
+import json
 sys.path.insert(0, sys.argv[3])
 sys.path.insert(0, sys.argv[4])
 from pdf_memory import bind_parent_lifetime, verify_native_build
@@ -41,16 +42,40 @@ try:
 except Exception:
     raise SystemExit(86)
 import pymupdf4llm
-
-text = pymupdf4llm.to_markdown(sys.argv[1], show_progress=False)
+unicode_diagnostics = None
+if sys.argv[6] == "1":
+    import fitz
+    from pdf_unicode import normalize_pdf_bytes
+    raw = pathlib.Path(sys.argv[1]).read_bytes()
+    derived, unicode_diagnostics = normalize_pdf_bytes(raw)
+    document = fitz.open(stream=derived, filetype="pdf")
+    text = pymupdf4llm.to_markdown(document, show_progress=False)
+    page_count = document.page_count
+    page_text_chars = sum(len(page.get_text("text")) for page in document)
+    document.close()
+else:
+    text = pymupdf4llm.to_markdown(sys.argv[1], show_progress=False)
+    page_count = page_text_chars = None
+    if sys.argv[8] == "1":
+        import fitz
+        with fitz.open(sys.argv[1]) as document:
+            page_count = document.page_count
+            page_text_chars = sum(len(page.get_text("text")) for page in document)
 if not isinstance(text, str):
     raise TypeError("PDF converter did not return Markdown")
 with pathlib.Path(sys.argv[2]).open("w", encoding="utf-8", newline="") as output:
     output.write(text)
+if sys.argv[8] == "1":
+    metadata = {"page_count": page_count, "page_text_chars": page_text_chars,
+                "markdown_chars": len(text), "markdown_replacement_characters": text.count("\ufffd"),
+                "unicode_normalization": unicode_diagnostics}
+    with pathlib.Path(sys.argv[7]).open("w", encoding="utf-8", newline="") as output:
+        json.dump(metadata, output, ensure_ascii=True, sort_keys=True)
 """
 
 
-def convert_pdf_isolated(pdf_path, timeout, *, native_build=None):
+def convert_pdf_isolated(pdf_path, timeout, *, native_build=None,
+                         normalize_unicode=False, return_diagnostics=False):
     """Convert one PDF in a fresh interpreter, retaining layout/OCR defaults.
 
     No service import or fork of its threads; only a successful child exit may
@@ -78,11 +103,14 @@ def convert_pdf_isolated(pdf_path, timeout, *, native_build=None):
         pdf_path = str(Path(pdf_path).resolve())
         with NATIVE_JOB_SLOTS, tempfile.TemporaryDirectory(prefix="dtox-pdf-") as directory:
             output = Path(directory) / "fulltext.md"
+            metadata = Path(directory) / "metadata.json"
             process = None
             try:
                 process = subprocess.Popen(
                     [sys.executable, "-c", _PDF_CONVERSION_SCRIPT, pdf_path, str(output),
-                     str(Path(__file__).resolve().parent), native_build, str(os.getpid())],
+                     str(Path(__file__).resolve().parent), native_build, str(os.getpid()),
+                     "1" if normalize_unicode else "0", str(metadata),
+                     "1" if return_diagnostics else "0"],
                     # The fork is selected only in the fresh native interpreter.
                     cwd=directory, stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -99,7 +127,12 @@ def convert_pdf_isolated(pdf_path, timeout, *, native_build=None):
                     raise PDFConversionError("conversion_failed", returncode)
                 try:
                     with output.open("r", encoding="utf-8", newline="") as markdown:
-                        return markdown.read()
+                        text = markdown.read()
+                    if return_diagnostics:
+                        import json
+                        details = json.loads(metadata.read_text(encoding="utf-8"))
+                        return text, details
+                    return text
                 except (OSError, UnicodeError) as exc:
                     raise PDFConversionError("invalid_output") from exc
             finally:
@@ -925,6 +958,35 @@ def _clean_scientific_heading(title):
     return re.sub(r"^\s*\d+(?:\.\d+)*[.)]?\s+", "", title).strip()
 
 
+def _markdown_elements(text):
+    """Keep explicit source tables and display math typed, outside code fences."""
+    fences = _markdown_fences(text)
+    intervals = [(start, end, "code") for start, end in fences]
+    patterns = (
+        ("equation", re.compile(r"^[ \t]*\$\$[ \t]*\n.*?^[ \t]*\$\$[ \t]*(?=\n|$)", re.M | re.S)),
+        ("equation", re.compile(r"\\\[.*?\\\]", re.S)),
+        ("table", re.compile(r"<table\b[^>]*>.*?</table\s*>", re.I | re.S)),
+        ("table", re.compile(
+            r"^[ \t]*\|[^\n]+\|[ \t]*\n"
+            r"[ \t]*\|(?:[ \t]*:?-{3,}:?[ \t]*\|)+[ \t]*(?:\n|$)"
+            r"(?:[ \t]*\|[^\n]+\|[ \t]*(?:\n|$))*", re.M)),
+    )
+    for kind, pattern in patterns:
+        for match in pattern.finditer(text):
+            start, end = match.span()
+            if any(start < right and end > left for left, right, _ in intervals):
+                continue
+            intervals.append((start, end, kind))
+    position = 0
+    for start, end, kind in sorted(intervals):
+        if start > position:
+            yield "prose", text[position:start]
+        yield kind, text[start:end]
+        position = end
+    if position < len(text):
+        yield "prose", text[position:]
+
+
 def build_chunks_markdown(text, section_sink=None, document_kind="spec", element_sink=None):
     """Chunk Markdown by heading using its paper or specification profile.
 
@@ -989,13 +1051,7 @@ def build_chunks_markdown(text, section_sink=None, document_kind="spec", element
     index = 0
     for section_title, section_type, section_body in sections:
         section_elements = [] if section_sink is not None else None
-        elements = []
-        pos = 0
-        for start, end in _markdown_fences(section_body):
-            elements.append(("prose", section_body[pos:start]))
-            elements.append(("code", section_body[start:end]))
-            pos = end
-        elements.append(("prose", section_body[pos:]))
+        elements = _markdown_elements(section_body)
         for element_type, element_text in elements:
             if canonical_elements is not None and element_text.strip():
                 canonical_elements.append({"section_title": section_title, "section_type": section_type,
@@ -1010,7 +1066,8 @@ def build_chunks_markdown(text, section_sink=None, document_kind="spec", element
                 chunks.append({
                     "chunk_index": index, "section_type": section_type,
                     "section_title": section_title, "element_type": element_type,
-                    "has_math": False, "has_algorithm": element_type == "code",
+                    "has_math": element_type == "equation" or (element_type in {"prose", "table"} and bool(MATH_INLINE_RE.search(piece))),
+                    "has_algorithm": element_type == "code",
                     "part_index": pi, "part_total": len(parts), "text": piece.strip(),
                 })
                 index += 1

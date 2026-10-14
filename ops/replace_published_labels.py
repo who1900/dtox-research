@@ -1,12 +1,15 @@
 """Explicit offline snapshot transitions and exact source-bound orphan adoption.
 
-Requires maintenance of readers and writers. Does not admit managed revisions,
-change first-publication rules or rewrite existing fulltext vectors. The label/addition
-route preserves paper/coarse metadata; orphan adoption creates missing projections.
-Optional source-proven cached additions embed and insert only missing points.
+Requires maintenance of readers and writers. Does not admit managed revisions
+or change first-publication rules. The label/addition route preserves existing
+fulltext vectors; whole-document replacement stages a fresh complete source,
+prepared vectors and exact before-images before its bounded maintenance writes.
+Orphan adoption creates missing projections; cached additions insert missing points.
 """
 import base64
+import gzip
 import hashlib
+import inspect
 import json
 import math
 import re
@@ -25,6 +28,417 @@ _jbytes = labels._json_bytes
 
 def _decode(value):
     return base64.b64decode(value)
+
+
+def _document_rows(conn, table, aid, fts_table=None):
+    if table in ('pipeline_fts_rows','pipeline_fts_papers'):
+        if fts_table not in ('chunks','papers_fts'): raise RepairError('explicit FTS family required')
+        return [list(r) for r in conn.execute('SELECT * FROM '+table+
+            ' WHERE table_name=? AND arxiv_id=? ORDER BY rowid',(fts_table,aid))]
+    return [list(r) for r in conn.execute('SELECT * FROM '+table+' WHERE arxiv_id=? ORDER BY rowid',(aid,))]
+
+
+def _document_tables(conn, aid, paper_fts=False):
+    tables = ('pipeline_fts_rows', 'pipeline_fts_papers') if paper_fts else ('pipeline_fts_points', 'pipeline_fts_rows')
+    return {t: _document_rows(conn, t, aid, 'papers_fts' if paper_fts else 'chunks') for t in tables}
+
+
+def _document_fts_rows(conn, aid):
+    # Complete indexed ownership replaces the unindexed FTS arxiv_id scan.
+    # _owned_rows validates each raw rowid and UUID against the existing catalog;
+    # unlike ensure_catalog/_scope_complete, this helper performs no DDL.
+    from pipeline.fts_catalog import _owned_rows, CatalogBlocked
+    try: rowids=_owned_rows(conn,aid)
+    except CatalogBlocked as exc: raise RepairError(str(exc)) from exc
+    return [list(r) for r in _fts_rows(conn,aid,rowids)]
+
+
+def _document_paper_fts_rows(conn,aid):
+    rowids=conn.execute("SELECT row_id FROM pipeline_fts_rows WHERE table_name='papers_fts' AND arxiv_id=?",(aid,)).fetchall()
+    rows=[]
+    for (rid,) in rowids:
+        row=conn.execute('SELECT rowid,arxiv_id,title,abstract,layers,year FROM papers_fts WHERE rowid=?',(rid,)).fetchone()
+        if row is None or row[1]!=aid: raise RepairError('paper FTS row ownership drift')
+        rows.append(list(row))
+    return rows
+
+
+def _document_last_rowid(conn,table):
+    if table not in ('chunks','papers_fts'): raise RepairError('unsupported FTS family')
+    # FTS5 consumes rowid descending order; max(rowid) can scan the full table.
+    row=conn.execute('SELECT rowid FROM '+table+' ORDER BY rowid DESC LIMIT 1').fetchone()
+    return row[0] if row else 0
+
+
+def _document_policy_binding():
+    from pipeline import extractor
+    function=extractor.is_boilerplate_chunk
+    if function is None: raise RepairError('current admission policy unavailable')
+    return dict(filter_enabled=extractor.BOILERPLATE_FILTER,
+        extractor_sha256=labels._sha(Path(inspect.getsourcefile(extractor)).read_bytes().replace(b'\r\n',b'\n')),
+        policy_sha256=labels._sha(Path(inspect.getsourcefile(function)).read_bytes().replace(b'\r\n',b'\n')))
+
+
+def prepare_document_replacement(paper_id, *, candidate, state_db, fts_db, paper_fts_db,
+        cache_dir, section_cache_dir, fulltext_cache_dir, publication_cache_dir,
+        journal_path, qdrant, source_parser=None, rowid_floors=None):
+    """Stage one complete fresh-source replacement; no writes to corpus surfaces.
+
+    Candidate supplies source_path/sha256/binding/route, complete chunks/manifest,
+    prepared points and deployed embedding_recipe. source_parser is injectable
+    for isolated tests; production replays the canonical extractor. Existing IDs
+    can be reused only by apply_plan(maintenance=True), with exact before-images.
+    """
+    from ops import restore_cached_points as restore
+    from pipeline import extractor
+    floors={} if rowid_floors is None else rowid_floors
+    if (not isinstance(floors,dict) or not set(floors)<={'chunks','papers_fts'}
+            or any(type(v) is not int or v<0 for v in floors.values())):
+        raise RepairError('rowid floors must be nonnegative integers for existing FTS families')
+    if Path(journal_path).exists(): raise RepairError('replacement journal already exists')
+    c = json.loads(json.dumps(candidate, allow_nan=False))
+    source = restore._read(c['source_path'], c['source_sha256'])
+    binding = c['source_binding']
+    if (not isinstance(binding.get('url'), str) or not binding['url'].startswith('https://')
+            or not binding.get('version') or not binding.get('retrieved_at')):
+        raise RepairError('fresh source URL, version and retrieval receipt required')
+    try: datetime.fromisoformat(binding['retrieved_at'].replace('Z', '+00:00'))
+    except (ValueError, TypeError): raise RepairError('invalid source retrieval timestamp')
+    sections = []
+    if source_parser is None:
+        parsed = restore.parse_source(source, c['source_route'], section_sink=sections)
+    else: parsed, sections = source_parser(source, c['source_route'])
+    if (not parsed or parsed != c['chunks'] or not sections
+            or any(not isinstance(x.get('text'),str) or '\ufffd' in x['text'] for x in parsed)):
+        raise RepairError('candidate must equal complete canonical source replay')
+    cache = _jbytes(parsed)
+    manifest = c['manifest']
+    document_cache.validate_section_manifest(manifest, paper_id, cache, source)
+    expected_manifest = document_cache.make_section_manifest(paper_id, sections, cache,
+        source, manifest['parser_mode'], manifest['parser_revision'])
+    if manifest != expected_manifest: raise RepairError('candidate canonical manifest differs from source replay')
+    recipe = c['embedding_recipe']
+    if (recipe.get('dimension') != 384 or recipe.get('document_prefix') != ''
+            or recipe.get('pooling') != 'CLS/L2' or recipe.get('max_length') != 512
+            or not recipe.get('model_sha256') or not recipe.get('tokenizer_sha256')):
+        raise RepairError('verified deployed document embedding recipe required')
+    indices = [x.get('chunk_index') for x in parsed]
+    if any(type(i) is not int or i < 0 for i in indices) or len(set(indices)) != len(indices):
+        raise RepairError('invalid complete source chunk indices')
+    admitted = {str(uuid.uuid5(uuid.NAMESPACE_URL, f'{paper_id}#{x["chunk_index"]}')): x
+                for x in parsed if extractor.should_embed(x)}
+    points = {str(p['id']): p for p in c['points']}
+    if not admitted or len(points) != len(c['points']) or set(points) != set(admitted) or len(points) > 3000:
+        raise RepairError('candidate must cover exact current admitted source set')
+    for pid, point in points.items():
+        chunk = admitted[pid]; payload = point['payload']; vector = point['vector']
+        if (payload.get('arxiv_id') != paper_id or any(payload.get(k) != v for k,v in chunk.items())
+                or not _vector_equal(vector, vector) or len(vector) != 384
+                or abs(math.sqrt(sum(x*x for x in vector))-1) > 1e-3
+                or chunk.get('section_type') not in document_cache.SECTION_TYPES
+                or not document_cache._label(chunk.get('section_title'))):
+            raise RepairError('invalid complete candidate point/content/vector')
+    state = labels._connect(state_db, readonly=True); fts = labels._connect(fts_db, readonly=True)
+    pf = labels._connect(paper_fts_db, readonly=True)
+    try:
+        before_state = _paper_row(state, paper_id)
+        if not before_state or before_state['status'] != 'done': raise RepairError('existing done paper required')
+        if labels._exists(state,'paper_active') and state.execute('SELECT 1 FROM paper_active WHERE arxiv_id=?',(paper_id,)).fetchone():
+            raise RepairError('managed paper_active document is outside replacement')
+        publications = _document_rows(state,'paper_publications',paper_id)
+        if publications and (sum(r[5]=='published' for r in publications)!=1
+                or any(r[2]!='snapshot' or r[5] not in ('published','superseded') for r in publications)):
+            raise RepairError('unfinished or unsupported publication owner')
+        updates = c.get('state_updates', {})
+        if not set(updates) <= {'source_url','abstract','fulltext_chars','chunk_count','parser_mode','parser_revision',
+                'extractor_version','fulltext_source','parse_status','parse_error','parse_retry_after'} & set(before_state):
+            raise RepairError('state updates must be existing source-derived fields')
+        after_state = dict(before_state, **updates)
+        if (('source_url' in updates and updates['source_url']!=binding['url'])
+                or ('parser_mode' in updates and updates['parser_mode']!=manifest['parser_mode'])
+                or ('parser_revision' in updates and str(updates['parser_revision'])!=manifest['parser_revision'])):
+            raise RepairError('source-derived state differs from candidate binding')
+        for point in points.values():
+            if (any(point['payload'].get(k)!=after_state.get(k) for k in ('title','year'))
+                    or point['payload'].get('layers') != ((after_state.get('layers') or '').split(',') if after_state.get('layers') else [])):
+                raise RepairError('candidate fulltext/state metadata mismatch')
+        live = _scroll(qdrant,'papers_fulltext',paper_id)
+        reuse=c.get('embedding_reuse',{})
+        if (not isinstance(reuse,dict) or not set(reuse)<=set(points)
+                or any(not isinstance(pid,str) for pid in reuse.values())):
+            raise RepairError('invalid same-paper embedding reuse mapping')
+        if reuse and recipe.get('scope')!='newly_embedded_points':
+            raise RepairError('embedding recipe must explicitly scope only newly embedded points')
+        reuse_proof=[]
+        for new_id,old_id in reuse.items():
+            old=live.get(old_id);new=points[new_id]
+            if (old is None or old['payload'].get('arxiv_id')!=paper_id
+                    or old['payload'].get('text')!=new['payload']['text']
+                    or old['vector']!=new['vector'] or len(old['vector'])!=384
+                    or not _vector_equal(old['vector'],old['vector'])
+                    or abs(math.sqrt(sum(x*x for x in old['vector']))-1)>1e-3):
+                raise RepairError('reused embedding must equal same-paper exact-text baseline vector')
+            reuse_proof.append(dict(point_id=new_id,origin_point_id=old_id,text_sha256=labels._sha(new['payload']['text'].encode()),
+                vector_sha256=labels._sha(_jbytes(old['vector'])),reused_vector_recipe_unverified=True))
+        restore._catalog(fts)
+        if fts.execute('SELECT complete FROM pipeline_fts_scope WHERE singleton=1').fetchone() != (1,):
+            raise RepairError('complete chunk FTS ownership required')
+        rows = _document_fts_rows(fts,paper_id)
+        tables = _document_tables(fts,paper_id)
+        if (len({r[2] for r in rows}) != len(rows)
+                or {tuple(r) for r in tables['pipeline_fts_points']} != {(r[2],paper_id,r[0]) for r in rows}
+                or {tuple(r) for r in tables['pipeline_fts_rows']} != {('chunks',paper_id,r[0]) for r in rows}):
+            raise RepairError('complete old FTS/catalog set mismatch')
+        for collection in ('papers_fulltext','papers_coarse_base'):
+            for pid,p in restore._retrieve(qdrant,collection,list(points)).items():
+                if collection != 'papers_fulltext' or p['payload'].get('arxiv_id') != paper_id:
+                    raise RepairError('candidate UUID foreign or cross-family collision')
+        for pid in points:
+            owner = fts.execute('SELECT arxiv_id FROM pipeline_fts_points WHERE point_id=?',(pid,)).fetchone()
+            if owner and owner != (paper_id,): raise RepairError('candidate UUID foreign FTS owner')
+        coarse_before = list(_scroll(qdrant,'papers_coarse_base',paper_id).values())
+        coarse_after = c.get('coarse_point')
+        if coarse_after is None:
+            if len(coarse_before)!=1 or after_state.get('abstract') != before_state.get('abstract'):
+                raise RepairError('changed/missing coarse embedding text requires prepared coarse candidate')
+            coarse_after = coarse_before[0]
+        cp = coarse_after['payload']; cv = coarse_after['vector']
+        coarse_id = str(uuid.uuid5(uuid.NAMESPACE_URL,'coarse:'+paper_id))
+        if (coarse_after['id'] != coarse_id or cp.get('arxiv_id') != paper_id
+                or not _vector_equal(cv,cv) or len(cv)!=768
+                or abs(math.sqrt(sum(x*x for x in cv))-1)>1e-3
+                or any(cp.get(k)!=after_state.get(k) for k in ('title','year'))
+                or cp.get('layers') != ((after_state.get('layers') or '').split(',') if after_state.get('layers') else [])):
+            raise RepairError('invalid coarse candidate metadata/vector')
+        for p in restore._retrieve(qdrant,'papers_coarse_base',[coarse_id]).values():
+            if p['payload'].get('arxiv_id')!=paper_id: raise RepairError('foreign coarse UUID owner')
+        if restore._retrieve(qdrant,'papers_fulltext',[coarse_id]): raise RepairError('cross-family coarse collision')
+        metadata = {k:after_state.get(k) for k in ('title','year','layers','source_url')}
+        metadata['source_binding'] = dict(binding,sha256=c['source_sha256'],route=c['source_route'])
+        metadata['embedding_provenance']=dict(current_recipe=recipe,current_recipe_scope='newly_embedded_points',
+            newly_embedded_point_ids=sorted(set(points)-set(reuse)),reused_points=reuse_proof,
+            reused_vector_recipe_unverified=bool(reuse))
+        cache_path = Path(cache_dir).resolve()/(document_cache.safe_id(paper_id)+'.json')
+        artifact = dict(points=list(points.values()),metadata=metadata,cache_path=str(cache_path))
+        revision = _snapshot_revision(artifact,labels._sha(cache))
+        for point in artifact['points']: point['payload']['publication_revision']=revision
+        artifact_path = document_cache._cache_directory(publication_cache_dir)/(hashlib.sha256(paper_id.encode()).hexdigest()+'-'+revision+'.json')
+        if artifact_path.exists(): raise RepairError('candidate artifact already exists')
+        old_by = {r[2]:r[0] for r in rows}; next_id = max(_document_last_rowid(fts,'chunks'),floors.get('chunks',0))
+        after_rows = []
+        for point in artifact['points']:
+            rid = old_by.get(point['id'])
+            if rid is None: next_id += 1; rid = next_id
+            after_rows.append([rid,*restore._expected(point)])
+        pf_before = _document_paper_fts_rows(pf,paper_id)
+        pf_tables = _document_tables(pf,paper_id,True)
+        if len(pf_before)>1: raise RepairError('duplicate paper FTS rows')
+        pf_id = pf_before[0][0] if pf_before else max(_document_last_rowid(pf,'papers_fts'),floors.get('papers_fts',0))+1
+        pf_after = [[pf_id,paper_id,after_state['title'],after_state.get('abstract') or '',after_state.get('layers'),after_state.get('year')]]
+        files = []
+        for path,data in ((cache_path,cache),(Path(section_cache_dir).resolve()/cache_path.name,document_cache.manifest_bytes(manifest)),
+                (Path(fulltext_cache_dir).resolve()/(document_cache.safe_id(paper_id)+'.tex'),source)):
+            path=document_cache._plain_path(path)
+            raw=document_cache.read_bounded(path) if path.exists() else None
+            files.append(dict(path=str(path),before=base64.b64encode(raw).decode() if raw is not None else None,
+                after=base64.b64encode(data).decode()))
+        after_tables = {'pipeline_fts_points':[[r[2],paper_id,r[0]] for r in after_rows],
+            'pipeline_fts_rows':[['chunks',paper_id,r[0]] for r in after_rows]}
+        retained_artifacts=[]
+        for row in publications:
+            path=document_cache._plain_path(row[3])
+            raw=document_cache.read_bounded(path,64*1024*1024) if path.exists() else None
+            retained_artifacts.append(dict(path=str(path),sha256=labels._sha(raw) if raw is not None else None))
+        paper = dict(arxiv_id=paper_id,revision=revision,artifact=artifact,artifact_path=str(artifact_path),cache_sha256=labels._sha(cache),
+            points_before=list(live.values()),coarse_before=coarse_before,coarse_after=[coarse_after],
+            state_before=before_state,state_after=after_state,publications_before=publications,
+            fts_before=rows,fts_after=after_rows,catalog_before=tables,catalog_after=after_tables,
+            paper_fts_before=pf_before,paper_fts_after=pf_after,paper_catalog_before=pf_tables,
+            paper_catalog_after={'pipeline_fts_rows':[['papers_fts',paper_id,pf_id]],'pipeline_fts_papers':[['papers_fts',paper_id]]},
+            files=files,source_path=str(Path(c['source_path']).resolve()),source_sha256=c['source_sha256'],embedding_recipe=recipe,
+            admission_policy=_document_policy_binding(),retained_artifacts=retained_artifacts)
+        paper['embedding_reuse']=reuse
+        plan=dict(schema=1,kind='published-label-replacement',operation='whole-document',phase='prepared',paper=paper,
+            state_db=str(Path(state_db).resolve()),fts_db=str(Path(fts_db).resolve()),paper_fts_db=str(Path(paper_fts_db).resolve()),collection='papers_fulltext')
+        plan['binding_sha256'] = _document_binding(plan)
+        _verify_document(plan,qdrant,'before')
+        labels._atomic(journal_path,_jbytes(plan))
+        return plan
+    finally: state.close();fts.close();pf.close()
+
+
+def _document_binding(plan):
+    return labels._sha(_jbytes({k:v for k,v in plan.items() if k not in ('phase','binding_sha256')}))
+
+
+def _document_publications(p, published=False):
+    rows=json.loads(json.dumps(p['publications_before']))
+    if published:
+        for row in rows:
+            if row[5]=='published': row[5]='superseded'
+    rows.append([p['arxiv_id'],p['revision'],'snapshot',p['artifact_path'],p['cache_sha256'],
+        'published' if published else 'replacement_staged',
+        _jbytes(['preflight','qdrant','fts','complete']).decode() if published else '[]',0,None])
+    return rows
+
+
+def _document_equal_points(actual, expected):
+    return (set(actual)==set(expected) and all(actual[k]['payload']==expected[k]['payload']
+        and _vector_equal(actual[k]['vector'],expected[k]['vector']) for k in actual))
+
+
+def _verify_document(plan, client, mode):
+    from ops import restore_cached_points as restore
+    p=plan['paper']; aid=p['arxiv_id']
+    if _document_binding(plan)!=plan['binding_sha256']: raise RepairError('whole-document journal binding drift')
+    if _document_policy_binding()!=p['admission_policy']: raise RepairError('prepared admission policy changed')
+    restore._read(p['source_path'],p['source_sha256'])
+    if _snapshot_revision(p['artifact'],p['cache_sha256'])!=p['revision']:
+        raise RepairError('whole-document candidate artifact binding drift')
+    old_points={x['id']:x for x in p['points_before']};candidate_points={x['id']:x for x in p['artifact']['points']}
+    for new_id,old_id in p.get('embedding_reuse',{}).items():
+        old=old_points[old_id];new=candidate_points[new_id]
+        if old['payload'].get('text')!=new['payload'].get('text') or old['vector']!=new['vector']:
+            raise RepairError('whole-document baseline embedding proof drift')
+    def allowed(actual,before,after):
+        choices=[before,after] if mode=='partial' else [before if mode=='before' else after]
+        if actual not in choices: raise RepairError('whole-document surface drift')
+    for item in p['files']:
+        path=Path(item['path']); raw=document_cache.read_bounded(path) if path.exists() else None
+        allowed(raw,_decode(item['before']) if item['before'] is not None else None,_decode(item['after']))
+    for item in p['retained_artifacts']:
+        path=document_cache._plain_path(item['path'])
+        raw=document_cache.read_bounded(path,64*1024*1024) if path.exists() else None
+        if (labels._sha(raw) if raw is not None else None)!=item['sha256']:
+            raise RepairError('retained parent artifact drift')
+    path=Path(p['artifact_path'])
+    if path.exists() and path.read_bytes()!=_jbytes(p['artifact']): raise RepairError('candidate artifact collision')
+    for collection,before_list,after_list in (
+            ('papers_fulltext',p['points_before'],p['artifact']['points']),
+            ('papers_coarse_base',p['coarse_before'],p['coarse_after'])):
+        before={x['id']:x for x in before_list}; after={x['id']:x for x in after_list}
+        live=_scroll(client,collection,aid)
+        global_points=restore._retrieve(client,collection,list(set(before)|set(after)))
+        if set(global_points)!=set(live): raise RepairError('replacement UUID acquired a foreign owner')
+        if mode=='partial':
+            if not set(live)<=set(before)|set(after): raise RepairError('unexpected partial replacement UUID')
+            for pid,x in live.items():
+                if not any(_document_equal_points({pid:x},{pid:choices[pid]}) for choices in (before,after) if pid in choices):
+                    raise RepairError('partial replacement point drift')
+        elif not _document_equal_points(live,before if mode=='before' else after):
+            raise RepairError('whole-document Qdrant set/content drift')
+        other='papers_coarse_base' if collection=='papers_fulltext' else 'papers_fulltext'
+        if restore._retrieve(client,other,list(set(before)|set(after))): raise RepairError('cross-family replacement UUID collision')
+    state=labels._connect(plan['state_db'],readonly=True); fts=labels._connect(plan['fts_db'],readonly=True)
+    pf=labels._connect(plan['paper_fts_db'],readonly=True)
+    try:
+        if labels._exists(state,'paper_active') and state.execute('SELECT 1 FROM paper_active WHERE arxiv_id=?',(aid,)).fetchone():
+            raise RepairError('managed document acquired ownership')
+        allowed(_paper_row(state,aid),p['state_before'],p['state_after'])
+        pubs=_document_rows(state,'paper_publications',aid)
+        choices=[p['publications_before']] if mode in ('before','partial') else []
+        if mode!='before': choices += [_document_publications(p),_document_publications(p,True)]
+        if sorted(pubs) not in [sorted(x) for x in choices]: raise RepairError('publication journal drift')
+        if mode=='published' and sorted(pubs)!=sorted(_document_publications(p,True)):
+            raise RepairError('replacement publication not switched')
+        allowed(sorted(_document_fts_rows(fts,aid)),sorted(p['fts_before']),sorted(p['fts_after']))
+        for table,old in p['catalog_before'].items():
+            allowed(sorted(_document_rows(fts,table,aid,'chunks')),sorted(old),sorted(p['catalog_after'][table]))
+        if fts.execute('SELECT complete FROM pipeline_fts_scope WHERE singleton=1').fetchone()!=(1,):
+            raise RepairError('FTS catalog completeness drift')
+        for row in p['fts_after']:
+            actual=fts.execute('SELECT arxiv_id FROM chunks WHERE rowid=?',(row[0],)).fetchone()
+            owner=fts.execute('SELECT arxiv_id FROM pipeline_fts_points WHERE point_id=?',(row[2],)).fetchone()
+            if (actual and actual!=(aid,)) or (owner and owner!=(aid,)):
+                raise RepairError('candidate FTS row/UUID foreign collision')
+        allowed(sorted(_document_paper_fts_rows(pf,aid)),sorted(p['paper_fts_before']),sorted(p['paper_fts_after']))
+        for table,old in p['paper_catalog_before'].items():
+            allowed(sorted(_document_rows(pf,table,aid,'papers_fts')),sorted(old),sorted(p['paper_catalog_after'][table]))
+        for row in p['paper_fts_after']:
+            actual=pf.execute('SELECT arxiv_id FROM papers_fts WHERE rowid=?',(row[0],)).fetchone()
+            if actual and actual!=(aid,): raise RepairError('candidate paper FTS row foreign collision')
+    finally: state.close();fts.close();pf.close()
+
+
+def _write_document(plan, client, forward):
+    p=plan['paper'];aid=p['arxiv_id'];side='after' if forward else 'before'
+    # Upload the entire valid candidate before retiring old-only IDs. Reused IDs
+    # are safe solely under the explicit gate and complete before-image journal.
+    for collection,before,after in (('papers_fulltext',p['points_before'],p['artifact']['points']),
+            ('papers_coarse_base',p['coarse_before'],p['coarse_after'])):
+        points=after if forward else before
+        for start in range(0,len(points),200): client.upsert(collection_name=collection,points=points[start:start+200],wait=True)
+        remove=list({x['id'] for x in (before if forward else after)}-{x['id'] for x in points})
+        for start in range(0,len(remove),200): client.delete(collection_name=collection,points_selector=remove[start:start+200],wait=True)
+    for db,table,rows,tables in ((plan['fts_db'],'chunks',p['fts_'+side],p['catalog_'+side]),
+            (plan['paper_fts_db'],'papers_fts',p['paper_fts_'+side],p['paper_catalog_'+side])):
+        conn=labels._connect(db)
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            owned=_document_fts_rows(conn,aid) if table=='chunks' else _document_paper_fts_rows(conn,aid)
+            conn.executemany('DELETE FROM '+table+' WHERE rowid=?',[(row[0],) for row in owned])
+            columns='rowid,text,point_id,arxiv_id,section_type,element_type,layers,year' if table=='chunks' else 'rowid,arxiv_id,title,abstract,layers,year'
+            conn.executemany('INSERT INTO '+table+'('+columns+') VALUES('+','.join('?' for _ in columns.split(','))+')',rows)
+            for name,values in tables.items():
+                if name in ('pipeline_fts_rows','pipeline_fts_papers'):
+                    conn.execute('DELETE FROM '+name+' WHERE table_name=? AND arxiv_id=?',(table,aid))
+                else: conn.execute('DELETE FROM '+name+' WHERE arxiv_id=?',(aid,))
+                if values: conn.executemany('INSERT INTO '+name+' VALUES('+','.join('?' for _ in values[0])+')',values)
+            conn.commit()
+        finally: conn.close()
+    conn=labels._connect(plan['state_db'])
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        row=p['state_'+side];cols=[k for k in row if k!='arxiv_id']
+        if not all(k.isidentifier() for k in cols): raise RepairError('invalid state projection columns')
+        conn.execute('UPDATE papers SET '+','.join('"'+k+'"=?' for k in cols)+' WHERE arxiv_id=?',[row[k] for k in cols]+[aid])
+        conn.commit()
+    finally: conn.close()
+    for item in p['files']:
+        raw=item[side];path=Path(item['path'])
+        if raw is None: path.unlink(missing_ok=True)
+        else: labels._atomic(path,_decode(raw))
+
+
+def _write_document_publications(plan, rows):
+    conn=labels._connect(plan['state_db'])
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        conn.execute('DELETE FROM paper_publications WHERE arxiv_id=?',(plan['paper']['arxiv_id'],))
+        if rows: conn.executemany('INSERT INTO paper_publications(arxiv_id,revision,kind,artifact_path,cache_sha256,state,completed,retry_after,error_code) VALUES(?,?,?,?,?,?,?,?,?)',rows)
+        conn.commit()
+    finally: conn.close()
+
+
+def _apply_document(path,plan,client,maintenance):
+    if maintenance is not True: raise RepairError('whole-document replacement requires reader and writer maintenance')
+    if plan['phase']!='prepared': raise RepairError('whole-document replacement must be prepared')
+    _verify_document(plan,client,'before')
+    _checkpoint(path,plan,'applying')
+    try:
+        labels._atomic(plan['paper']['artifact_path'],_jbytes(plan['paper']['artifact']))
+        _write_document_publications(plan,_document_publications(plan['paper']))
+        _write_document(plan,client,True)
+        _verify_document(plan,client,'after')
+        _write_document_publications(plan,_document_publications(plan['paper'],True))
+        _verify_document(plan,client,'published')
+        _checkpoint(path,plan,'applied')
+    except Exception:
+        _rollback_document(path,plan,client,maintenance)
+        raise
+    return plan
+
+
+def _rollback_document(path,plan,client,maintenance):
+    if maintenance is not True: raise RepairError('whole-document rollback requires reader and writer maintenance')
+    if plan['phase'] not in ('applying','applied','rolling_back'): raise RepairError('no whole-document replacement to roll back')
+    _verify_document(plan,client,'partial')
+    _checkpoint(path,plan,'rolling_back')
+    _write_document(plan,client,False)
+    _write_document_publications(plan,plan['paper']['publications_before'])
+    _verify_document(plan,client,'before')
+    _checkpoint(path,plan,'rolled_back')
+    return plan
 
 
 def _snapshot_revision(artifact, cache_sha):
@@ -331,7 +745,10 @@ def prepare_plan(changes, *, state_db, fts_db, cache_dir, section_cache_dir,
 
 
 def _load(path):
-    plan = json.loads(Path(path).read_text(encoding='utf-8'))
+    raw = Path(path).read_bytes()
+    if raw.startswith(b'\x1f\x8b'):
+        raw = gzip.decompress(raw)
+    plan = json.loads(raw)
     if plan.get('schema') != 1 or plan.get('kind') != 'published-label-replacement':
         raise RepairError('invalid replacement journal')
     return plan
@@ -435,7 +852,10 @@ def _verify(plan, qdrant, mode):
 
 def _checkpoint(path, plan, phase):
     plan['phase'] = phase
-    labels._atomic(path, _jbytes(plan))
+    with Path(path).open('rb') as journal:
+        compressed = journal.read(2) == b'\x1f\x8b'
+    raw = _jbytes(plan)
+    labels._atomic(path, gzip.compress(raw, compresslevel=1, mtime=0) if compressed else raw)
 
 
 def _switch(plan, forward):
@@ -468,6 +888,8 @@ def _switch(plan, forward):
 
 def apply_plan(journal_path, *, qdrant, maintenance=False):
     plan = _load(journal_path); paper = plan['paper']
+    if plan.get('operation') == 'whole-document':
+        return _apply_document(journal_path, plan, qdrant, maintenance)
     if plan.get('operation') in ('orphan-adoption','receipt-withdrawal') and maintenance is not True:
         raise RepairError('snapshot transition requires reader and writer maintenance')
     if plan['phase'] != 'prepared':
@@ -575,6 +997,8 @@ def _write_surfaces(plan,client,forward):
 
 def rollback_plan(journal_path, *, qdrant, maintenance=False):
     plan = _load(journal_path)
+    if plan.get('operation') == 'whole-document':
+        return _rollback_document(journal_path, plan, qdrant, maintenance)
     if plan.get('operation') in ('orphan-adoption','receipt-withdrawal') and maintenance is not True:
         raise RepairError('snapshot transition requires reader and writer maintenance')
     if plan['phase'] not in ('applying','applied','rolling_back'):
