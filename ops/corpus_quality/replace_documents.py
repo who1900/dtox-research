@@ -7,6 +7,7 @@ gate. The existing snapshot owner writes every corpus surface and its journal.
 from __future__ import annotations
 
 import argparse
+import errno
 from contextlib import ExitStack, contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -18,6 +19,8 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
+from email.utils import parsedate_to_datetime
 import sqlite3
 import subprocess
 import time
@@ -44,6 +47,10 @@ PHASE_KEYS = ('acquisition_queue_wait_seconds', 'source_resolution_seconds',
 
 class WorkerError(RuntimeError):
     """A shared dependency or unsafe worker state prevents this run."""
+
+
+class RetryableWorkerError(WorkerError):
+    """A known temporary shared service outage; a managed run may restart."""
 
 
 class DeferredPaper(RuntimeError):
@@ -205,6 +212,9 @@ def _update(base, paper_id, status, *, reason=None, journal_path=None, metrics=N
                                  (paper_id,)).fetchone()
             old_metrics = json.loads(prior[0] or '{}') if prior else {}
             if metrics is not None:
+                metrics = dict(metrics)
+                if 'source_transport_retry_passes' in old_metrics:
+                    metrics.setdefault('source_transport_retry_passes', old_metrics['source_transport_retry_passes'])
                 new_metrics = dict(metrics)
                 active = conn.execute("SELECT value FROM meta WHERE key='active_run'").fetchone()
                 if active:
@@ -237,6 +247,9 @@ def _update_metrics(base, paper_id, metrics):
             prior = conn.execute('SELECT metrics_json FROM targets WHERE paper_id=?',
                                  (paper_id,)).fetchone()
             old_metrics = json.loads(prior[0] or '{}') if prior else {}
+            metrics = dict(metrics)
+            if 'source_transport_retry_passes' in old_metrics:
+                metrics.setdefault('source_transport_retry_passes', old_metrics['source_transport_retry_passes'])
             active = conn.execute("SELECT value FROM meta WHERE key='active_run'").fetchone()
             if active:
                 run = json.loads(active[0])
@@ -481,16 +494,13 @@ def _load_runtime(base, root=ROOT):
     if not endpoint.startswith('http://127.0.0.1:') or not endpoint.endswith('/embed_batch'):
         raise WorkerError('unexpected configured document embedding endpoint')
     health_url = endpoint[:-len('/embed_batch')] + '/healthz'
-    try:
-        with urllib.request.urlopen(health_url, timeout=5) as response:
-            health_value = json.load(response)
-        if health_value.get('status') != 'ok':
-            raise WorkerError('document embedding endpoint is not healthy')
-    except (OSError, ValueError, urllib.error.URLError) as exc:
-        raise WorkerError('document embedding endpoint preflight failed') from exc
+    _check_health(health_url, 'document embedding endpoint')
     client = run_label_worker.Qdrant()
     for collection in ('papers_fulltext', 'papers_coarse_base'):
-        client.request('/collections/' + collection, {}, method='GET')
+        try:
+            client.request('/collections/' + collection, {}, method='GET')
+        except Exception as exc:
+            raise _shared_failure('Qdrant preflight failed', exc) from exc
     fts = restore.labels._connect(paths['fts_db'], readonly=True)
     try:
         restore._catalog(fts)
@@ -588,13 +598,17 @@ def _embedder(runtime, metrics):
                 with urllib.request.urlopen(request, timeout=180) as response:
                     result = json.load(response)
             except (OSError, ValueError, urllib.error.URLError) as exc:
-                raise WorkerError('document embedding batch failed') from exc
+                raise _shared_failure('document embedding batch failed', exc) from exc
             metrics['embedding_seconds'] = metrics.get('embedding_seconds', 0.0) + time.monotonic() - started
             metrics['embedding_batch_sizes'] = metrics.get('embedding_batch_sizes', []) + [len(batch)]
             part = result.get('vectors') if isinstance(result, dict) else None
             if not isinstance(part, list) or len(part) != len(batch):
                 raise WorkerError('document embedding count mismatch')
             for index, vector in zip(indices, part):
+                if (not isinstance(vector, list) or len(vector) != 384
+                        or any(type(value) not in (int, float) or not math.isfinite(value) for value in vector)
+                        or abs(math.sqrt(sum(value * value for value in vector)) - 1) > 1e-3):
+                    raise WorkerError('document embedding vector is invalid')
                 vectors[index] = vector
         return vectors
     return embed
@@ -814,16 +828,24 @@ def maintenance_gate(base, worker, paper_ids, *, cleanup=None):
         raise
     finally:
         if gate.get('safe_to_restore'):
+            checking_health = False
             try:
+                gate.update(phase='closed', attention_required=False, updated_at=utc_now())
+                _atomic_json(marker_path, gate)
                 if was_active:
                     worker.systemctl('start', API_UNIT)
-                    worker.health()
+                    checking_health = True
+                    _wait_for_api()
                 gate.update(phase='restored', attention_required=False,
                             restored_at=utc_now(), updated_at=utc_now())
                 _atomic_json(marker_path, gate)
-            except BaseException:
-                gate.update(phase='closed', attention_required=True, updated_at=utc_now())
+            except BaseException as exc:
+                transient = checking_health and (isinstance(exc, RetryableWorkerError)
+                                                 or (isinstance(exc, Exception) and _transport_failure(exc)))
+                gate.update(phase='closed', attention_required=not transient, updated_at=utc_now())
                 _atomic_json(marker_path, gate)
+                if transient:
+                    raise RetryableWorkerError('API restore health temporarily unavailable') from exc
                 raise
         else:
             gate.update(phase='closed', attention_required=True, updated_at=utc_now())
@@ -898,26 +920,103 @@ def _document_scoped_error(exc, runtime):
         return False
     import requests
     return isinstance(exc, (runtime['fresh'].FreshSourceError, urllib.error.HTTPError,
-                            requests.exceptions.RequestException))
+                            requests.exceptions.RequestException)) or _transport_failure(exc, runtime)
 
 
-def _transport_failure(exc, runtime):
+def _transport_failure(exc, runtime=None):
     import requests
-    if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+    if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+                        TimeoutError, ConnectionError, socket.gaierror)):
         return True
+    if isinstance(exc, requests.exceptions.HTTPError):
+        return exc.response is not None and (exc.response.status_code == 429
+                                             or 500 <= exc.response.status_code <= 599)
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code == 429 or 500 <= exc.code <= 599
     if isinstance(exc, urllib.error.URLError):
+        return _transport_failure(exc.reason)
+    if isinstance(exc, OSError) and exc.errno in (errno.ECONNREFUSED, errno.ECONNRESET,
+                                                errno.ETIMEDOUT, errno.ENETUNREACH, errno.EHOSTUNREACH):
         return True
+    if runtime is None:
+        return False
+    dependency = getattr(runtime['fresh'], 'FreshSourceDependencyError', None)
+    if dependency is not None and isinstance(exc, dependency):
+        return False
+    status = getattr(exc, 'status_code', None)
+    if isinstance(exc, runtime['fresh'].FreshSourceError) and isinstance(status, int):
+        return status == 429 or 500 <= status <= 599
     return isinstance(exc, runtime['fresh'].FreshSourceError) and bool(
-        re.search(r'\bHTTP\s+(?:429|5\d\d)\b|non-200', str(exc), re.I))
+        re.search(r'\bHTTP\s+(?:429|5\d\d)\b', str(exc), re.I))
+
+
+def _retry_delay(exc, attempt):
+    headers = getattr(exc, 'headers', None)
+    response = getattr(exc, 'response', None)
+    if headers is None and response is not None:
+        headers = response.headers
+    value = headers.get('Retry-After') if headers else None
+    if value is not None:
+        try:
+            delay = float(value)
+        except (TypeError, ValueError):
+            try:
+                delay = parsedate_to_datetime(value).timestamp() - time.time()
+            except (TypeError, ValueError, OverflowError):
+                delay = None
+        if delay is not None and math.isfinite(delay):
+            return max(0.0, min(60.0, delay))
+    return (5.0, 15.0)[attempt]
+
+
+def _source_attempt(call, runtime, sleeper=None):
+    sleeper = sleeper or time.sleep
+    for attempt in range(3):
+        try:
+            return call()
+        except Exception as exc:
+            if not _transport_failure(exc, runtime):
+                raise
+            if attempt == 2:
+                raise DeferredPaper('source_transport_retries_exhausted:' + type(exc).__name__
+                                    + ':' + str(exc)[:240]) from exc
+            sleeper(_retry_delay(exc, attempt))
+
+
+def _shared_failure(message, exc):
+    error = RetryableWorkerError if _transport_failure(exc) else WorkerError
+    return error(message)
+
+
+def _check_health(url, name):
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            value = json.load(response)
+    except Exception as exc:
+        raise _shared_failure(name + ' preflight failed', exc) from exc
+    if not isinstance(value, dict) or not isinstance(value.get('status'), str):
+        raise WorkerError(name + ' returned invalid health receipt')
+    if value['status'] != 'ok':
+        raise RetryableWorkerError(name + ' is temporarily unhealthy')
+
+
+def _wait_for_api(sleeper=None):
+    sleeper = sleeper or time.sleep
+    for attempt in range(30):
+        try:
+            _check_health('http://127.0.0.1:8010/v1/health', 'API restore')
+            return
+        except RetryableWorkerError:
+            if attempt == 29:
+                raise
+            sleeper(1)
 
 
 def _acquire_one(paper_id, state, runtime, base, queued_at=None):
     task_started = time.monotonic()
     queue_wait = max(0.0, task_started - queued_at) if queued_at is not None else 0.0
     resolver_started = time.monotonic()
-    request = _fresh_request(state, runtime['fresh'])
+    request = _source_attempt(lambda: _fresh_request(state, runtime['fresh']), runtime)
     resolver_seconds = time.monotonic() - resolver_started
     stage = Path(base) / 'source-stage' / runtime['document_cache'].safe_id(paper_id)
     kwargs = dict(timeout=120, native_build=str(NATIVE_BUILD), original_store_root=str(ORIGINAL_STORE))
@@ -932,14 +1031,12 @@ def _acquire_one(paper_id, state, runtime, base, queued_at=None):
         name = route['fresh_kind']
         route_attempts.append(name)
         try:
-            candidate_result = runtime['fresh'].acquire_and_parse(route, stage, **kwargs)
+            candidate_result = _source_attempt(
+                lambda: runtime['fresh'].acquire_and_parse(route, stage, **kwargs), runtime)
         except getattr(runtime['fresh'], 'FreshSourceDependencyError', WorkerError):
             raise
         except runtime['fresh'].FreshSourceError as exc:
-            # A document-specific 429/5xx/timeout is deferred once. Alternate
-            # source routes are for route/parser failures, not transport retries.
-            if _transport_failure(exc, runtime):
-                raise
+            # Transport retries are exhausted by _source_attempt before route fallback.
             route_rejections.append({'route': name, 'reason': type(exc).__name__ + ':' + str(exc)[:240]})
             continue
         diagnostics = candidate_result.get('diagnostics') or {}
@@ -970,7 +1067,12 @@ def _preflight_apply(plans, runtime):
         plan = runtime['owner']._load(journal)
         if plan.get('phase') != 'prepared':
             raise WorkerError('only prepared owner journals may enter the apply gate')
-        runtime['owner']._verify_document(plan, runtime['client'], 'before')
+        try:
+            runtime['owner']._verify_document(plan, runtime['client'], 'before')
+        except Exception as exc:
+            if _transport_failure(exc):
+                raise RetryableWorkerError('Qdrant apply preflight unavailable') from exc
+            raise
 
 
 def _recover_batch_plans(plans, runtime, base):
@@ -1077,9 +1179,14 @@ def _locks(base):
         yield
 
 
+def _check_storage(base):
+    if shutil.disk_usage(base).free < 2 * 1024 ** 3:
+        raise WorkerError('storage_headroom: less than 2 GiB free; remaining targets retained')
+
+
 def _runtime_preflight(runtime, worker):
     if worker.systemctl('show', API_UNIT, '--value', '--property=ActiveState') == 'active':
-        worker.health()
+        _check_health('http://127.0.0.1:8010/v1/health', 'API')
     states = _service_states(worker)
     if any(value not in ('inactive', 'failed') for value in states.values()):
         raise WorkerError('ingestion writer is active: ' + json.dumps(states, sort_keys=True))
@@ -1130,12 +1237,10 @@ def run(base=BASE, root=ROOT, *, papers=None, limit=None, retry_deferred=False):
         finally:
             conn.close()
         write_status(base)
-        consecutive_transport_failures = 0
         for group in batched(selected, PREFETCH_WORKERS):
             # Leave space for database and rollback writes as raw sources and
             # journals grow. The remaining queue survives this operational stop.
-            if shutil.disk_usage(base).free < 2 * 1024 ** 3:
-                raise WorkerError('storage_headroom: less than 2 GiB free; remaining targets retained')
+            _check_storage(base)
             resumable = {}
             for record in group:
                 path = record.get('journal_path')
@@ -1162,18 +1267,10 @@ def run(base=BASE, root=ROOT, *, papers=None, limit=None, retry_deferred=False):
                         record = futures[future]
                         try:
                             acquired[record['paper_id']] = future.result()
-                            consecutive_transport_failures = 0
                         except DeferredPaper as exc:
-                            consecutive_transport_failures = 0
                             _record_error(base, record['paper_id'], exc, {}, defer=True)
                         except Exception as exc:
                             if _document_scoped_error(exc, runtime):
-                                if _transport_failure(exc, runtime):
-                                    consecutive_transport_failures += 1
-                                    if consecutive_transport_failures >= 3:
-                                        raise WorkerError('repeated source transport failures; stopping dispatch') from exc
-                                else:
-                                    consecutive_transport_failures = 0
                                 _record_error(base, record['paper_id'], exc, {}, defer=True)
                             else:
                                 raise WorkerError('shared source acquisition/parser dependency failed') from exc
@@ -1197,6 +1294,7 @@ def run(base=BASE, root=ROOT, *, papers=None, limit=None, retry_deferred=False):
                         0.0, time.monotonic() - candidate_started - metrics.get('embedding_seconds', 0.0))
                     journal = _journal_path(base, paper_id, runtime['document_cache'])
                     _update(base, paper_id, 'staging', reason=None, journal_path=journal, metrics=metrics)
+                    _check_storage(base)
                     prepare_started = time.monotonic()
                     plan = runtime['owner'].prepare_document_replacement(
                         paper_id, candidate=candidate, **runtime['paths'], journal_path=journal,
@@ -1216,6 +1314,7 @@ def run(base=BASE, root=ROOT, *, papers=None, limit=None, retry_deferred=False):
                 except WorkerError:
                     raise
             if prepared:
+                _check_storage(base)
                 _apply_batch(prepared, runtime, base, worker)
                 for paper_id, journal, metrics in prepared:
                     current = _get_targets(base, ('applied',), [paper_id])
@@ -1248,10 +1347,42 @@ def run(base=BASE, root=ROOT, *, papers=None, limit=None, retry_deferred=False):
         return write_status(base, run_status)
 
 
+def _transport_retry_targets(base):
+    # One extra managed pass after ordinary work drains; retain this allowance
+    # in the existing durable ledger across restarts and metric replacement.
+    if _get_targets(base, ('pending', 'staging', 'prepared')):
+        return []
+    selected = []
+    for row in _get_targets(base, ('deferred',)):
+        metrics = json.loads(row['metrics_json'] or '{}')
+        reason = row.get('reason') or ''
+        transport = ('source_transport_retries_exhausted:' in reason
+                     or bool(re.match(r'(?:ReadTimeout|ConnectTimeout|Timeout|ConnectionError|URLError):', reason))
+                     or bool(re.search(r'\bHTTP\s+(?:Error\s*)?(?:429|5\d\d)\b', reason)))
+        if transport and metrics.get('source_transport_retry_passes', 0) < 1:
+            selected.append(row['paper_id'])
+            metrics['source_transport_retry_passes'] = 1
+            _update(base, row['paper_id'], 'pending',
+                    reason='source_transport_delayed_retry_claimed', metrics=metrics)
+    return selected
+
+
+def api_startup_check(base):
+    try:
+        gate = json.loads((Path(base) / 'maintenance-gate.json').read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return 0
+    except (OSError, ValueError):
+        return 1
+    return 0 if (isinstance(gate, dict) and gate.get('phase') in ('closed', 'restored')
+                 and gate.get('safe_to_restore') is True
+                 and gate.get('attention_required') is False) else 1
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
-    for name in ('init','status'):
+    for name in ('init','status','api-startup-check'):
         item = sub.add_parser(name)
         item.add_argument('--base', type=Path, default=BASE)
     work = sub.add_parser('run')
@@ -1260,16 +1391,54 @@ def main(argv=None):
     work.add_argument('--paper', action='append', default=[])
     work.add_argument('--limit', type=int)
     work.add_argument('--retry-deferred', action='store_true')
+    work.add_argument('--managed', action='store_true')
     args = parser.parse_args(argv)
+    if args.command == 'api-startup-check':
+        return api_startup_check(args.base)
     if args.command == 'init':
         result = initialize(args.base)
     elif args.command == 'status':
         result = status_snapshot(args.base)
     else:
-        result = run(args.base, args.root, papers=args.paper, limit=args.limit,
-                     retry_deferred=args.retry_deferred)
+        if args.managed:
+            path = args.base / 'bulk-controller-status.json'
+            def lifecycle(phase, status, cause=None, **details):
+                _atomic_json(path, dict(worker_pid=os.getpid(), phase=phase, time=time.time(),
+                                        status=status, cause=cause, **details))
+            try:
+                _atomic_json(args.base / 'bulk-controller.pid', os.getpid())
+                lifecycle('bulk_running', 'running')
+                result = run(args.base, args.root, papers=args.paper, limit=args.limit,
+                             retry_deferred=args.retry_deferred)
+                # Explicit bounded subsets and manual retry selections keep their scope.
+                if not args.paper and args.limit is None and not args.retry_deferred:
+                    retry_ids = _transport_retry_targets(args.base)
+                    if retry_ids:
+                        lifecycle('bulk_running', 'retry_wait', 'source_transport_delayed_pass',
+                                  retry_documents=len(retry_ids))
+                        time.sleep(60)
+                        lifecycle('bulk_running', 'running')
+                        result = run(args.base, args.root, papers=retry_ids)
+                counts = result.get('statuses', {})
+                lifecycle('bulk_complete', 'pass_complete',
+                          deferred_documents=counts.get('deferred', 0),
+                          failed_documents=counts.get('failed', 0),
+                          whole_corpus_quality_complete=False)
+            except Exception as exc:
+                retryable = isinstance(exc, RetryableWorkerError)
+                try:
+                    lifecycle('bulk_interrupted', 'retry_wait' if retryable else 'needs_attention',
+                              type(exc).__name__ + ':' + str(exc)[:300])
+                except OSError:
+                    retryable = False  # A durable lifecycle write failure needs operator attention.
+                print(json.dumps(dict(error=type(exc).__name__, retryable=retryable)), file=sys.stderr)
+                return 75 if retryable else 78
+        else:
+            result = run(args.base, args.root, papers=args.paper, limit=args.limit,
+                         retry_deferred=args.retry_deferred)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

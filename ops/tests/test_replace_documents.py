@@ -210,11 +210,258 @@ class RecoveryTests(unittest.TestCase):
 
             runtime = {'owner': Owner, 'client': object()}
             worker_state = FakeWorker()
-            with self.assertRaises(KeyboardInterrupt):
+            with patch.object(worker, '_wait_for_api'), self.assertRaises(KeyboardInterrupt):
                 worker._apply_batch([('p1', journal, {})], runtime, base, worker_state)
             self.assertTrue(worker_state.api_active)
             self.assertEqual(Owner._load(journal)['phase'], 'rolled_back')
             self.assertEqual(worker._get_targets(base, ('failed',))[0]['paper_id'], 'p1')
+
+
+class FaultPolicyTests(unittest.TestCase):
+    def runtime(self):
+        from ops.corpus_quality import fresh_sources
+        return {'fresh': fresh_sources}
+
+    def test_source_transport_retries_then_succeeds(self):
+        from unittest.mock import Mock
+        call = Mock(side_effect=[TimeoutError('slow'), ConnectionRefusedError('down'), 'ok'])
+        waits = []
+        self.assertEqual(worker._source_attempt(call, self.runtime(), waits.append), 'ok')
+        self.assertEqual(waits, [5, 15])
+        self.assertEqual(call.call_count, 3)
+
+    def test_four_unrelated_transport_failures_each_defer(self):
+        from unittest.mock import Mock
+        for _ in range(4):
+            call = Mock(side_effect=TimeoutError('slow'))
+            with self.assertRaises(worker.DeferredPaper):
+                worker._source_attempt(call, self.runtime(), lambda _: None)
+            self.assertEqual(call.call_count, 3)
+
+    def test_run_continues_after_four_source_transport_failures(self):
+        import requests
+        from concurrent.futures import Future
+        class ImmediatePool:
+            def __init__(self, **kwargs):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def submit(self, call, *args):
+                future = Future()
+                try:
+                    future.set_result(call(*args))
+                except Exception as exc:
+                    future.set_exception(exc)
+                return future
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            conn = worker._connect(worker.db_path(base))
+            worker._schema(conn)
+            conn.executemany("INSERT INTO targets(paper_id,cache_ufffd,source_ufffd,empty_fulltext,status,created_at,updated_at) VALUES(?,0,0,0,'pending','now','now')",
+                             [(f'p{i}',) for i in range(4)])
+            conn.commit()
+            conn.close()
+            runtime = dict(self.runtime(), owner=object(), client=object(), worker=object(),
+                           document_cache=types.SimpleNamespace(safe_id=lambda value: value))
+            with patch.object(worker, '_locks', return_value=contextlib.nullcontext()), \
+                    patch.object(worker, '_load_runtime', return_value=runtime), \
+                    patch.object(worker, '_runtime_preflight'), patch.object(worker, '_rowid_floors', return_value={}), \
+                    patch.object(worker, '_check_storage'), \
+                    patch.object(worker, 'ThreadPoolExecutor', ImmediatePool), \
+                    patch.object(worker.os, 'kill', return_value=None), \
+                    patch.object(worker, '_state_row', return_value={}), \
+                    patch.object(worker, '_acquire_one', side_effect=requests.exceptions.ReadTimeout('slow')) as acquire:
+                result = worker.run(base, base)
+            self.assertEqual(acquire.call_count, 4)
+            self.assertEqual(result['statuses'], {'deferred': 4})
+
+    def test_http_retry_after_is_bounded_and_404_not_retried(self):
+        from unittest.mock import Mock
+        from ops.corpus_quality import fresh_sources
+        response = types.SimpleNamespace(status_code=429, headers={'Retry-After': '999'})
+        error = fresh_sources._http_failure('HTTP 429', response)
+        waits = []
+        call = Mock(side_effect=[error, 'ok'])
+        self.assertEqual(worker._source_attempt(call, self.runtime(), waits.append), 'ok')
+        self.assertEqual(waits, [60])
+        response.status_code = 404
+        error = fresh_sources._http_failure('non-200', response)
+        call = Mock(side_effect=error)
+        with self.assertRaises(fresh_sources.FreshSourceError):
+            worker._source_attempt(call, self.runtime(), waits.append)
+        self.assertEqual(call.call_count, 1)
+
+    def test_unknown_dependency_and_cancellation_do_not_retry(self):
+        from unittest.mock import Mock
+        from ops.corpus_quality import fresh_sources
+        for error in (ValueError('parse bug'), fresh_sources.FreshSourceDependencyError('HTTP 503'),
+                      KeyboardInterrupt()):
+            call = Mock(side_effect=error)
+            with self.assertRaises(type(error)):
+                worker._source_attempt(call, self.runtime(), lambda _: self.fail('unexpected sleep'))
+            self.assertEqual(call.call_count, 1)
+
+    def test_shared_service_fault_classification(self):
+        import urllib.error
+        for error in (TimeoutError(), urllib.error.HTTPError('url', 503, 'down', {}, None),
+                      urllib.error.URLError(ConnectionRefusedError())):
+            self.assertIsInstance(worker._shared_failure('outage', error), worker.RetryableWorkerError)
+        for error in (ValueError(), OSError('disk'),
+                      urllib.error.HTTPError('url', 400, 'bad', {}, None)):
+            self.assertNotIsInstance(worker._shared_failure('fatal', error), worker.RetryableWorkerError)
+
+    def test_embedding_outage_is_retryable_bad_json_and_vectors_are_fatal(self):
+        runtime = {'recipe': {'endpoint': 'http://127.0.0.1:99/embed_batch'}}
+        for error in (TimeoutError(), ValueError('invalid JSON')):
+            with patch.object(worker.urllib.request, 'urlopen', side_effect=error):
+                with self.assertRaises(worker.WorkerError) as caught:
+                    worker._embedder(runtime, {})(['text'])
+            self.assertEqual(isinstance(caught.exception, worker.RetryableWorkerError),
+                             isinstance(error, TimeoutError))
+        for value in ({'vectors': []}, {'vectors': [[0.0] * 384]}):
+            with patch.object(worker.urllib.request, 'urlopen', return_value=contextlib.nullcontext(None)), \
+                    patch.object(worker.json, 'load', return_value=value):
+                with self.assertRaises(worker.WorkerError) as caught:
+                    worker._embedder(runtime, {})(['text'])
+            self.assertNotIsInstance(caught.exception, worker.RetryableWorkerError)
+
+    def test_health_preflight_classifies_outage_and_invalid_receipt(self):
+        with patch.object(worker.urllib.request, 'urlopen', side_effect=ConnectionRefusedError()):
+            with self.assertRaises(worker.RetryableWorkerError):
+                worker._check_health('http://localhost/health', 'service')
+        with patch.object(worker.urllib.request, 'urlopen', return_value=contextlib.nullcontext(None)), \
+                patch.object(worker.json, 'load', return_value={}):
+            with self.assertRaises(worker.WorkerError) as caught:
+                worker._check_health('http://localhost/health', 'service')
+        self.assertNotIsInstance(caught.exception, worker.RetryableWorkerError)
+
+    def test_api_restore_wait_retries_only_known_transient_health(self):
+        waits = []
+        with patch.object(worker, '_check_health', side_effect=[worker.RetryableWorkerError('down'), None]) as check:
+            worker._wait_for_api(waits.append)
+            self.assertEqual(check.call_count, 2)
+            self.assertEqual(waits, [1])
+        waits.clear()
+        with patch.object(worker, '_check_health', side_effect=worker.WorkerError('invalid JSON')) as check:
+            with self.assertRaises(worker.WorkerError):
+                worker._wait_for_api(waits.append)
+            self.assertEqual(check.call_count, 1)
+            self.assertEqual(waits, [])
+        with patch.object(worker, '_check_health', side_effect=worker.RetryableWorkerError('down')) as check:
+            with self.assertRaises(worker.RetryableWorkerError):
+                worker._wait_for_api(waits.append)
+            self.assertEqual(check.call_count, 30)
+            self.assertEqual(len(waits), 29)
+
+    def test_delayed_pass_selects_only_transport_and_persists_allowance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            conn = worker._connect(worker.db_path(base))
+            worker._schema(conn)
+            conn.executemany("INSERT INTO targets(paper_id,cache_ufffd,source_ufffd,empty_fulltext,status,reason,created_at,updated_at) VALUES(?,0,0,0,'deferred',?,'now','now')",
+                             [('timeout', 'HTTPError:HTTP Error 503:down'), ('transport', 'DeferredPaper:source_transport_retries_exhausted:Timeout'),
+                              ('parser', 'FreshSourceError:invalid HTML'), ('missing', 'FreshSourceError:HTTP 404')])
+            conn.commit()
+            conn.close()
+            with patch.object(worker, 'write_status'):
+                selected = worker._transport_retry_targets(base)
+                self.assertEqual(set(selected), {'timeout', 'transport'})
+                self.assertEqual(worker._transport_retry_targets(base), [])
+                worker._update(base, 'timeout', 'staging', metrics={'fetch_seconds': 2})
+                worker._update_metrics(base, 'transport', {'fetch_seconds': 3})
+            for row in worker._get_targets(base, ('pending', 'staging', 'deferred'), papers=selected):
+                self.assertEqual(json.loads(row['metrics_json'])['source_transport_retry_passes'], 1)
+            self.assertEqual(worker._transport_retry_targets(base), [])
+
+    def test_managed_cli_runs_one_delayed_transport_pass(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(worker, 'run', return_value={'statuses': {'deferred': 2}}) as run, \
+                patch.object(worker, '_transport_retry_targets', return_value=['retry']), \
+                patch.object(worker.time, 'sleep') as sleep:
+            self.assertEqual(worker.main(['run', '--managed', '--base', directory]), 0)
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_args.kwargs['papers'], ['retry'])
+            self.assertNotIn('retry_deferred', run.call_args.kwargs)
+            sleep.assert_called_once_with(60)
+            value = json.loads((Path(directory) / 'bulk-controller-status.json').read_text())
+            self.assertEqual(value['deferred_documents'], 2)
+            self.assertFalse(value['whole_corpus_quality_complete'])
+
+    def test_api_startup_check_accepts_only_missing_or_verified_safe_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'maintenance-gate.json'
+            with patch.object(worker, '_load_runtime', side_effect=AssertionError('runtime loaded')):
+                self.assertEqual(worker.main(['api-startup-check', '--base', directory]), 0)
+                for value, expected in (({'phase': 'closed', 'safe_to_restore': True, 'attention_required': False}, 0),
+                                        ({'phase': 'restored', 'safe_to_restore': True, 'attention_required': False}, 0),
+                                        ({'phase': 'closed', 'safe_to_restore': False, 'attention_required': False}, 1),
+                                        ({'phase': 'closed', 'safe_to_restore': True, 'attention_required': True}, 1),
+                                        ({'phase': 'unknown', 'safe_to_restore': True, 'attention_required': False}, 1),
+                                        ({}, 1), ([], 1), (None, 1)):
+                    path.write_text(json.dumps(value))
+                    self.assertEqual(worker.main(['api-startup-check', '--base', directory]), expected)
+                path.write_text('{invalid')
+                self.assertEqual(worker.main(['api-startup-check', '--base', directory]), 1)
+
+    def test_gate_persists_verified_state_before_api_start_and_preserves_transient_health(self):
+        for health_error in (None, worker.RetryableWorkerError('booting'), ValueError('bad health')):
+            with tempfile.TemporaryDirectory() as directory:
+                base = Path(directory)
+                class Service:
+                    api_active = True
+                    def systemctl(self, action, unit, *args):
+                        if action == 'show':
+                            return 'active' if unit == worker.API_UNIT and self.api_active else 'inactive'
+                        if action == 'stop':
+                            self.api_active = False
+                        elif action == 'start':
+                            self.assert_safe = worker.api_startup_check(base)
+                            if self.assert_safe != 0:
+                                raise AssertionError('API startup blocked by unpersisted verification')
+                            self.api_active = True
+                    def health(self):
+                        if health_error is not None:
+                            raise health_error
+                service = Service()
+                def restore():
+                    with patch.object(worker, '_wait_for_api', side_effect=health_error), \
+                            worker.maintenance_gate(base, service, ['p']) as gate:
+                        gate['safe_to_restore'] = True
+                if health_error is None:
+                    restore()
+                else:
+                    with self.assertRaises(worker.RetryableWorkerError if isinstance(health_error, worker.RetryableWorkerError)
+                                           else ValueError):
+                        restore()
+                marker = json.loads((base / 'maintenance-gate.json').read_text())
+                self.assertEqual(service.assert_safe, 0)
+                self.assertTrue(marker['safe_to_restore'])
+                self.assertEqual(marker['attention_required'], isinstance(health_error, ValueError))
+                self.assertEqual(marker['phase'], 'restored' if health_error is None else 'closed')
+
+    def test_managed_cli_exit_and_lifecycle_classification(self):
+        for error, code, status in ((worker.RetryableWorkerError('service down'), 75, 'retry_wait'),
+                                    (worker.WorkerError('integrity'), 78, 'needs_attention'),
+                                    (ValueError('unknown bug'), 78, 'needs_attention')):
+            with tempfile.TemporaryDirectory() as directory, patch.object(worker, 'run', side_effect=error):
+                self.assertEqual(worker.main(['run', '--managed', '--base', directory]), code)
+                value = json.loads((Path(directory) / 'bulk-controller-status.json').read_text())
+                self.assertEqual(value['worker_pid'], worker.os.getpid())
+                self.assertEqual(int((Path(directory) / 'bulk-controller.pid').read_text()), worker.os.getpid())
+                self.assertEqual(value['phase'], 'bulk_interrupted')
+                self.assertEqual(value['status'], status)
+                self.assertIsInstance(value['time'], float)
+                self.assertIn(str(error), value['cause'])
+        with tempfile.TemporaryDirectory() as directory, patch.object(worker, 'run', return_value={}), \
+                patch.object(worker, '_transport_retry_targets', return_value=[]):
+            self.assertEqual(worker.main(['run', '--managed', '--base', directory]), 0)
+            value = json.loads((Path(directory) / 'bulk-controller-status.json').read_text())
+            self.assertEqual((value['phase'], value['status']), ('bulk_complete', 'pass_complete'))
+        with patch.object(worker, 'run', side_effect=worker.RetryableWorkerError('down')):
+            with self.assertRaises(worker.RetryableWorkerError):
+                worker.main(['run'])
 
 
 if __name__ == '__main__':

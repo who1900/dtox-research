@@ -38,6 +38,32 @@ class _Session:
 
 
 class FreshSourceTests(unittest.TestCase):
+    def test_abs_mobile_breadcrumb_uses_explicit_submission_history_version(self):
+        response = _Response(
+            b'<meta name="citation_title" content="Paper">'
+            b'<div class="header-breadcrumbs-mobile"><strong>arXiv:2606.27708</strong></div>'
+            b'<div class="dateline">[Submitted on 26 Jun 2026]</div>'
+            b'<div class="submission-history"><h2>Submission history</h2>'
+            b'<strong>[v1]</strong> Fri, 26 Jun 2026 04:13:32 UTC</div>')
+        response.url = 'https://arxiv.org/abs/2606.27708'
+        result = fresh_sources._resolve_arxiv_abs_version(
+            '2606.27708', session=_Session(response), timeout=1, started=0,
+            fallback_reason='fixture')
+        self.assertEqual(result['fresh_version'], 'v1')
+
+    def test_abs_conflicting_dateline_and_history_versions_are_rejected(self):
+        response = _Response(
+            b'<meta name="citation_title" content="Paper">'
+            b'<div class="header-breadcrumbs">arXiv:2606.27708</div>'
+            b'<div class="dateline">[Submitted on 26 Jun 2026 (v1), '
+            b'last revised 1 Jul 2026 (this version, v2)]</div>'
+            b'<div class="submission-history"><strong>[v3]</strong></div>')
+        response.url = 'https://arxiv.org/abs/2606.27708'
+        with self.assertRaisesRegex(fresh_sources.FreshSourceError, 'versions disagree'):
+            fresh_sources._resolve_arxiv_abs_version(
+                '2606.27708', session=_Session(response), timeout=1, started=0,
+                fallback_reason='fixture')
+
     def test_acl_pdf_is_bound_to_id_and_raw_hash(self):
         raw = b"%PDF-1.7\nsmall fixture"
         response = _Response(raw)

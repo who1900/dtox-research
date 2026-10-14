@@ -1,0 +1,30 @@
+[Unit]
+Description=DTOX frozen document replacement queue
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+# Known service outages keep retrying at a bounded frequency.
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+User=root
+WorkingDirectory=/opt/dtox-corpus-quality-20261013
+ExecStart=/opt/dtox-extraction-eval-20261012/venv/bin/python -B -m ops.corpus_quality.replace_documents run --managed
+Environment=PYTHONUNBUFFERED=1
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dtox-document-replacement
+Restart=on-failure
+RestartSec=60s
+RestartSteps=5
+RestartMaxDelaySec=15min
+# 75 is a temporary shared-service failure; 78 requires investigation.
+RestartPreventExitStatus=1 2 78 SIGABRT SIGSEGV SIGILL SIGBUS
+RestartForceExitStatus=SIGTERM SIGHUP SIGPIPE
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=10min
+
+[Install]
+WantedBy=multi-user.target

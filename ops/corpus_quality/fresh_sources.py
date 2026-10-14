@@ -31,6 +31,13 @@ class FreshSourceError(ValueError):
     """Fresh source failed identity, transport, or parse validation."""
 
 
+def _http_failure(message, response):
+    error = FreshSourceError(message)
+    error.status_code = getattr(response, 'status_code', None)
+    error.headers = getattr(response, 'headers', {})
+    return error
+
+
 class FreshSourceDependencyError(FreshSourceError):
     """A shared local dependency or configured store is unavailable."""
 
@@ -103,7 +110,7 @@ def expected_source(canonical_id, original_kind, edition):
 
 def _response_bytes(response, limit):
     if getattr(response, "status_code", None) != 200:
-        raise FreshSourceError(f"source request returned HTTP {getattr(response, 'status_code', None)}")
+        raise _http_failure(f"source request returned HTTP {getattr(response, 'status_code', None)}", response)
     chunks = []
     total = 0
     iterator = getattr(response, "iter_content", None)
@@ -198,7 +205,7 @@ def resolve_arxiv_version(canonical_id, *, session=None, timeout=30):
                                headers={"User-Agent": _USER_AGENT}, allow_redirects=True)
         try:
             if getattr(response, "status_code", None) != 200:
-                raise FreshSourceError("arXiv version resolver returned non-200")
+                raise _http_failure("arXiv version resolver returned non-200", response)
             final = _url_parts(getattr(response, "url", resolver_url))
             if final.hostname != "export.arxiv.org":
                 raise FreshSourceError("arXiv version resolver redirected off host")
@@ -249,7 +256,7 @@ def _resolve_arxiv_abs_version(bare, *, session, timeout, started, fallback_reas
                            headers={"User-Agent": _USER_AGENT}, allow_redirects=True)
     try:
         if getattr(response, "status_code", None) != 200:
-            raise FreshSourceError("arXiv abstract-page version resolver returned non-200")
+            raise _http_failure("arXiv abstract-page version resolver returned non-200", response)
         final = _url_parts(getattr(response, "url", url))
         if final.hostname != "arxiv.org":
             raise FreshSourceError("arXiv abstract-page resolver redirected off host")
@@ -269,8 +276,10 @@ def _resolve_arxiv_abs_version(bare, *, session, timeout, started, fallback_reas
             self.title = None
             self.dateline = []
             self.breadcrumb = []
+            self.history = []
             self._in_dateline = False
             self._in_breadcrumb = False
+            self._in_history = False
 
         def handle_starttag(self, tag, attrs):
             attrs = dict(attrs)
@@ -278,20 +287,26 @@ def _resolve_arxiv_abs_version(bare, *, session, timeout, started, fallback_reas
                 self.title = attrs.get("content", "").strip() or self.title
             if tag.lower() == "div" and "dateline" in attrs.get("class", "").split():
                 self._in_dateline = True
-            if tag.lower() == "div" and "header-breadcrumbs" in attrs.get("class", "").split():
+            if tag.lower() == "div" and {"header-breadcrumbs", "header-breadcrumbs-mobile"}.intersection(attrs.get("class", "").split()):
                 self._in_breadcrumb = True
+            if tag.lower() == "div" and "submission-history" in attrs.get("class", "").split():
+                self._in_history = True
 
         def handle_endtag(self, tag):
             if tag.lower() == "div" and self._in_dateline:
                 self._in_dateline = False
             if tag.lower() == "div" and self._in_breadcrumb:
                 self._in_breadcrumb = False
+            if tag.lower() == "div" and self._in_history:
+                self._in_history = False
 
         def handle_data(self, data):
             if self._in_dateline:
                 self.dateline.append(data)
             if self._in_breadcrumb:
                 self.breadcrumb.append(data)
+            if self._in_history:
+                self.history.append(data)
 
     parsed = _Metadata()
     parsed.feed(page)
@@ -303,9 +318,17 @@ def _resolve_arxiv_abs_version(bare, *, session, timeout, started, fallback_reas
     latest = re.search(r"this version,\s*v([1-9]\d*)", data, flags=re.I)
     if not latest and not re.search(r"\blast revised\b", data, flags=re.I):
         latest = re.search(r"Submitted on[^\]]*\(\s*v([1-9]\d*)\s*\)\s*\]", data, flags=re.I)
-    if not id_witness or not latest or not parsed.title:
+    history_versions = [int(v) for v in re.findall(r"\[v([1-9]\d*)\]", " ".join(parsed.history))]
+    version = int(latest.group(1)) if latest else None
+    if history_versions:
+        history_latest = max(history_versions)
+        if version is not None and version != history_latest:
+            raise FreshSourceError("arXiv dateline and submission history versions disagree")
+        if version is None and re.search(r"\bSubmitted on\b", data, flags=re.I):
+            version = history_latest
+    if not id_witness or version is None or not parsed.title:
         raise FreshSourceError("arXiv abstract page lacks exact ID, version-history, or title evidence")
-    return {"fresh_version": "v" + latest.group(1), "title": " ".join(parsed.title.split()),
+    return {"fresh_version": "v" + str(version), "title": " ".join(parsed.title.split()),
             "resolver_url": url, "resolved_at": _utc_now(),
             "resolution": "publisher_abs_exact_id_version_history",
             "fallback_reason": fallback_reason,
