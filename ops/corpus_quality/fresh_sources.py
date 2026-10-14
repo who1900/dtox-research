@@ -23,6 +23,7 @@ import tempfile
 import tarfile
 import io
 import time
+import zlib
 from urllib.parse import urlsplit
 
 
@@ -161,8 +162,9 @@ def fetch_fresh_artifact(canonical_id, *, original_kind, edition, session=None,
             decoded = raw.decode("utf-8", errors="strict")
         except UnicodeDecodeError as exc:
             raise FreshSourceError("HTML source is not valid UTF-8") from exc
-        if "<html" not in decoded[:8192].lower() and "<article" not in decoded[:8192].lower():
-            raise FreshSourceError("response does not look like an HTML document")
+        store_header = raw.lstrip(b"\xef\xbb\xbf \r\n\t").lower()
+        if not store_header.startswith((b"<!doctype html", b"<html")):
+            raise FreshSourceError("response is not raw HTML accepted by ORIGINAL store")
     if original_kind == "rawTexarchive" and not (raw.startswith(b"\x1f\x8b") or raw.startswith(b"%PDF-")):
         raise FreshSourceError("response is not a supported arXiv source archive")
 
@@ -262,6 +264,10 @@ def _parse_pdf(artifact, timeout, native_build=None):
         text, conversion = extractor.convert_pdf_isolated(
             str(path), timeout=timeout, native_build=native_build,
             normalize_unicode=True, return_diagnostics=True)
+    except extractor.PDFConversionError as exc:
+        if exc.reason == "conversion_timeout":
+            raise FreshSourceError("PDF conversion timed out for this source") from exc
+        raise
     finally:
         path.unlink(missing_ok=True)
     normalization = conversion.get("unicode_normalization") or {}
@@ -587,12 +593,15 @@ def _parse_tex_archive(artifact):
         except tarfile.ReadError:
             try:
                 text = gzip.decompress(artifact.raw_bytes).decode("utf-8", errors="strict")
-            except (OSError, UnicodeError) as exc:
+            except (OSError, EOFError, UnicodeError, zlib.error) as exc:
                 raise FreshSourceError("e-print is neither a readable tar archive nor gzip TeX") from exc
             if not ("\\documentclass" in text or "\\section" in text):
                 raise FreshSourceError("gzip e-print has no recognizable TeX body")
-            return text, {"parser": "single-file-gzip-tex", "parse_status": "ok",
-                          "archive_member_count": 1, "unresolved_include_warnings": []}
+            # OriginalStore records rawTexarchive only for real tar/zip archives.
+            # Preserve the actual e-print bytes; do not wrap this single-file
+            # gzip payload in a synthetic archive merely to satisfy that kind.
+            raise FreshSourceError(
+                "single-file gzip TeX is not an ORIGINAL rawTexarchive; use the PDF source route")
         with archive:
             members = archive.getmembers()
             if len(members) > 10000:
@@ -639,6 +648,8 @@ def _parse_tex_archive(artifact):
                        "replacement_characters": text.count("\ufffd"),
                        "word_count": len(text.split())}
         return text, diagnostics
+    except (tarfile.TarError, EOFError, gzip.BadGzipFile, zlib.error) as exc:
+        raise FreshSourceError("e-print archive is truncated or has invalid compression") from exc
     finally:
         logger.removeHandler(capture)
 
@@ -764,7 +775,14 @@ def _register_original(artifact, raw_path, original_store_root):
         else:
             store.ingest_file(raw_path, provenance, max_bytes=_MAX_SOURCE_BYTES)
             storage = "new_blob_and_reference"
-    except (OriginalError, OSError, ValueError) as exc:
+    except OriginalError as exc:
+        if (artifact.original_kind == "rawTexarchive"
+                and str(exc) == "not a raw TeX tar/zip archive"):
+            raise FreshSourceError(
+                "e-print bytes are not an ORIGINAL rawTexarchive; use the PDF source route") from exc
+        raise FreshSourceDependencyError(
+            "fresh raw source could not be registered in existing ORIGINAL store") from exc
+    except (OSError, ValueError) as exc:
         raise FreshSourceDependencyError("fresh raw source could not be registered in existing ORIGINAL store") from exc
     canonical_blob = store.verify_blob(artifact.raw_sha256, artifact.raw_size_bytes)
     return {"store_root": str(root), "raw_sha256": artifact.raw_sha256,

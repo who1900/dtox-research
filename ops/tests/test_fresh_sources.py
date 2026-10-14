@@ -1,10 +1,12 @@
 import hashlib
+import gzip
 import io
 import tempfile
 import tarfile
 import unittest
+import zlib
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from ops.corpus_quality import fresh_sources
 
@@ -52,6 +54,14 @@ class FreshSourceTests(unittest.TestCase):
         self.assertEqual(artifact.raw_sha256, hashlib.sha256(raw).hexdigest())
         self.assertEqual(artifact.retrieval_url, response.url)
         self.assertEqual(artifact.edition, "sha256:" + artifact.raw_sha256)
+
+    def test_html_must_match_original_store_raw_html_contract(self):
+        response = _Response(b"<!-- mirror wrapper --><article>Paper</article>")
+        response.url = "https://arxiv.org/html/2408.11826v1"
+        with self.assertRaisesRegex(fresh_sources.FreshSourceError, "not raw HTML"):
+            fresh_sources.fetch_fresh_artifact(
+                "2408.11826", original_kind="HTML", edition="v1",
+                session=_Session(response))
 
     def test_generic_pdf_uses_exact_url_and_hash_edition(self):
         raw = b"%PDF-1.7\nsource fixture"
@@ -201,6 +211,79 @@ class FreshSourceTests(unittest.TestCase):
         self.assertIn("A source-bound body.", text)
         self.assertEqual(diagnostics["archive_member_count"], 2)
         self.assertEqual(diagnostics["parse_status"], "ok")
+
+    def test_single_file_gzip_tex_is_source_unsupported_not_an_archive(self):
+        raw = gzip.compress(
+            b"\\documentclass{article}\n\\begin{document}Text.\\end{document}")
+        artifact = fresh_sources.FreshArtifact(
+            canonical_id="2408.11826", source_url="https://arxiv.org/e-print/2408.11826v1",
+            request_url="https://arxiv.org/e-print/2408.11826v1",
+            retrieval_url="https://arxiv.org/e-print/2408.11826v1", original_kind="rawTexarchive",
+            edition="v1", retrieved_at="2026-10-14T00:00:00Z",
+            raw_sha256=hashlib.sha256(raw).hexdigest(), raw_size_bytes=len(raw), raw_bytes=raw)
+        with self.assertRaisesRegex(fresh_sources.FreshSourceError, "single-file gzip TeX"):
+            fresh_sources._parse_tex_archive(artifact)
+
+    def test_truncated_and_invalid_deflate_eprints_are_per_source_errors(self):
+        source = b"\\documentclass{article}\\begin{document}" + b"A" * 2000 + b"\\end{document}"
+        valid = gzip.compress(source)
+        for raw in (valid[:-4], valid[:20] + b"\xff\xff\xff\xff" + valid[24:]):
+            artifact = fresh_sources.FreshArtifact(
+                canonical_id="2408.11826", source_url="https://arxiv.org/e-print/2408.11826v1",
+                request_url="https://arxiv.org/e-print/2408.11826v1",
+                retrieval_url="https://arxiv.org/e-print/2408.11826v1", original_kind="rawTexarchive",
+                edition="v1", retrieved_at="2026-10-14T00:00:00Z",
+                raw_sha256=hashlib.sha256(raw).hexdigest(), raw_size_bytes=len(raw), raw_bytes=raw)
+            with self.subTest(size=len(raw)):
+                with self.assertRaises(fresh_sources.FreshSourceError):
+                    fresh_sources._parse_tex_archive(artifact)
+
+    def test_pdf_timeout_is_per_source_but_unverified_build_remains_dependency_error(self):
+        from pipeline.extractor import PDFConversionError
+        raw = b"%PDF-1.7\nsource fixture"
+        artifact = fresh_sources.FreshArtifact(
+            canonical_id="acl:2023.evalita-1.3", source_url="https://aclanthology.org/2023.evalita-1.3.pdf",
+            request_url="https://aclanthology.org/2023.evalita-1.3.pdf",
+            retrieval_url="https://aclanthology.org/2023.evalita-1.3.pdf", original_kind="PDF",
+            edition="acl:2023.evalita-1.3", retrieved_at="2026-10-14T00:00:00Z",
+            raw_sha256=hashlib.sha256(raw).hexdigest(), raw_size_bytes=len(raw), raw_bytes=raw)
+        with patch("pipeline.extractor.convert_pdf_isolated",
+                   side_effect=PDFConversionError("conversion_timeout")):
+            with self.assertRaisesRegex(fresh_sources.FreshSourceError, "timed out"):
+                fresh_sources._parse_pdf(artifact, 1)
+        with patch("pipeline.extractor.convert_pdf_isolated",
+                   side_effect=PDFConversionError("converter_build_unverified")):
+            with self.assertRaisesRegex(PDFConversionError, "converter_build_unverified"):
+                fresh_sources._parse_pdf(artifact, 1)
+
+    def test_original_format_rejection_is_per_source_but_store_failure_is_dependency(self):
+        from pipeline.originals import OriginalError
+
+        raw = b"\\documentclass{article}\\begin{document}Text\\end{document}"
+        artifact = fresh_sources.FreshArtifact(
+            canonical_id="2408.11826", source_url="https://arxiv.org/e-print/2408.11826v1",
+            request_url="https://arxiv.org/e-print/2408.11826v1",
+            retrieval_url="https://arxiv.org/e-print/2408.11826v1", original_kind="rawTexarchive",
+            edition="v1", retrieved_at="2026-10-14T00:00:00Z",
+            raw_sha256=hashlib.sha256(raw).hexdigest(), raw_size_bytes=len(raw), raw_bytes=raw)
+
+        for message, expected in (
+                ("not a raw TeX tar/zip archive", fresh_sources.FreshSourceError),
+                ("fresh ORIGINAL disk reserve failed", fresh_sources.FreshSourceDependencyError)):
+            class Store:
+                def __init__(self, root): pass
+                def blob_path(self, digest): return Path(tmp) / "missing-blob"
+                def ingest_file(self, *args, **kwargs): raise OriginalError(message)
+
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "originals"
+                root.mkdir()
+                (root / "manifest.sqlite3").write_bytes(b"manifest marker")
+                raw_path = Path(tmp) / "fresh-source"
+                raw_path.write_bytes(raw)
+                with patch("pipeline.originals.OriginalStore", Store):
+                    with self.assertRaises(expected):
+                        fresh_sources._register_original(artifact, raw_path, root)
 
 
 if __name__ == "__main__":
