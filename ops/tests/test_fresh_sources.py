@@ -255,6 +255,10 @@ class FreshSourceTests(unittest.TestCase):
         self.assertIn("Reference text remains.", text)
         self.assertIn("Appendix text remains.", text)
         self.assertEqual(diagnostics["tables"], diagnostics["article_tables_rendered_count"])
+        with self.assertRaisesRegex(fresh_sources.FreshSourceError,
+                                    "heading does not uniquely match"):
+            fresh_sources.parse_fresh_artifact(
+                artifact, expected_title="A metadata title that differs")
 
     def test_html_projection_preserves_valid_table_row_and_column_spans(self):
         raw = (b'<html><body>arXiv:2408.11826v1<article><h1>Spanned Table Paper</h1>'
@@ -383,6 +387,11 @@ class FreshSourceTests(unittest.TestCase):
                    side_effect=PDFConversionError("converter_build_unverified")):
             with self.assertRaisesRegex(PDFConversionError, "converter_build_unverified"):
                 fresh_sources._parse_pdf(artifact, 1)
+        with patch("pipeline.extractor.convert_pdf_isolated",
+                   side_effect=PDFConversionError("conversion_failed", 1)):
+            with self.assertRaisesRegex(fresh_sources.FreshSourceError, "PDF parser rejected") as caught:
+                fresh_sources._parse_pdf(artifact, 1)
+            self.assertIsInstance(caught.exception.__cause__, PDFConversionError)
 
     def test_original_format_rejection_is_per_source_but_store_failure_is_dependency(self):
         from pipeline.originals import OriginalError

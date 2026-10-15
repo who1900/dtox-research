@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 import errno
 from contextlib import ExitStack, contextmanager
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, Future, wait, FIRST_COMPLETED
 from datetime import datetime, timezone
 import hashlib
 import gzip
@@ -36,7 +36,9 @@ ROOT = Path('/opt/dtox-research')
 NATIVE_BUILD = Path('/opt/dtox-extraction-eval-20261012/baseline/native_build')
 ORIGINAL_STORE = Path('/opt/dtox-source-recovery-20261012/originals-store-v1')
 EMBED_BATCH_SIZE = 64
-PREFETCH_WORKERS = 2
+PREFETCH_WORKERS = int(os.getenv('DTOX_REPAIR_ACQUIRE_WORKERS', '6'))
+CANDIDATE_WORKERS = int(os.getenv('DTOX_REPAIR_CANDIDATE_WORKERS', '2'))
+MAX_IN_FLIGHT = int(os.getenv('DTOX_REPAIR_MAX_IN_FLIGHT', '12'))
 API_UNIT = 'dtox-research-api-oracle-20261012.service'
 WRITER_UNITS = ('dtox-research.service', 'dtox-pipeline.service')
 SCHEMA = 1
@@ -309,6 +311,19 @@ def _selected_counts(base, paper_ids):
         return result
     finally:
         conn.close()
+
+
+def _order_preparation(selected, cache_dir, cache):
+    """Start costly sources early using existing cache-file sizes as estimates."""
+    sizes = {}
+    for row in selected:
+        path = Path(cache_dir) / (cache.safe_id(row['paper_id']) + '.json')
+        try:
+            sizes[row['paper_id']] = path.lstat().st_size
+        except FileNotFoundError:
+            sizes[row['paper_id']] = 0
+    return sorted(selected, key=lambda row: (row['status'] != 'prepared',
+                  -sizes[row['paper_id']], row['paper_id']))
 
 
 def _rowid_floors(runtime):
@@ -600,17 +615,19 @@ def _embedder(runtime, metrics):
                 with urllib.request.urlopen(request, timeout=180) as response:
                     result = json.load(response)
             except (OSError, ValueError, urllib.error.URLError) as exc:
-                raise _shared_failure('document embedding batch failed', exc) from exc
+                if _transport_failure(exc):
+                    raise RetryableWorkerError('document embedding batch failed') from exc
+                raise DeferredPaper('document embedding response unavailable or invalid') from exc
             metrics['embedding_seconds'] = metrics.get('embedding_seconds', 0.0) + time.monotonic() - started
             metrics['embedding_batch_sizes'] = metrics.get('embedding_batch_sizes', []) + [len(batch)]
             part = result.get('vectors') if isinstance(result, dict) else None
             if not isinstance(part, list) or len(part) != len(batch):
-                raise WorkerError('document embedding count mismatch')
+                raise DeferredPaper('document embedding count mismatch')
             for index, vector in zip(indices, part):
                 if (not isinstance(vector, list) or len(vector) != 384
                         or any(type(value) not in (int, float) or not math.isfinite(value) for value in vector)
                         or abs(math.sqrt(sum(value * value for value in vector)) - 1) > 1e-3):
-                    raise WorkerError('document embedding vector is invalid')
+                    raise DeferredPaper('document embedding vector is invalid')
                 vectors[index] = vector
         return vectors
     return embed
@@ -632,7 +649,7 @@ def _preserving_embedder(runtime, metrics, paper_id, targets, existing):
 
     def embed(texts):
         if texts != [chunk['text'] for chunk in targets]:
-            raise WorkerError('embedding inputs differ from canonical targets')
+            raise DeferredPaper('embedding inputs differ from canonical targets')
         vectors = [None] * len(texts)
         missing = []
         for index, (text, chunk) in enumerate(zip(texts, targets)):
@@ -748,30 +765,54 @@ def _journal_path(base, paper_id, cache):
 
 def _compress_applied_journal(base, paper_id, journal, runtime, metrics):
     """Keep one exact rollback receipt, compressed after verified publication."""
-    path = Path(journal)
-    raw = path.read_bytes()
-    if raw.startswith(b'\x1f\x8b'):
-        return path
-    plan = runtime['owner']._load(path)
-    if plan.get('phase') != 'applied':
-        return path
-    compressed = gzip.compress(raw, compresslevel=1, mtime=0)
-    target = path.with_suffix(path.suffix + '.gz')
-    runtime['owner'].labels._atomic(target, compressed)
-    if gzip.decompress(target.read_bytes()) != raw or runtime['owner']._load(target) != plan:
-        raise WorkerError('compressed rollback receipt differs from accepted journal')
-    metrics = dict(metrics, journal_size_bytes=len(compressed), journal_uncompressed_bytes=len(raw))
-    # The durable queue selects the verified new file before retiring its old
-    # encoding. A crash between these steps leaves a harmless owned duplicate.
-    _update(base, paper_id, 'applied', journal_path=target, metrics=metrics)
-    path.unlink()
-    if os.name != 'nt':
-        fd = os.open(path.parent, os.O_RDONLY)
+    plan = None
+    try:
+        path = Path(journal)
+        raw = path.read_bytes()
+        if raw.startswith(b'\x1f\x8b'):
+            return path
+        plan = runtime['owner']._load(path)
+        if plan.get('phase') != 'applied':
+            return path
+        compressed = gzip.compress(raw, compresslevel=1, mtime=0)
+        target = path.with_suffix(path.suffix + '.gz')
+        runtime['owner'].labels._atomic(target, compressed)
+        if gzip.decompress(target.read_bytes()) != raw or runtime['owner']._load(target) != plan:
+            raise WorkerError('compressed rollback receipt differs from accepted journal')
+        metrics = dict(metrics, journal_size_bytes=len(compressed), journal_uncompressed_bytes=len(raw))
+        # The durable queue selects the verified new file before retiring its old
+        # encoding. A crash between these steps leaves a harmless owned duplicate.
+        _update(base, paper_id, 'applied', journal_path=target, metrics=metrics)
+        path.unlink()
+        if os.name != 'nt':
+            fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        return target
+    except Exception as exc:
+        if (isinstance(exc, (sqlite3.DatabaseError, MemoryError))
+                or isinstance(exc, OSError) and exc.errno in
+                (errno.ENOSPC, errno.EIO, errno.EROFS, errno.EMFILE, errno.ENFILE)):
+            raise
+        # Compression is optional. Only the durable queue chooses the accepted
+        # receipt; it may already select the verified compressed encoding.
+        rows = _get_targets(base, ('applied',), [paper_id])
+        if len(rows) != 1 or not rows[0].get('journal_path'):
+            raise WorkerError('compression failure left no accepted journal') from exc
+        selected = Path(rows[0]['journal_path'])
         try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    return target
+            accepted = runtime['owner']._load(selected)
+        except Exception as journal_exc:
+            raise WorkerError('accepted journal unavailable after compression failure') from journal_exc
+        if accepted.get('phase') != 'applied' or (plan is not None and accepted != plan):
+            raise WorkerError('accepted journal changed after compression failure') from exc
+        metrics = json.loads(rows[0]['metrics_json'] or '{}')
+        metrics['compression_deferred'] = _error_reason(exc)
+        _update(base, paper_id, 'applied', reason='compression_deferred:' + _error_reason(exc),
+                journal_path=selected, metrics=metrics)
+        return selected
 
 
 def _read_meta_state(path):
@@ -854,7 +895,7 @@ def maintenance_gate(base, worker, paper_ids, *, cleanup=None):
             _atomic_json(marker_path, gate)
 
 
-def recover_journals(records, *, owner, qdrant, gate_factory, update):
+def recover_journals(records, *, owner, qdrant, gate_factory, update, trusted_terminal=False):
     """Resolve owner journals before selecting new work; never guess after writes."""
     loaded = []
     uncertain = []
@@ -869,6 +910,10 @@ def recover_journals(records, *, owner, qdrant, gate_factory, update):
             continue
         plan = owner._load(path)
         phase = plan.get('phase')
+        if trusted_terminal and record['status'] == 'applied' and phase == 'applied':
+            # A safe persisted gate and matching terminal ledger/journal already
+            # attest completed publication. Restart recovery handles uncertainty.
+            continue
         loaded.append((record, plan))
         if phase in ('applying', 'rolling_back'):
             uncertain.append((record, plan))
@@ -906,23 +951,19 @@ def recover_journals(records, *, owner, qdrant, gate_factory, update):
                 gate['safe_to_restore'] = True
 
 
+def _error_reason(exc):
+    causes, seen = [], set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        causes.append(type(exc).__name__ + ':' + str(exc))
+        exc = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+    return ' <- '.join(causes)
+
+
 def _record_error(base, paper_id, exc, metrics, *, defer=True):
     status = 'deferred' if defer else 'failed'
-    reason = (type(exc).__name__ + ':' + str(exc))[:500]
+    reason = _error_reason(exc)
     _update(base, paper_id, status, reason=reason, metrics=metrics)
-
-
-def _document_scoped_error(exc, runtime):
-    # Only errors explicitly normalized by the source adapter (or an HTTP
-    # response tied to this document) are isolated to one target. Unexpected
-    # exceptions stop dispatch so a broken shared dependency cannot poison the
-    # entire frozen queue.
-    dependency_error = getattr(runtime['fresh'], 'FreshSourceDependencyError', None)
-    if dependency_error is not None and isinstance(exc, dependency_error):
-        return False
-    import requests
-    return isinstance(exc, (runtime['fresh'].FreshSourceError, urllib.error.HTTPError,
-                            requests.exceptions.RequestException)) or _transport_failure(exc, runtime)
 
 
 def _transport_failure(exc, runtime=None):
@@ -1064,19 +1105,6 @@ def _acquire_one(paper_id, state, runtime, base, queued_at=None):
     return result, metrics
 
 
-def _preflight_apply(plans, runtime):
-    for paper_id, journal, _ in plans:
-        plan = runtime['owner']._load(journal)
-        if plan.get('phase') != 'prepared':
-            raise WorkerError('only prepared owner journals may enter the apply gate')
-        try:
-            runtime['owner']._verify_document(plan, runtime['client'], 'before')
-        except Exception as exc:
-            if _transport_failure(exc):
-                raise RetryableWorkerError('Qdrant apply preflight unavailable') from exc
-            raise
-
-
 def _recover_batch_plans(plans, runtime, base):
     """On an escaping exception, verify every plan while the API is still closed."""
     for paper_id, journal, metrics in plans:
@@ -1107,17 +1135,6 @@ def _recover_batch_plans(plans, runtime, base):
 def _apply_batch(plans, runtime, base, worker):
     if not plans:
         return
-    ready = []
-    for item in plans:
-        paper_id, journal, metrics = item
-        try:
-            _preflight_apply([item], runtime)
-            ready.append(item)
-        except runtime['owner'].RepairError as exc:
-            _record_error(base, paper_id, exc, metrics, defer=True)
-    plans = ready
-    if not plans:
-        return
     gate_started = time.monotonic()
     try:
         with maintenance_gate(base, worker, [paper_id for paper_id, _, _ in plans],
@@ -1127,8 +1144,6 @@ def _apply_batch(plans, runtime, base, worker):
                 started = time.monotonic()
                 try:
                     runtime['owner'].apply_plan(journal, qdrant=runtime['client'], maintenance=True)
-                    runtime['owner']._verify_document(runtime['owner']._load(journal),
-                                                      runtime['client'], 'published')
                     metrics['apply_seconds'] = time.monotonic() - started
                     metrics['elapsed_seconds'] = (metrics.get('acquire_parse_seconds', 0)
                         + metrics.get('candidate_build_seconds', 0)
@@ -1141,15 +1156,16 @@ def _apply_batch(plans, runtime, base, worker):
                     try:
                         if phase in ('applying', 'applied', 'rolling_back'):
                             runtime['owner'].rollback_plan(journal, qdrant=runtime['client'], maintenance=True)
-                        runtime['owner']._verify_document(runtime['owner']._load(journal),
-                                                          runtime['client'], 'before')
+                        if phase != 'prepared':
+                            runtime['owner']._verify_document(runtime['owner']._load(journal),
+                                                              runtime['client'], 'before')
                     except BaseException as rollback_exc:
                         gate['attention_required'] = True
                         gate['safe_to_restore'] = False
                         _update(base, paper_id, 'failed', reason='rollback_unverified:' + type(rollback_exc).__name__)
                         raise WorkerError('rollback could not be verified; API left closed') from rollback_exc
                     metrics['apply_seconds'] = time.monotonic() - started
-                    _record_error(base, paper_id, exc, metrics, defer=False)
+                    _record_error(base, paper_id, exc, metrics, defer=(phase == 'prepared'))
                 gate['safe_to_restore'] = True
                 gate['updated_at'] = utc_now()
                 _atomic_json(Path(base) / 'maintenance-gate.json', gate)
@@ -1194,6 +1210,141 @@ def _runtime_preflight(runtime, worker):
         raise WorkerError('ingestion writer is active: ' + json.dumps(states, sort_keys=True))
 
 
+
+def _unsafe_preparation_error(exc):
+    """Only storage or explicitly signalled integrity faults stop preparation."""
+    return (isinstance(exc, (WorkerError, sqlite3.DatabaseError, MemoryError))
+            or isinstance(exc, OSError) and exc.errno in
+            (errno.ENOSPC, errno.EIO, errno.EROFS, errno.EMFILE, errno.ENFILE))
+
+
+def _candidate_one(paper_id, source_result, state, runtime, base, metrics):
+    started = time.monotonic()
+    for attempt in range(3):
+        try:
+            candidate = _prepare_candidate(paper_id, source_result, state, runtime, base, metrics)
+            metrics['candidate_build_seconds'] = max(
+                0.0, time.monotonic() - started - metrics.get('embedding_seconds', 0.0))
+            return candidate, metrics
+        except Exception as exc:
+            if not isinstance(exc, RetryableWorkerError) and not _transport_failure(exc):
+                raise
+            if attempt == 2:
+                raise RetryableWorkerError('candidate dependency retries exhausted') from exc
+            time.sleep((5, 15)[attempt])
+
+
+def _submit_preparation(sources, candidates, paper_id, state, runtime, base, metrics):
+    """Forward source completion into embedding without waiting for the writer."""
+    completed = Future()
+    def candidate_ready(future):
+        try:
+            completed.set_result(future.result())
+        except BaseException as exc:
+            completed.set_exception(exc)
+    def source_ready(future):
+        try:
+            result, source_metrics = future.result()
+            metrics.update(source_metrics)
+            candidate = candidates.submit(_candidate_one, paper_id, result, state, runtime, base, metrics)
+            candidate.add_done_callback(candidate_ready)
+        except BaseException as exc:
+            completed.set_exception(exc)
+    source = sources.submit(_acquire_one, paper_id, state, runtime, base, time.monotonic())
+    source.add_done_callback(source_ready)
+    return completed
+
+
+def _run_stages(selected, runtime, base, root, rowid_floors):
+    """Bounded independent source/embedding stages feed one publication owner.
+
+    Source acquisition uses the standard fresh-source adapters, extractor and
+    OriginalStore; candidate construction uses canonical cache/embedding tools.
+    The existing queue and owner journals are the only durable progress state.
+    """
+    if min(PREFETCH_WORKERS, CANDIDATE_WORKERS, MAX_IN_FLIGHT) < 1:
+        raise WorkerError('stage worker counts and in-flight bound must be positive')
+    records = iter(selected)
+    exhausted = False
+    # A future owns exactly one document until it reaches the serialized writer.
+    pending = {}
+    with ThreadPoolExecutor(max_workers=PREFETCH_WORKERS) as sources, \
+            ThreadPoolExecutor(max_workers=CANDIDATE_WORKERS) as candidates:
+        while pending or not exhausted:
+            ready = []
+            while not exhausted and len(pending) + len(ready) < MAX_IN_FLIGHT:
+                try:
+                    record = next(records)
+                except StopIteration:
+                    exhausted = True
+                    break
+                paper_id = record['paper_id']
+                _check_storage(base)
+                path = record.get('journal_path')
+                if path and Path(path).exists() and runtime['owner']._load(path).get('phase') == 'prepared':
+                    ready.append((paper_id, Path(path), json.loads(record['metrics_json'] or '{}')))
+                    continue
+                journal = _journal_path(base, paper_id, runtime['document_cache'])
+                _update(base, paper_id, 'staging', reason=None, journal_path=journal)
+                try:
+                    state = _state_row(root, paper_id)
+                except Exception as exc:
+                    if _unsafe_preparation_error(exc):
+                        raise
+                    _record_error(base, paper_id, exc, {})
+                    continue
+                metrics = {}
+                future = _submit_preparation(sources, candidates, paper_id, state, runtime, base, metrics)
+                pending[future] = (paper_id, metrics)
+            if pending:
+                done = {future for future in pending if future.done()}
+                if not done and not ready:
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                # Callbacks feed candidate work even while this sole owner is
+                # publishing. Only complete documents reach this writer.
+                for future in done:
+                    paper_id, metrics = pending.pop(future)
+                    journal = _journal_path(base, paper_id, runtime['document_cache'])
+                    preparing = False
+                    try:
+                        value, metrics = future.result()
+                        _update(base, paper_id, 'staging', reason=None, journal_path=journal, metrics=metrics)
+                        _check_storage(base)
+                        started = time.monotonic()
+                        preparing = True
+                        plan = runtime['owner'].prepare_document_replacement(
+                            paper_id, candidate=value, **runtime['paths'], journal_path=journal,
+                            qdrant=runtime['client'], rowid_floors=rowid_floors)
+                        _advance_rowid_floors(rowid_floors, plan)
+                        metrics['prepare_seconds'] = time.monotonic() - started
+                        metrics['journal_size_bytes'] = Path(journal).stat().st_size if Path(journal).exists() else None
+                        _update(base, paper_id, 'prepared', reason=None, journal_path=journal, metrics=metrics)
+                        ready.append((paper_id, journal, metrics))
+                    except Exception as exc:
+                        if _unsafe_preparation_error(exc):
+                            raise
+                        # prepare writes only its recovery journal. Preserve a
+                        # completed journal for the next run instead of losing it
+                        # when an unrelated document-local step raises afterward.
+                        if preparing and Path(journal).exists():
+                            plan = runtime['owner']._load(journal)
+                            if plan.get('phase') == 'prepared':
+                                _advance_rowid_floors(rowid_floors, plan)
+                                _update(base, paper_id, 'prepared', reason=_error_reason(exc),
+                                        journal_path=journal, metrics=metrics)
+                                continue
+                            if plan.get('phase') not in ('rolled_back',):
+                                raise WorkerError('preparation left an unsafe owner journal') from exc
+                        _record_error(base, paper_id, exc, metrics)
+            if ready:
+                _apply_batch(ready, runtime, base, runtime['worker'])
+                for paper_id, journal, metrics in ready:
+                    current = _get_targets(base, ('applied',), [paper_id])
+                    if current:
+                        _compress_applied_journal(base, paper_id, journal, runtime,
+                                                  json.loads(current[0]['metrics_json']))
+
+
 def run(base=BASE, root=ROOT, *, papers=None, limit=None, retry_deferred=False):
     base, root = Path(base).resolve(), Path(root).resolve(strict=True)
     if limit is not None and (type(limit) is not int or limit < 1):
@@ -1206,9 +1357,14 @@ def run(base=BASE, root=ROOT, *, papers=None, limit=None, retry_deferred=False):
         worker = runtime['worker']
         _runtime_preflight(runtime, worker)
         recovery_records = _get_targets(base, ('staging','prepared','applying','applied','failed'))
+        gate_state = _read_meta_state(base / 'maintenance-gate.json') or {}
+        trusted_terminal = (gate_state.get('phase') in ('closed', 'restored')
+                            and gate_state.get('safe_to_restore') is True
+                            and gate_state.get('attention_required') is False)
         recover_journals(recovery_records, owner=runtime['owner'], qdrant=runtime['client'],
                          gate_factory=lambda ids: maintenance_gate(base, worker, ids),
-                         update=lambda pid, status, **kw: _update(base, pid, status, **kw))
+                         update=lambda pid, status, **kw: _update(base, pid, status, **kw),
+                         trusted_terminal=trusted_terminal)
         rowid_floors = _rowid_floors(runtime)
         for record in _get_targets(base, ('prepared',)):
             if record.get('journal_path') and Path(record['journal_path']).exists():
@@ -1219,6 +1375,7 @@ def run(base=BASE, root=ROOT, *, papers=None, limit=None, retry_deferred=False):
             unknown = [p for p in papers if not _get_targets(base, ('pending','prepared','staging','deferred','applied','failed'), [p])]
             if unknown:
                 raise WorkerError('requested paper is outside the frozen target set: ' + ','.join(unknown))
+        selected = _order_preparation(selected, runtime['paths']['cache_dir'], runtime['document_cache'])
         selection_count = len(selected)
         active_run = dict(run_id=run_id, pid=os.getpid(), target_ids=[row['paper_id'] for row in selected],
                           started_epoch=time.time(), updated_epoch=time.time())
@@ -1239,90 +1396,7 @@ def run(base=BASE, root=ROOT, *, papers=None, limit=None, retry_deferred=False):
         finally:
             conn.close()
         write_status(base)
-        for group in batched(selected, PREFETCH_WORKERS):
-            # Leave space for database and rollback writes as raw sources and
-            # journals grow. The remaining queue survives this operational stop.
-            _check_storage(base)
-            resumable = {}
-            for record in group:
-                path = record.get('journal_path')
-                if path and Path(path).exists() and runtime['owner']._load(path).get('phase') == 'prepared':
-                    resumable[record['paper_id']] = Path(path)
-            pending_acquire = [r for r in group if r['paper_id'] not in resumable]
-            prepared = []
-            acquired = {}
-            for record in pending_acquire:
-                _update(base, record['paper_id'], 'staging', reason=None,
-                        journal_path=_journal_path(base, record['paper_id'], runtime['document_cache']))
-            if pending_acquire:
-                with ThreadPoolExecutor(max_workers=PREFETCH_WORKERS) as pool:
-                    futures = {}
-                    for record in pending_acquire:
-                        try:
-                            state = _state_row(root, record['paper_id'])
-                            queued_at = time.monotonic()
-                            futures[pool.submit(_acquire_one, record['paper_id'], state, runtime,
-                                                base, queued_at)] = record
-                        except DeferredPaper as exc:
-                            _record_error(base, record['paper_id'], exc, {}, defer=True)
-                    for future in as_completed(futures):
-                        record = futures[future]
-                        try:
-                            acquired[record['paper_id']] = future.result()
-                        except DeferredPaper as exc:
-                            _record_error(base, record['paper_id'], exc, {}, defer=True)
-                        except Exception as exc:
-                            if _document_scoped_error(exc, runtime):
-                                _record_error(base, record['paper_id'], exc, {}, defer=True)
-                            else:
-                                raise WorkerError('shared source acquisition/parser dependency failed') from exc
-            for record in group:
-                paper_id = record['paper_id']
-                if paper_id in resumable:
-                    journal = resumable[paper_id]
-                    if record['status'] != 'prepared':
-                        _update(base, paper_id, 'prepared', reason=None, journal_path=journal)
-                    prepared.append((paper_id, journal, json.loads(record['metrics_json'] or '{}')))
-                    continue
-                if paper_id not in acquired:
-                    continue
-                source_result, source_metrics = acquired[paper_id]
-                metrics = dict(source_metrics)
-                try:
-                    state = _state_row(root, paper_id)
-                    candidate_started = time.monotonic()
-                    candidate = _prepare_candidate(paper_id, source_result, state, runtime, base, metrics)
-                    metrics['candidate_build_seconds'] = max(
-                        0.0, time.monotonic() - candidate_started - metrics.get('embedding_seconds', 0.0))
-                    journal = _journal_path(base, paper_id, runtime['document_cache'])
-                    _update(base, paper_id, 'staging', reason=None, journal_path=journal, metrics=metrics)
-                    _check_storage(base)
-                    prepare_started = time.monotonic()
-                    plan = runtime['owner'].prepare_document_replacement(
-                        paper_id, candidate=candidate, **runtime['paths'], journal_path=journal,
-                        qdrant=runtime['client'], rowid_floors=rowid_floors)
-                    _advance_rowid_floors(rowid_floors, plan)
-                    metrics['prepare_seconds'] = time.monotonic() - prepare_started
-                    try:
-                        metrics['journal_size_bytes'] = Path(journal).stat().st_size
-                    except OSError:
-                        metrics['journal_size_bytes'] = None
-                    _update(base, paper_id, 'prepared', reason=None, journal_path=journal, metrics=metrics)
-                    prepared.append((paper_id, journal, metrics))
-                except DeferredPaper as exc:
-                    _record_error(base, paper_id, exc, metrics, defer=True)
-                except (runtime['owner'].RepairError, runtime['document_cache'].ManifestInvalid) as exc:
-                    _record_error(base, paper_id, exc, metrics, defer=True)
-                except WorkerError:
-                    raise
-            if prepared:
-                _check_storage(base)
-                _apply_batch(prepared, runtime, base, worker)
-                for paper_id, journal, metrics in prepared:
-                    current = _get_targets(base, ('applied',), [paper_id])
-                    if current:
-                        _compress_applied_journal(base, paper_id, journal, runtime,
-                                                  json.loads(current[0]['metrics_json']))
+        _run_stages(selected, runtime, base, root, rowid_floors)
         elapsed = time.monotonic() - started
         selected_statuses = _selected_counts(base, active_run['target_ids'])
         successful = selected_statuses.get('applied', 0)
@@ -1343,7 +1417,7 @@ def run(base=BASE, root=ROOT, *, papers=None, limit=None, retry_deferred=False):
             selected_scope_eta_seconds=current_eta,
             eta_scope='selected run subset only; never whole corpus',
             prefetch_workers=PREFETCH_WORKERS, embed_batch_size=EMBED_BATCH_SIZE,
-            embed_concurrency=1, target_ids=active_run['target_ids'],
+            embed_concurrency=CANDIDATE_WORKERS, max_in_flight=MAX_IN_FLIGHT, target_ids=active_run['target_ids'],
             phase_seconds=final_phase_seconds,
             started_epoch=active_run['started_epoch'], finished_epoch=time.time(), finished=True)
         return write_status(base, run_status)
@@ -1427,7 +1501,8 @@ def main(argv=None):
                           failed_documents=counts.get('failed', 0),
                           whole_corpus_quality_complete=False)
             except Exception as exc:
-                retryable = isinstance(exc, RetryableWorkerError)
+                retryable = (isinstance(exc, (RetryableWorkerError, MemoryError))
+                             or isinstance(exc, OSError) and exc.errno in (errno.EMFILE, errno.ENFILE))
                 try:
                     lifecycle('bulk_interrupted', 'retry_wait' if retryable else 'needs_attention',
                               type(exc).__name__ + ':' + str(exc)[:300])

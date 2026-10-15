@@ -87,6 +87,96 @@ class PDFMemoryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 pdf_memory.patched_source(source, version)
 
+    def test_onnx_session_patch_is_source_guarded_and_applies_thread_config(self):
+        source = b'''"""
+common_util.py
+
+Utils shared by the ONNX runtime users.
+
+"""
+
+import onnxruntime as ort
+
+def make_session(model_path, providers=None):
+    """
+    Create an ort.InferenceSession with the CPU memory arena disabled.
+
+    By default, ort.InferenceSession uses enable_cpu_mem_arena=True, which
+    causes the ONNX Runtime allocator to retain the peak allocation across
+    all calls and never release it back to the OS.  When a long-lived process
+    processes many PDFs that differ in page size or element count, the arena
+    grows without bound and is never reclaimed even after gc.collect().
+
+    Setting enable_cpu_mem_arena=False makes the runtime release allocations
+    promptly, keeping RSS stable across documents.
+    """
+    so = ort.SessionOptions()
+    so.enable_cpu_mem_arena = False
+    return ort.InferenceSession(model_path, sess_options=so, providers=providers)
+'''
+        self.assertEqual(hashlib.sha256(source).hexdigest(),
+                         pdf_memory.ONNX_SESSION_UPSTREAM_SHA256)
+        patched = pdf_memory.patched_onnx_session_source(source)
+        compile(patched, "onnx/common_util.py", "exec")
+
+        class SessionOptions:
+            def __init__(self):
+                self.enable_cpu_mem_arena = True
+                self.intra_op_num_threads = 0
+                self.inter_op_num_threads = 0
+
+        import sys
+        import types
+        runtime = types.ModuleType("onnxruntime")
+        runtime.SessionOptions = SessionOptions
+        runtime.InferenceSession = lambda model_path, *, sess_options, providers: (
+            model_path, sess_options, providers)
+        namespace = {}
+        with patch.dict(sys.modules, {"onnxruntime": runtime}):
+            exec(compile(patched, "onnx/common_util.py", "exec"), namespace)
+        with patch.dict(os.environ, {"DTOX_NATIVE_ORT_THREADS": "3"}):
+            _, configured, providers = namespace["make_session"]("model.onnx", ["CPUExecutionProvider"])
+        self.assertFalse(configured.enable_cpu_mem_arena)
+        self.assertEqual(configured.intra_op_num_threads, 3)
+        self.assertEqual(configured.inter_op_num_threads, 1)
+        self.assertEqual(providers, ["CPUExecutionProvider"])
+        with patch.dict(os.environ, {"DTOX_NATIVE_ORT_THREADS": "0"}):
+            with self.assertRaisesRegex(ValueError, "must be a positive integer"):
+                namespace["make_session"]("model.onnx", None)
+        for original, version in ((source + b"\n", "1.28.0"), (source, "1.30.0")):
+            with self.assertRaises(ValueError):
+                pdf_memory.patched_onnx_session_source(original, version)
+
+        import inspect
+        import tempfile
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory) / "pymupdf"
+            layout = package / "layout"
+            onnx = layout / "onnx"
+            onnx.mkdir(parents=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            layout_source = layout / "common_util.py"
+            directional_patch = inspect.getsource(pdf_memory.get_edge_by_directional_nn).encode("utf-8")
+            layout_source.write_bytes(directional_patch)
+            (layout / "common_util.dtox-upstream").write_bytes(b"upstream fixture")
+            onnx_source = onnx / "common_util.py"
+            onnx_source.write_bytes(source)
+            spec = SimpleNamespace(origin=str(package / "__init__.py"))
+            with patch("importlib.metadata.version", return_value="1.28.0"), \
+                    patch("importlib.util.find_spec", return_value=spec), \
+                    patch("pipeline.pdf_memory.patched_source", return_value=directional_patch):
+                baseline = pdf_memory.verify_native_build(directory)
+                self.assertFalse(baseline["ort_thread_patch_configured"])
+                onnx_source.with_name("common_util.dtox-upstream").write_bytes(source)
+                onnx_source.write_bytes(patched)
+                with patch.dict(os.environ, {"DTOX_NATIVE_ORT_THREADS": "2"}):
+                    configured = pdf_memory.verify_native_build(directory)
+            self.assertTrue(configured["ort_thread_patch_configured"])
+            self.assertEqual(configured["ort_intra_op_threads_default"], 2)
+            self.assertEqual(configured["ort_intra_op_threads"], 2)
+            self.assertEqual(configured["ort_inter_op_threads"], 1)
+
     def test_actual_model_input_arrays_and_geometry_branches(self):
         def namespace(nn):
             ns = {"np": np, "math": math, "IGNORE_FEATURE_NAMES": []}

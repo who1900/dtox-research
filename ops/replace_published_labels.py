@@ -429,8 +429,10 @@ def _apply_document(path,plan,client,maintenance):
         labels._atomic(plan['paper']['artifact_path'],_jbytes(plan['paper']['artifact']))
         _write_document_publications(plan,_document_publications(plan['paper']))
         _write_document(plan,client,True)
-        _verify_document(plan,client,'after')
         _write_document_publications(plan,_document_publications(plan['paper'],True))
+        # Readers remain gated until this complete published-state readback.
+        # A separate staged-state readback repeats the same corpus checks;
+        # publication switching is covered here and failures still roll back.
         _verify_document(plan,client,'published')
         _checkpoint(path,plan,'applied')
     except Exception:

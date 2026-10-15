@@ -150,14 +150,24 @@ def normalize_pdf_bytes(raw):
                      if any(ch[0]==65533 for ch in run['chars'])}
             fonts=page.get_fonts(full=True)
             for row in fonts:
-                kind,value=document.xref_get_key(row[0],'ToUnicode')
-                if kind=='xref':cmap_owners.setdefault(int(value.split()[0]),set()).add(row[0])
+                # PyMuPDF uses xref 0 when a page font dictionary is direct
+                # rather than an indirect object. Such a font has no stable
+                # object identity for xref_get_key/extract_font.
+                if row[0] > 0:
+                    kind,value=document.xref_get_key(row[0],'ToUnicode')
+                    if kind=='xref':cmap_owners.setdefault(int(value.split()[0]),set()).add(row[0])
             for name in missing:
                 matches={row[0] for row in fonts if _font_key(row[3])==name}
                 if len(matches)!=1:
                     ambiguous.update(matches)
                     diagnostics['unresolved'].append(dict(font_xref=None,font_name=name,reason='ambiguous or missing page font resource'))
-                else:affected[next(iter(matches))]=name
+                else:
+                    xref=next(iter(matches))
+                    if xref <= 0:
+                        diagnostics['unresolved'].append(dict(font_xref=0,font_name=name,
+                            reason='direct page font dictionary has no indirect xref for source-grounded mapping'))
+                    else:
+                        affected[xref]=name
         used_cmaps={}
         for xref,name in affected.items():
             if xref in ambiguous:continue

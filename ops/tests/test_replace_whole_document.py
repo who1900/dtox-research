@@ -143,6 +143,32 @@ class WholeDocumentTests(unittest.TestCase):
         owner.rollback_plan(self.journal,qdrant=self.qdrant,maintenance=True)
         self.assertEqual(self.snapshot(),before)
 
+    def test_apply_checks_before_and_complete_published_state_once(self):
+        self.prepare()
+        verify=owner._verify_document
+        with patch.object(owner,'_verify_document',wraps=verify) as calls:
+            owner.apply_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+        self.assertEqual([call.args[2] for call in calls.call_args_list],['before','published'])
+
+    def test_published_verification_failure_rolls_back_exact_surfaces(self):
+        before=self.snapshot();self.prepare()
+        verify=owner._verify_document
+        def fail_published(plan,client,mode):
+            verify(plan,client,mode)
+            if mode=='published':raise owner.RepairError('published verification failed')
+        with patch.object(owner,'_verify_document',side_effect=fail_published):
+            with self.assertRaisesRegex(owner.RepairError,'published verification failed'):
+                owner.apply_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+        self.assertEqual(self.snapshot(),before)
+        self.assertEqual(owner._load(self.journal)['phase'],'rolled_back')
+
+    def test_published_verifier_detects_content_drift(self):
+        self.prepare()
+        plan=owner.apply_plan(self.journal,qdrant=self.qdrant,maintenance=True)
+        self.qdrant.points[self.newid]['payload']['text']='unexpected published text'
+        with self.assertRaisesRegex(owner.RepairError,'Qdrant set/content drift'):
+            owner._verify_document(plan,self.qdrant,'published')
+
     def test_complete_owner_uses_bounded_fts_rowids(self):
         traced=[];connect=owner.labels._connect
         def capture(*args,**kwargs):

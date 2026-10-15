@@ -58,5 +58,23 @@ class SourceFontUnicodeTests(unittest.TestCase):
         self.assertTrue(all(m['tounicode_created'] and m['tounicode_before_sha256'] is None for m in proof['mappings']))
         self.assertEqual(proof['unresolved'][0]['glyph_name'],'unknownmath')
 
+    def test_direct_font_xref_zero_is_reported_without_xref_lookup(self):
+        class Page:
+            def get_texttrace(self):return [{'font':'CMEX10','chars':[(65533,1)]}]
+            def get_fonts(self,full):return [(0,'','Type1','CMEX10','F1')]
+        class Document:
+            def __iter__(self):return iter([Page()])
+            def xref_get_key(self,xref,key):
+                if xref == 0:raise AssertionError('xref zero is a direct font dictionary')
+                raise AssertionError('no indirect font should be inspected')
+            def close(self):pass
+        raw=b'%PDF-direct-font-fixture'
+        with patch('fitz.open',return_value=Document()):
+            derived,proof=adapter.normalize_pdf_bytes(raw)
+        self.assertEqual(derived,raw)
+        self.assertEqual(proof['mappings'],[])
+        self.assertEqual(proof['unresolved'][0]['font_xref'],0)
+        self.assertIn('direct page font dictionary',proof['unresolved'][0]['reason'])
+
 
 if __name__=='__main__':unittest.main()

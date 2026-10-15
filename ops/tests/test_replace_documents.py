@@ -217,6 +217,250 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(worker._get_targets(base, ('failed',))[0]['paper_id'], 'p1')
 
 
+
+class JournalCompressionTests(unittest.TestCase):
+    def test_temp_write_failure_retains_exact_raw_and_next_document_continues(self):
+        import gzip
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            conn = worker._connect(worker.db_path(base))
+            worker._schema(conn)
+            raw_by_paper = {}
+            for paper in ('first', 'next'):
+                path = base / (paper + '.json')
+                raw = json.dumps({'phase': 'applied', 'paper': {'arxiv_id': paper}}).encode()
+                path.write_bytes(raw)
+                raw_by_paper[paper] = raw
+                conn.execute("INSERT INTO targets(paper_id,cache_ufffd,source_ufffd,empty_fulltext,status,journal_path,created_at,updated_at) VALUES(?,0,0,0,'applied',?,'now','now')",
+                             (paper, str(path)))
+            conn.commit()
+            conn.close()
+            def load(path):
+                raw = Path(path).read_bytes()
+                return json.loads(gzip.decompress(raw) if raw.startswith(b'\x1f\x8b') else raw)
+            def atomic(path, content):
+                if Path(path).name.startswith('first'):
+                    raise PermissionError('compressed temporary write failed')
+                Path(path).write_bytes(content)
+            owner = types.SimpleNamespace(_load=load, labels=types.SimpleNamespace(_atomic=atomic))
+            runtime = dict(owner=owner)
+            results = []
+            with patch.object(worker, 'write_status'):
+                for paper in ('first', 'next'):
+                    results.append(worker._compress_applied_journal(
+                        base, paper, base / (paper + '.json'), runtime, {}))
+            self.assertEqual(results, [base / 'first.json', base / 'next.json.gz'])
+            self.assertEqual((base / 'first.json').read_bytes(), raw_by_paper['first'])
+            self.assertEqual(gzip.decompress((base / 'next.json.gz').read_bytes()), raw_by_paper['next'])
+            rows = {row['paper_id']: row for row in worker._get_targets(base, ('applied',))}
+            self.assertEqual(rows['first']['journal_path'], str(base / 'first.json'))
+            self.assertIn('PermissionError:', json.loads(rows['first']['metrics_json'])['compression_deferred'])
+            self.assertEqual(rows['next']['journal_path'], str(base / 'next.json.gz'))
+
+    def test_compression_failure_without_selected_applied_receipt_stops(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            owner = types.SimpleNamespace(_load=lambda path: {'phase': 'prepared'})
+            runtime = dict(owner=owner)
+            with patch.object(worker, '_get_targets', return_value=[dict(journal_path=str(base / 'missing'), metrics_json='{}')]):
+                with self.assertRaisesRegex(worker.WorkerError, 'accepted journal changed'):
+                    worker._compress_applied_journal(base, 'paper', base / 'missing', runtime, {})
+
+
+class ContinuousStageTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def stages(self, base, acquire, candidate, prepare, apply):
+        owner = types.SimpleNamespace(prepare_document_replacement=prepare)
+        runtime = dict(owner=owner, document_cache=types.SimpleNamespace(safe_id=lambda value: value),
+                       paths={}, client=object(), worker=object())
+        with contextlib.ExitStack() as stack:
+            for name, value in (('_check_storage', lambda *a: None),
+                                ('_state_row', lambda *a: {}), ('_update', lambda *a, **kw: None),
+                                ('_get_targets', lambda *a: []),
+                                ('_advance_rowid_floors', lambda *a: None),
+                                ('_acquire_one', acquire), ('_prepare_candidate', candidate),
+                                ('_apply_batch', apply)):
+                stack.enter_context(patch.object(worker, name, side_effect=value))
+            stack.enter_context(patch.object(worker, 'PREFETCH_WORKERS', 2))
+            stack.enter_context(patch.object(worker, 'CANDIDATE_WORKERS', 2))
+            stack.enter_context(patch.object(worker, 'MAX_IN_FLIGHT', 4))
+            yield runtime
+
+    def test_slow_source_does_not_block_publication_or_continuous_refill(self):
+        import threading
+        from unittest.mock import Mock
+        release = threading.Event()
+        main_thread = threading.get_ident()
+        active, published, peak = set(), [], [0]
+        lock = threading.Lock()
+        def acquire(paper, *args):
+            with lock:
+                active.add(paper)
+                peak[0] = max(peak[0], len(active))
+            if paper == 'slow' and not release.wait(5):
+                raise AssertionError('slow source blocked the independent pipeline')
+            return {}, {}
+        def prepare(paper, **kwargs):
+            self.assertEqual(threading.get_ident(), main_thread)
+            return {'phase': 'prepared'}
+        def apply(plans, *args):
+            self.assertEqual(threading.get_ident(), main_thread)
+            for paper, _, _ in plans:
+                with lock:
+                    active.remove(paper)
+                published.append(paper)
+                if paper == 'fast6':
+                    release.set()
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            records = [dict(paper_id=paper) for paper in ['slow'] + [f'fast{i}' for i in range(7)]]
+            with self.stages(base, acquire, lambda *a: {}, prepare, apply) as runtime:
+                worker._run_stages(records, runtime, base, base, {})
+        self.assertTrue(release.is_set())
+        self.assertLess(published.index('fast6'), published.index('slow'))
+        self.assertEqual(set(published), {r['paper_id'] for r in records})
+        self.assertLessEqual(peak[0], 4)
+
+    def test_preparation_orders_existing_cache_sizes_with_prepared_first(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory)
+            cache = types.SimpleNamespace(safe_id=lambda value: value)
+            for paper, size in [('small', 10), ('large', 900), ('tie-b', 80),
+                                ('tie-a', 80), ('ready', 1), ('empty', 0)]:
+                (cache_dir / (paper + '.json')).write_bytes(b'x' * size)
+            records = [dict(paper_id=p, status='prepared' if p == 'ready' else 'pending')
+                       for p in ('small', 'tie-b', 'empty', 'large', 'ready', 'tie-a', 'absent')]
+            ordered = worker._order_preparation(records, cache_dir, cache)
+            self.assertEqual([row['paper_id'] for row in ordered],
+                             ['ready', 'large', 'tie-a', 'tie-b', 'small', 'absent', 'empty'])
+            self.assertEqual(records[0]['paper_id'], 'small')
+        with patch.object(Path, 'lstat', side_effect=PermissionError('denied')):
+            with self.assertRaises(PermissionError):
+                worker._order_preparation(records, cache_dir, cache)
+
+    def test_source_completion_feeds_candidates_while_writer_is_blocked(self):
+        import threading
+        entered_writer, candidate_during_write = threading.Event(), threading.Event()
+        published = []
+        def acquire(paper, *args):
+            if paper == 'next' and not entered_writer.wait(5):
+                raise AssertionError('first document never reached writer')
+            return {}, {}
+        def candidate(paper, *args):
+            if paper == 'next':
+                self.assertTrue(entered_writer.is_set())
+                candidate_during_write.set()
+            return {}
+        def apply(plans, *args):
+            for paper, _, _ in plans:
+                if paper == 'first':
+                    entered_writer.set()
+                    self.assertTrue(candidate_during_write.wait(5),
+                                    'candidate dispatch stopped while writer was busy')
+                published.append(paper)
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            with self.stages(base, acquire, candidate,
+                             lambda *a, **kw: {'phase': 'prepared'}, apply) as runtime:
+                worker._run_stages([dict(paper_id=p) for p in ('first', 'next')],
+                                   runtime, base, base, {})
+        self.assertEqual(published, ['first', 'next'])
+
+    def test_unknown_source_and_candidate_defects_are_local_but_storage_stops(self):
+        from unittest.mock import Mock
+        import errno
+        for stage in ('source', 'candidate'):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
+                def acquire(paper, *args):
+                    if paper == 'bad' and stage == 'source':
+                        raise ValueError('source input defect')
+                    return {}, {}
+                def candidate(paper, *args):
+                    if paper == 'bad' and stage == 'candidate':
+                        raise ValueError('candidate input defect')
+                    return {}
+                applied = []
+                def apply(plans, *args):
+                    applied.extend(paper for paper, _, _ in plans)
+                with self.stages(Path(directory), acquire, candidate,
+                                 lambda *a, **kw: {'phase': 'prepared'}, apply) as runtime, \
+                        patch.object(worker, '_record_error') as error:
+                    worker._run_stages([dict(paper_id=p) for p in ('bad', 'good')],
+                                       runtime, Path(directory), Path(directory), {})
+                    self.assertEqual(applied, ['good'])
+                    self.assertEqual(error.call_args.args[1], 'bad')
+        with tempfile.TemporaryDirectory() as directory:
+            failure = Mock(side_effect=OSError(errno.ENOSPC, 'disk full'))
+            apply = Mock()
+            with self.stages(Path(directory), failure, lambda *a: {}, Mock(), apply) as runtime:
+                with self.assertRaises(OSError):
+                    worker._run_stages([dict(paper_id='bad')], runtime,
+                                       Path(directory), Path(directory), {})
+            apply.assert_not_called()
+
+    def test_prepared_journal_survives_local_prepare_exception(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            journal = base / 'journal.json'
+            def prepare(*args, **kwargs):
+                journal.write_text('{}')
+                raise ValueError('post-journal input defect')
+            apply = Mock()
+            with self.stages(base, lambda *a: ({}, {}), lambda *a: {}, prepare, apply) as runtime, \
+                    patch.object(worker, '_journal_path', return_value=journal), \
+                    patch.object(worker, '_update') as update:
+                runtime['owner']._load = lambda path: {'phase': 'prepared'}
+                worker._run_stages([dict(paper_id='paper')], runtime, base, base, {})
+            self.assertEqual(update.call_args.args[2], 'prepared')
+            self.assertIn('ValueError:', update.call_args.kwargs['reason'])
+            apply.assert_not_called()
+
+    def test_candidate_transport_retries_without_hiding_invalid_inputs(self):
+        with patch.object(worker, '_prepare_candidate', side_effect=[TimeoutError('Qdrant busy'), {}]) as build, \
+                patch.object(worker.time, 'sleep') as sleep:
+            result, metrics = worker._candidate_one('paper', {}, {}, {}, Path('.'), {})
+            self.assertEqual(result, {})
+            self.assertEqual(build.call_count, 2)
+            sleep.assert_called_once_with(5)
+        with patch.object(worker, '_prepare_candidate', side_effect=ValueError('bad input')), \
+                patch.object(worker.time, 'sleep') as sleep:
+            with self.assertRaises(ValueError):
+                worker._candidate_one('paper', {}, {}, {}, Path('.'), {})
+            sleep.assert_not_called()
+
+    def test_only_explicitly_trusted_matching_terminal_skips_recovery_readback(self):
+        from unittest.mock import Mock
+        for trusted, status, expected_readback in ((True, 'applied', False),
+                                                    (False, 'applied', True),
+                                                    (True, 'applying', True)):
+            with self.subTest(trusted=trusted, status=status), tempfile.TemporaryDirectory() as directory:
+                journal = Path(directory) / 'journals' / 'paper.json'
+                journal.parent.mkdir()
+                journal.write_text('{}')
+                owner = types.SimpleNamespace(_load=Mock(return_value={'phase': 'applied'}),
+                                              _verify_document=Mock())
+                update, gate = Mock(), Mock()
+                worker.recover_journals([dict(paper_id='paper', status=status, journal_path=str(journal))],
+                                        owner=owner, qdrant=object(), gate_factory=gate, update=update,
+                                        trusted_terminal=trusted)
+                self.assertEqual(owner._verify_document.called, expected_readback)
+                self.assertEqual(update.called, expected_readback)
+                gate.assert_not_called()
+                if not expected_readback:
+                    self.assertEqual(owner._load.call_count, 1)
+
+    def test_chained_document_failure_keeps_root_cause(self):
+        try:
+            try:
+                raise ValueError('bad source')
+            except ValueError as cause:
+                raise RuntimeError('parse failed') from cause
+        except RuntimeError as error:
+            self.assertEqual(worker._error_reason(error),
+                             'RuntimeError:parse failed <- ValueError:bad source')
+
+
 class FaultPolicyTests(unittest.TestCase):
     def runtime(self):
         from ops.corpus_quality import fresh_sources
@@ -264,10 +508,11 @@ class FaultPolicyTests(unittest.TestCase):
             conn.commit()
             conn.close()
             runtime = dict(self.runtime(), owner=object(), client=object(), worker=object(),
-                           document_cache=types.SimpleNamespace(safe_id=lambda value: value))
+                           document_cache=types.SimpleNamespace(safe_id=lambda value: value), paths={'cache_dir': base})
             with patch.object(worker, '_locks', return_value=contextlib.nullcontext()), \
                     patch.object(worker, '_load_runtime', return_value=runtime), \
                     patch.object(worker, '_runtime_preflight'), patch.object(worker, '_rowid_floors', return_value={}), \
+                    patch.object(worker, '_order_preparation', side_effect=lambda rows, cache_dir, cache: rows), \
                     patch.object(worker, '_check_storage'), \
                     patch.object(worker, 'ThreadPoolExecutor', ImmediatePool), \
                     patch.object(worker.os, 'kill', return_value=None), \
@@ -277,7 +522,7 @@ class FaultPolicyTests(unittest.TestCase):
             self.assertEqual(acquire.call_count, 4)
             self.assertEqual(result['statuses'], {'deferred': 4})
 
-    def test_manifest_invalid_prepare_defers_one_document_but_unknown_errors_stop(self):
+    def test_document_prepare_errors_defer_and_continue(self):
         from concurrent.futures import Future
         from pipeline import document_cache
         from unittest.mock import Mock
@@ -301,11 +546,12 @@ class FaultPolicyTests(unittest.TestCase):
                                  [('a-invalid',), ('b-valid',)])
                 conn.commit()
                 conn.close()
-                prepare = Mock(side_effect=[error, {'phase': 'prepared'}])
+                prepare = Mock(side_effect=lambda paper_id, **kwargs: (_ for _ in ()).throw(error)
+                               if paper_id == 'a-invalid' else {'phase': 'prepared'})
                 owner = types.SimpleNamespace(RepairError=type('RepairError', (Exception,), {}),
                                               prepare_document_replacement=prepare)
                 runtime = dict(self.runtime(), owner=owner, client=object(), worker=object(),
-                               document_cache=document_cache, paths={})
+                               document_cache=document_cache, paths={'cache_dir': base})
                 applied = []
                 def apply(plans, runtime, base, service):
                     for paper_id, journal, metrics in plans:
@@ -314,23 +560,19 @@ class FaultPolicyTests(unittest.TestCase):
                 with patch.object(worker, '_locks', return_value=contextlib.nullcontext()), \
                         patch.object(worker, '_load_runtime', return_value=runtime), \
                         patch.object(worker, '_runtime_preflight'), patch.object(worker, '_rowid_floors', return_value={}), \
+                    patch.object(worker, '_order_preparation', side_effect=lambda rows, cache_dir, cache: rows), \
                         patch.object(worker, '_check_storage'), patch.object(worker, 'ThreadPoolExecutor', ImmediatePool), \
                         patch.object(worker.os, 'kill', return_value=None), patch.object(worker, '_state_row', return_value={}), \
                         patch.object(worker, '_acquire_one', return_value=({}, {})), \
                         patch.object(worker, '_prepare_candidate', return_value={}), \
                         patch.object(worker, '_advance_rowid_floors'), patch.object(worker, '_compress_applied_journal'), \
                         patch.object(worker, '_apply_batch', side_effect=apply):
-                    if isinstance(error, document_cache.ManifestInvalid):
-                        result = worker.run(base, base)
-                        self.assertEqual(result['statuses'], {'applied': 1, 'deferred': 1})
-                        self.assertEqual(applied, ['b-valid'])
-                        self.assertEqual(prepare.call_count, 2)
-                        self.assertIn('ManifestInvalid:', worker._get_targets(base, ('deferred',))[0]['reason'])
-                    else:
-                        with self.assertRaisesRegex(RuntimeError, 'unknown defect'):
-                            worker.run(base, base)
-                        self.assertEqual(applied, [])
-                        self.assertEqual(prepare.call_count, 1)
+                    result = worker.run(base, base)
+                    self.assertEqual(result['statuses'], {'applied': 1, 'deferred': 1})
+                    self.assertEqual(applied, ['b-valid'])
+                    self.assertEqual(prepare.call_count, 2)
+                    self.assertIn(type(error).__name__ + ':',
+                                  worker._get_targets(base, ('deferred',))[0]['reason'])
 
     def test_http_retry_after_is_bounded_and_404_not_retried(self):
         from unittest.mock import Mock
@@ -367,20 +609,18 @@ class FaultPolicyTests(unittest.TestCase):
                       urllib.error.HTTPError('url', 400, 'bad', {}, None)):
             self.assertNotIsInstance(worker._shared_failure('fatal', error), worker.RetryableWorkerError)
 
-    def test_embedding_outage_is_retryable_bad_json_and_vectors_are_fatal(self):
+    def test_embedding_outage_retries_invalid_json_and_vectors_defer(self):
         runtime = {'recipe': {'endpoint': 'http://127.0.0.1:99/embed_batch'}}
         for error in (TimeoutError(), ValueError('invalid JSON')):
             with patch.object(worker.urllib.request, 'urlopen', side_effect=error):
-                with self.assertRaises(worker.WorkerError) as caught:
+                with self.assertRaises(worker.RetryableWorkerError if isinstance(error, TimeoutError)
+                                       else worker.DeferredPaper):
                     worker._embedder(runtime, {})(['text'])
-            self.assertEqual(isinstance(caught.exception, worker.RetryableWorkerError),
-                             isinstance(error, TimeoutError))
         for value in ({'vectors': []}, {'vectors': [[0.0] * 384]}):
             with patch.object(worker.urllib.request, 'urlopen', return_value=contextlib.nullcontext(None)), \
                     patch.object(worker.json, 'load', return_value=value):
-                with self.assertRaises(worker.WorkerError) as caught:
+                with self.assertRaises(worker.DeferredPaper):
                     worker._embedder(runtime, {})(['text'])
-            self.assertNotIsInstance(caught.exception, worker.RetryableWorkerError)
 
     def test_health_preflight_classifies_outage_and_invalid_receipt(self):
         with patch.object(worker.urllib.request, 'urlopen', side_effect=ConnectionRefusedError()):
@@ -499,7 +739,9 @@ class FaultPolicyTests(unittest.TestCase):
     def test_managed_cli_exit_and_lifecycle_classification(self):
         for error, code, status in ((worker.RetryableWorkerError('service down'), 75, 'retry_wait'),
                                     (worker.WorkerError('integrity'), 78, 'needs_attention'),
-                                    (ValueError('unknown bug'), 78, 'needs_attention')):
+                                    (ValueError('unknown bug'), 78, 'needs_attention'),
+                                    (MemoryError('resource shortage'), 75, 'retry_wait'),
+                                    (OSError(worker.errno.EMFILE, 'descriptors exhausted'), 75, 'retry_wait')):
             with tempfile.TemporaryDirectory() as directory, patch.object(worker, 'run', side_effect=error):
                 self.assertEqual(worker.main(['run', '--managed', '--base', directory]), code)
                 value = json.loads((Path(directory) / 'bulk-controller-status.json').read_text())

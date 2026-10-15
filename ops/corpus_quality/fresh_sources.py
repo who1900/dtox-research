@@ -374,6 +374,8 @@ def _parse_pdf(artifact, timeout, native_build=None):
     except extractor.PDFConversionError as exc:
         if exc.reason == "conversion_timeout":
             raise FreshSourceError("PDF conversion timed out for this source") from exc
+        if exc.reason in {"conversion_failed", "invalid_output"}:
+            raise FreshSourceError("PDF parser rejected this source artifact") from exc
         raise
     finally:
         path.unlink(missing_ok=True)
