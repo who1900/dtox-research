@@ -3,578 +3,268 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>dtox research</title>
-<meta name="description" content="Web3-first evidence engine for AI agents over the full text of papers, protocol specs and whitepapers. Free MCP endpoint, paid x402 surface, verdicts attested on Solana.">
+<title>dtox research — evidence for builders and AI agents</title>
+<meta name="description" content="Research papers, protocol specifications and source evidence for Web3 builders and AI agents. Connect the free MCP and try the three-minute research walkthrough.">
 <meta property="og:title" content="dtox research">
-<meta property="og:description" content="Web3-first evidence engine for AI agents over the full text of papers, protocol specs and whitepapers.">
+<meta property="og:description" content="Find relevant research, read the methods and assumptions, and connect your engineering decisions to source evidence.">
 <meta property="og:type" content="website">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%231a1a1a'/%3E%3Crect x='8' y='8' width='16' height='4' fill='%23fafaf3'/%3E%3Crect x='8' y='14' width='10' height='4' fill='%23fafaf3'/%3E%3Crect x='8' y='20' width='16' height='4' fill='%23fafaf3'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-  :root {
-    --bg: #fafaf3;
-    --bg-panel: #f0f0e7;
-    --ink: #1a1a1a;
-    --muted: #686860;
-    --shadow: rgba(27,28,24,0.04);
-    --shadow-strong: rgba(27,28,24,0.08);
-    --ok: #1a1a1a;
-    --link: #1a1a1a;
-  }
-
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #171814;
-      --bg-panel: #202119;
-      --ink: #fafaf3;
-      --muted: #a3a398;
-      --shadow: rgba(0,0,0,0.28);
-      --shadow-strong: rgba(0,0,0,0.4);
-      --ok: #fafaf3;
-      --link: #fafaf3;
-    }
-  }
-
-  * { box-sizing: border-box; }
-
-  html { -webkit-text-size-adjust: 100%; }
-
-  body {
-    margin: 0;
-    background: var(--bg);
-    color: var(--ink);
-    font-family: "Inter", -apple-system, sans-serif;
-    line-height: 1.55;
-    overflow-x: hidden;
-  }
-
-  ::selection { background: var(--ink); color: var(--bg); }
-
-  a { color: var(--link); }
-  a:not(.btn) { text-decoration-thickness: 1px; text-underline-offset: 3px; }
-
-  :focus-visible {
-    outline: 2px solid var(--ink);
-    outline-offset: 3px;
-  }
-
-  code, pre, .mono {
-    font-family: "Roboto Mono", ui-monospace, monospace;
-  }
-
-  .wrap {
-    max-width: 920px;
-    margin: 0 auto;
-    padding: 0 16px;
-  }
-
-  header.top {
-    padding: 28px 0 0;
-  }
-
-  .top .wrap {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 16px;
-    flex-wrap: wrap;
-  }
-
-  .brand {
-    font-family: "Roboto Mono", monospace;
-    font-size: 13px;
-    letter-spacing: 0.04em;
-    color: var(--muted);
-    text-decoration: none;
-  }
-
-  nav.top-links {
-    display: flex;
-    gap: 20px;
-    font-family: "Roboto Mono", monospace;
-    font-size: 12px;
-    letter-spacing: 0.02em;
-  }
-
-  nav.top-links a { text-decoration: none; color: var(--muted); }
-  nav.top-links a:hover { color: var(--ink); }
-
-  section {
-    padding: 64px 0;
-  }
-
-  section.hero { padding: 72px 0 56px; }
-
-  h1 {
-    font-family: "Inter", sans-serif;
-    font-weight: 700;
-    letter-spacing: -0.03em;
-    font-size: clamp(38px, 7vw, 64px);
-    line-height: 1.02;
-    margin: 0 0 20px;
-  }
-
-  h2 {
-    font-family: "Inter", sans-serif;
-    font-weight: 600;
-    letter-spacing: -0.015em;
-    font-size: clamp(22px, 3.4vw, 28px);
-    margin: 0 0 28px;
-  }
-
-  h3 {
-    font-family: "Inter", sans-serif;
-    font-weight: 600;
-    letter-spacing: -0.01em;
-    font-size: 17px;
-    margin: 0 0 8px;
-  }
-
-  .lede {
-    font-size: clamp(17px, 2.4vw, 20px);
-    color: var(--muted);
-    max-width: 62ch;
-    margin: 0 0 40px;
-  }
-
-  .section-label {
-    font-family: "Roboto Mono", monospace;
-    font-size: 11px;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: var(--muted);
-    margin: 0 0 16px;
-  }
-
-  .install {
-    background: var(--bg-panel);
-    padding: 20px;
-    box-shadow: 0 0 24px var(--shadow);
-    max-width: 640px;
-  }
-
-  .install-row {
-    display: flex;
-    align-items: flex-start;
-    gap: 12px;
-    margin-bottom: 12px;
-  }
-
-  .install-row:last-child { margin-bottom: 0; }
-
-  .install pre {
-    margin: 0;
-    padding: 12px 14px;
-    background: var(--bg);
-    font-size: 12.5px;
-    overflow-x: auto;
-    flex: 1;
-    box-shadow: inset 0 0 0 var(--shadow);
-    white-space: pre-wrap;
-    word-break: break-all;
-  }
-
-  .copy-btn {
-    font-family: "Roboto Mono", monospace;
-    font-size: 11px;
-    letter-spacing: 0.03em;
-    background: var(--ink);
-    color: var(--bg);
-    border: none;
-    padding: 10px 14px;
-    cursor: pointer;
-    white-space: nowrap;
-    flex-shrink: 0;
-  }
-
-  .copy-btn:hover { opacity: 0.85; }
-  .copy-btn:active { opacity: 0.7; }
-
-  .install-caption {
-    font-family: "Roboto Mono", monospace;
-    font-size: 11px;
-    color: var(--muted);
-    margin: 14px 0 0;
-  }
-
-  .grid3 {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 2px;
-    background: var(--shadow-strong);
-  }
-
-  .grid3 > div {
-    background: var(--bg-panel);
-    padding: 22px 20px;
-  }
-
-  @media (max-width: 720px) {
-    .grid3 { grid-template-columns: 1fr; }
-  }
-
-  .card-desc { color: var(--muted); font-size: 14.5px; margin: 0; }
-
-  ul.plain { margin: 0; padding: 0; list-style: none; }
-  ul.plain li {
-    padding: 12px 0;
-    color: var(--muted);
-    font-size: 15px;
-  }
-  ul.plain li + li { }
-  ul.plain.divided li {
-    box-shadow: 0 -1px 0 0 transparent;
-  }
-  ul.plain.divided { background: var(--bg-panel); padding: 4px 20px; box-shadow: 0 0 24px var(--shadow); }
-  ul.plain.divided li { padding: 14px 0; }
-  ul.plain.divided li:not(:last-child) { border-bottom: none; box-shadow: inset 0 -1px 0 var(--shadow-strong); }
-
-  .flow {
-    font-family: "Roboto Mono", monospace;
-    font-size: 12.5px;
-    line-height: 2.1;
-    background: var(--bg-panel);
-    padding: 20px 22px;
-    box-shadow: 0 0 24px var(--shadow);
-    overflow-x: auto;
-    white-space: pre;
-    margin: 0 0 28px;
-  }
-
-  .why {
-    max-width: 68ch;
-    color: var(--muted);
-    font-size: 15px;
-    margin: 0 0 32px;
-  }
-  .why strong { color: var(--ink); font-weight: 600; }
-
-  .example {
-    background: var(--bg-panel);
-    padding: 20px 22px;
-    box-shadow: 0 0 24px var(--shadow);
-    margin-bottom: 16px;
-  }
-
-  .example .tag {
-    font-family: "Roboto Mono", monospace;
-    font-size: 10.5px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--muted);
-    margin: 0 0 10px;
-  }
-
-  .example p { margin: 0 0 10px; font-size: 14.5px; }
-  .example p:last-child { margin-bottom: 0; }
-
-  .example a.explorer {
-    font-family: "Roboto Mono", monospace;
-    font-size: 12.5px;
-    word-break: break-all;
-  }
-
-  table.pricing {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 14.5px;
-    background: var(--bg-panel);
-    box-shadow: 0 0 24px var(--shadow);
-  }
-
-  table.pricing th, table.pricing td {
-    text-align: left;
-    padding: 12px 18px;
-  }
-
-  table.pricing thead th {
-    font-family: "Roboto Mono", monospace;
-    font-size: 11px;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--muted);
-    font-weight: 500;
-  }
-
-  table.pricing tbody tr:not(:last-child) td {
-    box-shadow: inset 0 -1px 0 var(--shadow-strong);
-  }
-
-  table.pricing td.price { font-family: "Roboto Mono", monospace; }
-
-  .badge {
-    display: inline-block;
-    font-family: "Roboto Mono", monospace;
-    font-size: 11px;
-    letter-spacing: 0.04em;
-    color: var(--muted);
-    background: var(--bg-panel);
-    padding: 4px 10px;
-    margin-bottom: 20px;
-  }
-
-  .stats-grid {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 2px;
-    background: var(--shadow-strong);
-    margin-bottom: 14px;
-  }
-
-  @media (max-width: 640px) {
-    .stats-grid { grid-template-columns: repeat(2, 1fr); }
-  }
-
-  .stat {
-    background: var(--bg-panel);
-    padding: 22px 18px;
-  }
-
-  .stat .num {
-    font-family: "Roboto Mono", monospace;
-    font-size: clamp(22px, 4vw, 30px);
-    font-weight: 500;
-    display: block;
-    margin-bottom: 6px;
-  }
-
-  .stat .label {
-    font-size: 12.5px;
-    color: var(--muted);
-  }
-
-  .as-of {
-    font-family: "Roboto Mono", monospace;
-    font-size: 12px;
-    color: var(--muted);
-  }
-
-  footer {
-    padding: 40px 0 56px;
-  }
-
-  footer .wrap {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 12px;
-    font-family: "Roboto Mono", monospace;
-    font-size: 12px;
-    color: var(--muted);
-  }
-
-  footer a { color: var(--muted); }
-  footer a:hover { color: var(--ink); }
-
-  .foot-links { display: flex; gap: 20px; flex-wrap: wrap; }
+:root { --bg:#fafaf3; --bg-panel:#f0f0e7; --ink:#1a1a1a; --muted:#686860; --line:rgba(27,28,24,.12); }
+@media (prefers-color-scheme:dark) { :root { --bg:#171814; --bg-panel:#202119; --ink:#e5e6dc; --muted:#b0b2a4; --line:rgba(225,228,210,.16); } }
+* { box-sizing:border-box; }
+html { -webkit-text-size-adjust:100%; }
+body { margin:0; background:var(--bg); color:var(--ink); font-family:Inter,-apple-system,sans-serif; line-height:1.6; }
+::selection { background:var(--ink); color:var(--bg); }
+a { color:inherit; text-underline-offset:4px; }
+a:hover { text-decoration-thickness:2px; }
+:focus-visible { outline:2px solid var(--ink); outline-offset:4px; }
+code,pre,.mono { font-family:'Roboto Mono',ui-monospace,monospace; }
+code { font-size:.9em; overflow-wrap:anywhere; }
+.wrap { max-width:952px; padding:0 20px; margin:auto; }
+.top { padding-top:24px; }
+.top .wrap, .top-links, .actions, .foot-links { display:flex; align-items:center; flex-wrap:wrap; gap:18px; }
+.top .wrap { justify-content:space-between; }
+.brand,.top-links,.section-label,.badge,.as-of,.install-label,footer { font-family:'Roboto Mono',ui-monospace,monospace; }
+.brand { font-size:13px; text-decoration:none; }
+.top-links { gap:16px; font-size:12px; color:var(--muted); }
+.top-links a { min-height:40px; display:inline-flex; align-items:center; text-decoration:none; }
+section { padding:64px 0; }
+.hero { padding:80px 0 56px; }
+h1,h2,h3 { line-height:1.15; letter-spacing:-.025em; }
+h1 { font-size:clamp(38px,6.6vw,64px); max-width:16ch; margin:0 0 24px; }
+h2 { font-size:clamp(25px,4vw,34px); margin:0 0 24px; }
+h3 { font-size:18px; margin:0 0 12px; }
+p { margin:0 0 20px; }
+.lede { color:var(--muted); font-size:clamp(17px,2.4vw,20px); max-width:64ch; margin-bottom:28px; }
+.section-label { text-transform:uppercase; letter-spacing:.1em; font-size:11px; color:var(--muted); margin:0 0 16px; }
+.why { max-width:70ch; color:var(--muted); margin-bottom:28px; }
+.actions { gap:12px; }
+.btn { display:inline-flex; min-height:44px; align-items:center; padding:10px 18px; background:var(--ink); color:var(--bg); text-decoration:none; font-size:14px; font-weight:600; }
+.btn.secondary { background:var(--bg-panel); color:var(--ink); }
+.grid3,.grid2,.tools-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:2px; background:var(--line); }
+.grid2,.tools-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+.card,.tool-item { background:var(--bg-panel); padding:24px; min-width:0; }
+.card p,.tool-item p { color:var(--muted); font-size:14px; margin:0; }
+.card a { display:inline-block; margin-top:16px; font-size:13px; }
+.install { background:var(--bg-panel); padding:22px; margin-bottom:24px; }
+.install-label { color:var(--muted); font-size:12px; margin:0 0 8px; }
+.install-row { display:flex; align-items:flex-start; gap:12px; margin-bottom:20px; }
+.install-row:last-child { margin-bottom:0; }
+.install pre { margin:0; padding:12px; background:var(--bg); flex:1; min-width:0; font-size:12px; white-space:pre-wrap; overflow-wrap:anywhere; }
+.copy-btn { min-height:42px; padding:10px 14px; border:0; cursor:pointer; flex-shrink:0; background:var(--ink); color:var(--bg); font-family:'Roboto Mono',monospace; font-size:12px; }
+.copy-btn:hover,.btn:hover { opacity:.88; }
+.copy-status { font-size:13px; color:var(--muted); min-height:22px; margin:0 0 20px; }
+.prompt { background:var(--bg-panel); padding:24px; margin:24px 0; }
+.prompt p { font-size:16px; margin-bottom:16px; }
+.steps { padding:0 0 0 24px; margin:28px 0; }
+.steps li { padding:8px 0 8px 6px; }
+.steps li::marker { font-family:'Roboto Mono',monospace; }
+.note { font-size:14px; color:var(--muted); max-width:75ch; }
+.flow { padding:20px; background:var(--bg-panel); font-size:13px; white-space:pre-wrap; overflow-wrap:anywhere; line-height:1.8; margin:28px 0; }
+.badge { display:inline-block; background:var(--bg-panel); color:var(--muted); font-size:11px; padding:5px 10px; margin-bottom:20px; }
+.tool-item { padding:18px 22px; }
+.tool-item h3 { font-size:14px; line-height:1.5; margin-bottom:6px; letter-spacing:0; }
+.stats-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:2px; background:var(--line); margin:28px 0 16px; }
+.stat { background:var(--bg-panel); padding:22px 16px; }
+.stat .num { display:block; font-family:'Roboto Mono',monospace; font-size:clamp(20px,3.4vw,29px); line-height:1.3; margin-bottom:8px; font-variant-numeric:tabular-nums; }
+.stat .label { font-size:12px; color:var(--muted); }
+.as-of { color:var(--muted); font-size:11px; }
+footer { border-top:1px solid var(--line); padding:32px 0 48px; font-size:12px; color:var(--muted); }
+footer .wrap { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:20px; }
+.foot-links { gap:20px; }
+@media(max-width:720px) { .grid3,.grid2,.tools-grid { grid-template-columns:1fr; } section { padding:44px 0; } .hero { padding-top:52px; } }
+@media(max-width:640px) { .stats-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .top-links { gap:14px; } .wrap { padding:0 18px; } }
 </style>
 </head>
 <body>
-
 <header class="top">
   <div class="wrap">
     <a class="brand" href="#top">dtox research</a>
-    <nav class="top-links">
-      <a href="#returns">what it returns</a>
-      <a href="#verdicts">verdicts</a>
-      <a href="#pricing">pricing</a>
-      <a href="#corpus">corpus</a>
-      <a href="#limits">limits</a>
+    <nav class="top-links" aria-label="Main navigation">
+      <a href="#try">try it</a><a href="#returns">capabilities</a><a href="#solana">Solana</a><a href="#corpus">corpus</a>
     </nav>
   </div>
 </header>
-
 <main>
-
 <section class="hero" id="top">
   <div class="wrap">
-    <h1>dtox research</h1>
-    <p class="lede">Web3-first evidence engine for AI agents over the full text of papers, protocol specs and whitepapers.</p>
-
+    <p class="section-label">Research for Web3 builders and AI agents</p>
+    <h1>Give your agent research it can read.</h1>
+    <p class="lede">Find relevant papers and protocol specifications. Read the methods, equations and assumptions. Connect your next engineering decision to source evidence.</p>
+    <div class="actions">
+      <a class="btn" href="#try">Try it in three minutes</a>
+      <a class="btn secondary" href="https://github.com/who1900/dtox-research#readme">Explore the project</a>
+    </div>
+  </div>
+</section>
+<section id="try">
+  <div class="wrap">
+    <p class="section-label">Start here · judging walkthrough</p>
+    <h2>One question. A source you can inspect.</h2>
+    <p class="why">Connect dtox to your MCP-compatible agent, then ask it to investigate an engineering question. Research reads are free, with no signup, API key or wallet required. The tools run inside your connected agent.</p>
     <div class="install">
+      <p class="install-label">Claude Code</p>
       <div class="install-row">
         <pre id="cmd-claude">claude mcp add --transport http dtox https://read.whoim.space/mcp</pre>
-        <button class="copy-btn" data-copy-target="cmd-claude" aria-label="Copy Claude Code install command">copy</button>
+        <button class="copy-btn" data-copy-target="cmd-claude" data-copy-label="Claude Code command" aria-label="Copy Claude Code command">copy</button>
       </div>
+      <p class="install-label">Codex</p>
       <div class="install-row">
-        <pre id="cmd-json">{"type":"http","url":"https://read.whoim.space/mcp"}</pre>
-        <button class="copy-btn" data-copy-target="cmd-json" aria-label="Copy generic MCP client config">copy</button>
+        <pre id="cmd-codex">codex mcp add dtox --url https://read.whoim.space/mcp</pre>
+        <button class="copy-btn" data-copy-target="cmd-codex" data-copy-label="Codex command" aria-label="Copy Codex command">copy</button>
       </div>
-      <p class="install-caption">No key, no signup. stdio-only clients can bridge with <code>npx -y mcp-remote https://read.whoim.space/mcp</code>.</p>
+      <p class="install-label">Other HTTP MCP clients · server URL</p>
+      <div class="install-row">
+        <pre id="cmd-url">https://read.whoim.space/mcp</pre>
+        <button class="copy-btn" data-copy-target="cmd-url" data-copy-label="MCP server URL" aria-label="Copy MCP server URL">copy</button>
+      </div>
     </div>
+    <div class="prompt">
+      <p class="section-label">Ask your agent</p>
+      <p id="demo-prompt">Find research on data availability sampling for blockchain light clients with limited bandwidth. Open a relevant paper, read its method and assumptions, and explain the implementation trade-offs with source citations. Distinguish the authors' findings from your own conclusions.</p>
+      <button class="copy-btn" data-copy-target="demo-prompt" data-copy-label="research prompt" aria-label="Copy research prompt">copy prompt</button>
+    </div>
+    <p class="copy-status" id="copy-status" role="status" aria-live="polite"></p>
+    <ol class="steps">
+      <li><strong>Discover.</strong> Use <code>find_papers</code> or <code>search_research_paper</code> to find candidate sources.</li>
+      <li><strong>Inspect.</strong> Open a result with <code>get_paper</code>, then read the relevant method with <code>read_paper_section</code>.</li>
+      <li><strong>Check the detail.</strong> Retrieve equations or algorithms with <code>get_code_or_math_spec</code>, or collect a cited packet with <code>get_research_bundle</code>.</li>
+    </ol>
+    <p class="note"><strong>A quick starting point:</strong> ask for paper <code>2005.11401</code>, <em>Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks</em>, then read its <code>Introduction</code>. Its card, outline and section read were checked through the public MCP on 17 October 2026.</p>
+    <p class="note">Look for the source link, the actual passage and a clear connection between the evidence and the agent's conclusion. <a href="https://github.com/who1900/dtox-research/blob/main/docs/agent-research-workflow.md">See the research workflow</a>.</p>
   </div>
 </section>
-
 <section id="returns">
   <div class="wrap">
-    <p class="section-label">What it returns</p>
-    <h2>Method sections, not paraphrases</h2>
-    <p class="why">Where available, source text is split by structure: equations in raw LaTeX, algorithms, tables and prose are first-class chunks. Body availability is per record; some records retain only abstracts. Thirteen public MCP tools cover exploring by paper (<code>find_papers</code>, <code>get_paper</code>, <code>read_paper_section</code>, <code>count_papers</code>, <code>similar_papers</code>), by passage (<code>search_research_paper</code>, <code>get_code_or_math_spec</code>, <code>compare_methods</code>, <code>research_trends</code>), by bounded reading packet (<code>get_research_bundle</code>), and by claim (<code>validate_project</code>, <code>get_verdict_message</code>, <code>record_signed_verdict</code>).</p>
-
+    <p class="section-label">What you can do</p>
+    <h2>From a promising abstract to an engineering decision.</h2>
+    <p class="why">Useful knowledge is scattered across papers, specifications and technical documents. An implementation often depends on an equation, a security assumption or a limitation buried in a later section. dtox brings those sources into the agent's workflow.</p>
     <div class="grid3">
-      <div>
-        <h3>Dense</h3>
-        <p class="card-desc">Papers by title and abstract with bge-base-en-v1.5 (768 dim), and millions of structural chunks with bge-small-en-v1.5 (384 dim), both int8 ONNX in Qdrant.</p>
-      </div>
-      <div>
-        <h3>Lexical</h3>
-        <p class="card-desc">BM25 over papers and over chunks in SQLite FTS5, fused with the dense channels by reciprocal rank. Exact terms like <code>GRPO</code> survive here and drown in embeddings alone.</p>
-      </div>
-      <div>
-        <h3>Citation graph</h3>
-        <p class="card-desc">One hop through citation edges from retrieved seeds. The graph traversal is seed-dependent: changing query wording can change the retrieved seeds and therefore the graph results. Citation links add a recall channel, not wording invariance. Copies of one paper from different sources are merged into one result.</p>
-      </div>
+      <div class="card"><h3>Read the method</h3><p>Open source sections, equations, algorithms, code and tables where available. Inspect the evidence behind the answer.</p></div>
+      <div class="card"><h3>Compare approaches</h3><p>Explore related work, follow citation links and compare two methods' reported results and assumptions.</p></div>
+      <div class="card"><h3>Investigate an idea</h3><p>Pass distinct technical claims to <code>validate_project</code>. Review the candidate papers and read the passages supporting each claim.</p></div>
     </div>
+    <div class="prompt">
+      <p class="section-label">Another way to try it</p>
+      <p id="claim-prompt">Use validate_project to investigate a retrieval-augmented language model. Evaluate this claim separately: "Retrieval augmented generation conditions language-model answers on retrieved documents." Show the candidate papers and supporting passages, then explain what still needs verification.</p>
+      <button class="copy-btn" data-copy-target="claim-prompt" data-copy-label="claim research prompt" aria-label="Copy claim research prompt">copy prompt</button>
+    </div>
+    <p class="note">Use dtox to investigate data availability, account abstraction, protocol incentives and agent research systems. Responses identify the source and available coverage, including full text and abstract-only records.</p>
   </div>
 </section>
-
-<section id="verdicts">
+<section id="solana">
   <div class="wrap">
-    <p class="section-label">Verifiable verdicts on Solana</p>
-    <h2>A retrieval score is not a verdict</h2>
-
-    <pre class="flow">search  -&gt;  read
-        -&gt;  get_verdict_message
-        -&gt;  agent signs with its own Solana wallet
-        -&gt;  record_signed_verdict
-        -&gt;  Solana Attestation Service attestation (devnet)</pre>
-
-    <p class="why">A retrieval score measures wording, never whether a paper makes a claim. The public write path is wallet-signed: an agent signs its verdict with an ed25519 keypair it controls. A signature proves signer identity, not independent reasoning. Distinct wallets alone do not establish scientific quorum or <strong>confirmed_prior_art</strong>; wallet-only agreement remains pending. Scientific settlement requires decisive agreement across known trusted model identities established by the server. Recorded claims and explicit links can reuse readings, but arbitrary paraphrases are not guaranteed to resolve to the same claim.</p>
-
-    <div class="example">
-      <p class="tag">Historical team demo, devnet</p>
-      <p>Claim: <em>GRPO removes the separate value critic model...</em>. Paper arXiv 2402.03300. Demo verdict: asserts, signed by team wallet A. This attestation demonstrates signer identity; it does not establish independent scientific confirmation or current registry status.</p>
-      <a class="explorer" href="https://explorer.solana.com/address/729nUikYt2SUJaq1Brx2YwXvgLT5J1eVp9sfo31ncswu?cluster=devnet" target="_blank" rel="noopener">explorer.solana.com/address/729nUikYt2SUJaq1Brx2YwXvgLT5J1eVp9sfo31ncswu</a>
+    <p class="section-label">Why Solana</p>
+    <h2>Agent research with attributable readings.</h2>
+    <span class="badge">Solana devnet integration</span>
+    <div class="grid2">
+      <div class="card"><h3>Wallet-signed readings · SAS</h3><p>An agent signs a canonical message containing the claim, paper and verdict. The attestor verifies the reviewer's signature and records the reading through Solana Attestation Service. The signature identifies who signed; the source evidence supports the reading.</p><a href="https://github.com/who1900/dtox-research/tree/main/attestor">Explore the attestor</a></div>
+      <div class="card"><h3>Agent payments · x402</h3><p>A separate MCP gateway implements per-call USDC payments for research tools and signed readings on Solana devnet. Builders can explore this integration alongside the free research endpoint.</p><a href="https://github.com/who1900/dtox-research/tree/main/x402-gateway">Explore the payment gateway</a></div>
     </div>
-
-    <div class="example">
-      <p class="tag">Historical team demo, devnet</p>
-      <p>Claim: <em>DeepSeek-R1-Zero is trained with large-scale reinforcement learning without supervised fine-tuning...</em>. Paper arXiv 2501.12948. Demo verdict: asserts, signed by team wallet B and reported through a paid x402 call. This historical example is not validation of the current payment lifecycle.</p>
-      <a class="explorer" href="https://explorer.solana.com/address/6pC4NS96euD9G7jPtjvXbVs1ffaWAjKdJMkX799Mq6eL?cluster=devnet" target="_blank" rel="noopener">explorer.solana.com/address/6pC4NS96euD9G7jPtjvXbVs1ffaWAjKdJMkX799Mq6eL</a>
-    </div>
-
-    <p class="why" style="margin-top: 20px;">Both reviewer wallets are run by the team, so these attestations show the mechanism, not independent consensus. The free MCP endpoint has no gateway USDC charge. In the updated gateway code, the paid signed write charges per batch attempt, not per accepted item. Payment does not remove sybil risk or establish scientific quorum.</p>
+    <pre class="flow">Read source evidence → prepare a verdict message
+→ agent wallet signs → verify signature → SAS attestation</pre>
+    <p class="note">The research walkthrough above uses the free endpoint. A wallet is used when signing a reading; payment and signing details are available in the integration guides.</p>
   </div>
 </section>
-
-<section id="pricing">
+<section id="how">
   <div class="wrap">
-    <p class="section-label">Payment transport with x402</p>
-    <h2>A paid MCP surface, USDC on Solana devnet</h2>
-    <span class="badge">devnet only at this stage</span>
-    <p class="why">Observed public payment endpoint: <code>https://read.whoim.space/x402/mcp</code>, Solana devnet only. EVM configuration is not proof of live multichain settlement. Prices are independently configured per call. The updated code settles paid signed writes upfront before the write handler; failures after settlement retain a receipt with no automatic refund. Paid reads use authorization and settle only after a successful handler. These changes have offline mocked SDK tests, not a newly deployed paid E2E verification.</p>
-    <p class="why">Paid <code>get_evidence_bundle</code> calls the same <code>get_research_bundle</code> as the free read endpoint, with bounded <code>limit</code>, <code>max_chars</code> and <code>strict</code> arguments. Unsupported filters are rejected. Payment transport does not imply exclusive evidence or scientific validation.</p>
-
-    <table class="pricing">
-      <thead>
-        <tr><th>Tool</th><th>Price</th></tr>
-      </thead>
-      <tbody>
-        <tr><td>get_evidence_bundle</td><td class="price">$0.01</td></tr>
-        <tr><td>get_code_or_math_spec</td><td class="price">$0.03</td></tr>
-        <tr><td>compare_methods</td><td class="price">$0.05</td></tr>
-        <tr><td>research_trends</td><td class="price">$0.03</td></tr>
-        <tr><td>validate_project</td><td class="price">$0.25</td></tr>
-        <tr><td>record_signed_verdict</td><td class="price">$0.01</td></tr>
-      </tbody>
-    </table>
-
-    <p class="why" style="margin-top: 20px;">Example settlement transaction: <a class="explorer" href="https://explorer.solana.com/tx/5DWkk85AFVHSTCqeSEbq8SpxEAtfkSRgQZLPJy9ZyCnTvZczsyD86yKELGWf5xYrDrF5wTvt3txUL19NFLYmrBvG?cluster=devnet" target="_blank" rel="noopener">explorer.solana.com/tx/5DWkk85AFVHSTCqeSEbq8SpxEAtfkSRgQZLPJy9ZyCnTvZczsyD86yKELGWf5xYrDrF5wTvt3txUL19NFLYmrBvG</a></p>
+    <p class="section-label">How it works</p>
+    <h2>Find the paper. Retrieve the passage. Follow the source.</h2>
+    <div class="grid3">
+      <div class="card"><h3>Semantic retrieval</h3><p>Paper-level search shortlists relevant documents, then passage-level search finds the useful detail within their contents.</p></div>
+      <div class="card"><h3>Exact technical terms</h3><p>Lexical search adds precise terms, identifiers and protocol names to the semantic retrieval channels.</p></div>
+      <div class="card"><h3>Citation links</h3><p>Citation neighbours provide another route to related work. Results carry source links and metadata for inspection.</p></div>
+    </div>
+    <p class="note" style="margin-top:24px">Built with FastAPI, Qdrant, SQLite FTS5 and ONNX embeddings, exposed through MCP. <a href="https://github.com/who1900/dtox-research#how-it-works">Read the architecture overview</a>.</p>
   </div>
 </section>
-
+<section id="tools">
+  <div class="wrap">
+    <p class="section-label">13 public MCP tools</p>
+    <h2>A research workflow inside your agent.</h2>
+    <div class="tools-grid">
+      <div class="tool-item"><h3><code>find_papers</code></h3><p>Discover papers and specifications.</p></div>
+      <div class="tool-item"><h3><code>search_research_paper</code></h3><p>Find indexed passages for a question.</p></div>
+      <div class="tool-item"><h3><code>get_paper</code></h3><p>Inspect a document card, outline and citations.</p></div>
+      <div class="tool-item"><h3><code>read_paper_section</code></h3><p>Read a selected source section.</p></div>
+      <div class="tool-item"><h3><code>count_papers</code></h3><p>Explore corpus counts and topic facets.</p></div>
+      <div class="tool-item"><h3><code>similar_papers</code></h3><p>Find semantically related documents.</p></div>
+      <div class="tool-item"><h3><code>get_code_or_math_spec</code></h3><p>Retrieve equations, algorithms, code and tables.</p></div>
+      <div class="tool-item"><h3><code>compare_methods</code></h3><p>Inspect evidence from two documents.</p></div>
+      <div class="tool-item"><h3><code>research_trends</code></h3><p>Explore topics and publication trends.</p></div>
+      <div class="tool-item"><h3><code>validate_project</code></h3><p>Investigate distinct technical claims.</p></div>
+      <div class="tool-item"><h3><code>get_research_bundle</code></h3><p>Collect a bounded packet of cited evidence.</p></div>
+      <div class="tool-item"><h3><code>get_verdict_message</code></h3><p>Prepare a canonical message for signing.</p></div>
+      <div class="tool-item"><h3><code>record_signed_verdict</code></h3><p>Submit the caller's wallet-signed reading.</p></div>
+    </div>
+    <p class="note" style="margin-top:24px"><a href="https://github.com/who1900/dtox-research/blob/main/docs/technical-reference.md">Full tool reference and self-hosting</a></p>
+  </div>
+</section>
 <section id="corpus">
   <div class="wrap">
-    <p class="section-label">Corpus</p>
-    <h2>What is actually indexed</h2>
-
+    <p class="section-label">The research index</p>
+    <h2>Web3 research and the technology around it.</h2>
+    <p class="why">Four layers cover Web3, AI agents, language models and builder technology. Sources include arXiv, IACR ePrint, ACL Anthology, PMLR, open-access research, Ethereum EIPs/ERCs, Solana SIMDs and technical whitepapers.</p>
     <div class="stats-grid">
-      <div class="stat"><span class="num" data-stat="documents">n/a</span><span class="label">documents</span></div>
-      <div class="stat"><span class="num" data-stat="chunks">n/a</span><span class="label">chunks</span></div>
-      <div class="stat"><span class="num" data-stat="citation_edges">n/a</span><span class="label">citation edges</span></div>
-      <div class="stat"><span class="num" data-stat="web3_documents">n/a</span><span class="label">web3 documents</span></div>
+      <div class="stat"><span class="num" data-stat="documents">183,856</span><span class="label">indexed document records</span></div>
+      <div class="stat"><span class="num" data-stat="chunks">11,085,974</span><span class="label">indexed passages</span></div>
+      <div class="stat"><span class="num" data-stat="citation_edges">3,399,205</span><span class="label">citation links</span></div>
+      <div class="stat"><span class="num" data-stat="web3_documents">17,544</span><span class="label">Web3 records</span></div>
     </div>
-    <p class="as-of">observed as of <span data-stat="as_of">n/a</span>; observation time, not a corpus snapshot</p>
+    <p class="as-of" id="stats-status">Corpus counts checked <span data-stat="as_of">17 October 2026, 15:48 UTC</span>.</p>
   </div>
 </section>
-
-<section id="limits">
-  <div class="wrap">
-    <p class="section-label">What it does not do</p>
-    <h2>Honesty as a feature</h2>
-    <ul class="plain divided">
-      <li>Four layers only: web3 (primary), AI agents, LLMs and small language models, and builder technology. An idea outside that scope is refused, not force-fit.</li>
-      <li>No patents. There are none in the corpus, and the service says that rather than letting absence read as novelty.</li>
-      <li>No guarantee that any given paper is present, inside the indexed layers or otherwise.</li>
-      <li>Full-text availability is per record, including IACR. Inspect evidence provenance and abstract-only fallback markers.</li>
-      <li>Empty results reflect index coverage and retrieval limits, never establish novelty; inspect evidence and scope.</li>
-      <li>Verdicts and attestations are devnet only.</li>
-    </ul>
-  </div>
-</section>
-
 </main>
-
 <footer>
   <div class="wrap">
-    <span>AGPL-3.0</span>
-    <div class="foot-links">
-      <a href="https://github.com/who1900/dtox-research" target="_blank" rel="noopener">github.com/who1900/dtox-research</a>
-      <a href="https://read.whoim.space/mcp">read.whoim.space/mcp</a>
-    </div>
+    <span>Built by <a href="https://portfolio.whoim.space/">Daniyar Gabdullin</a> · AGPL-3.0</span>
+    <div class="foot-links"><a href="https://github.com/who1900/dtox-research">GitHub / README</a><a href="https://github.com/who1900/dtox-research/blob/main/docs/technical-reference.md">Developer guide</a><a href="#try">Connect your agent</a></div>
   </div>
 </footer>
-
 <script>
-  document.querySelectorAll('.copy-btn').forEach(function (btn) {
-    btn.addEventListener('click', function () {
-      var targetId = btn.getAttribute('data-copy-target');
-      var el = document.getElementById(targetId);
-      if (!el) return;
-      var text = el.textContent;
-      var done = function () {
-        var original = btn.textContent;
-        btn.textContent = 'copied';
-        setTimeout(function () { btn.textContent = original; }, 1400);
-      };
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(done).catch(function () { fallbackCopy(text, done); });
-      } else {
-        fallbackCopy(text, done);
-      }
-    });
-  });
-
-  function fallbackCopy(text, done) {
-    var ta = document.createElement('textarea');
-    ta.value = text;
-    ta.style.position = 'fixed';
-    ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.select();
-    try { document.execCommand('copy'); } catch (e) {}
-    document.body.removeChild(ta);
-    done();
+(function () {
+  var status = document.getElementById('copy-status');
+  function fallbackCopy(text) {
+    var input = document.createElement('textarea');
+    input.value = text; input.style.position = 'fixed'; input.style.opacity = '0';
+    document.body.appendChild(input); input.select();
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (error) { ok = false; }
+    input.remove();
+    return ok;
   }
-
-  fetch('stats.json').then(function (r) {
-    if (!r.ok) throw new Error('no stats');
-    return r.json();
-  }).then(function (data) {
-    document.querySelectorAll('[data-stat]').forEach(function (el) {
-      var key = el.getAttribute('data-stat');
-      var value = data[key];
-      el.textContent = (value === null || value === undefined || value === '') ? 'n/a' : (typeof value === 'number' ? value.toLocaleString('en-US') : value);
-    });
-  }).catch(function () {
-    document.querySelectorAll('[data-stat]').forEach(function (el) {
-      el.textContent = 'n/a';
+  document.querySelectorAll('[data-copy-target]').forEach(function (button) {
+    var idleLabel = button.textContent;
+    button.addEventListener('click', async function () {
+      var target = document.getElementById(button.getAttribute('data-copy-target'));
+      if (!target) return;
+      var ok = false;
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(target.textContent); ok = true;
+        } else { ok = fallbackCopy(target.textContent); }
+      } catch (error) { ok = fallbackCopy(target.textContent); }
+      button.textContent = ok ? 'copied' : 'copy manually';
+      setTimeout(function () { button.textContent = idleLabel; }, 2000);
+      status.textContent = ok ? 'Copied ' + button.getAttribute('data-copy-label') + '.' : 'Copy unavailable. Select the text above and copy it manually.';
     });
   });
+  fetch('stats.json', {cache:'no-cache'}).then(function (response) {
+    if (!response.ok) throw new Error('Stats unavailable');
+    return response.json();
+  }).then(function (data) {
+    var keys = ['documents','chunks','citation_edges','web3_documents'];
+    if (!keys.every(function (key) { return Number.isInteger(data[key]) && data[key] >= 0; }) || !data.as_of || !Number.isFinite(Date.parse(data.as_of))) throw new Error('Invalid stats');
+    keys.forEach(function (key) { document.querySelector('[data-stat="'+key+'"]').textContent = data[key].toLocaleString('en-US'); });
+    document.querySelector('[data-stat="as_of"]').textContent = new Date(data.as_of).toLocaleString('en-GB',{day:'numeric',month:'long',year:'numeric',hour:'2-digit',minute:'2-digit',timeZone:'UTC'}) + ' UTC';
+  }).catch(function () {
+    document.getElementById('stats-status').append(' Live counts are unavailable; showing the dated figures above.');
+  });
+})();
 </script>
-
 </body>
 </html>

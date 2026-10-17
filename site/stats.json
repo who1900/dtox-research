@@ -1,7 +1,7 @@
 {
-  "documents": null,
-  "chunks": null,
-  "citation_edges": null,
-  "web3_documents": null,
-  "as_of": null
+  "documents": 183856,
+  "chunks": 11085974,
+  "citation_edges": 3399205,
+  "web3_documents": 17544,
+  "as_of": "2026-10-17T15:48Z"
 }
