@@ -3,7 +3,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import type { FacilitatorClient } from "@x402/core/server";
+import type { FacilitatorClient, OnSettleFailureHook } from "@x402/core/server";
 import type { PaymentRequired, PaymentRequirements } from "@x402/core/types";
 import { MCP_PAYMENT_META_KEY } from "@x402/mcp";
 import { loadConfig } from "../src/config.js";
@@ -30,6 +30,9 @@ export async function offlineGateway(t: TestContext, options: {
   settleSuccess?: boolean;
   response?: CallToolResult;
   upstreamFailure?: Error;
+  settlePending?: boolean;
+  settleTransaction?: string;
+  recoverSettlement?: OnSettleFailureHook;
 } = {}) {
   const config = loadConfig({ X402_MODE: options.mode ?? "live",
     X402_EVM_NETWORKS: "eip155:84532",
@@ -44,11 +47,11 @@ export async function offlineGateway(t: TestContext, options: {
     verify: async () => { events.push("verify"); return { isValid: true }; },
     settle: async (_payment, requirements) => {
       events.push("settle");
-      return { success: options.settleSuccess ?? true, transaction: "fixture-payment-tx",
-        network: requirements.network, errorReason: options.settleSuccess === false ? "fixture_settlement_failed" : undefined };
+      return { success: options.settlePending ? false : options.settleSuccess ?? true, transaction: options.settleTransaction ?? "fixture-payment-tx",
+        network: requirements.network, errorReason: options.settlePending ? "settlement_pending" : options.settleSuccess === false ? "fixture_settlement_failed" : undefined };
     }
   };
-  const wrappers = await createWrappers(config, facilitator);
+  const wrappers = await createWrappers(config, facilitator, options.recoverSettlement ?? (async () => {}));
   const api = createResearchUpstream(config, () => ({
     connect: async () => {}, close: async () => {},
     callTool: async (request: { name: string; arguments?: Record<string, unknown> }) => {
@@ -68,9 +71,9 @@ export async function offlineGateway(t: TestContext, options: {
     const result = await client.callTool({ name, arguments: args });
     return payload(result) as PaymentRequired;
   };
-  const pay = async (name: string, args: Record<string, unknown>, accepted: PaymentRequirements) => {
+  const pay = async (name: string, args: Record<string, unknown>, accepted: PaymentRequirements, payment = { fixture: true } as Record<string, unknown>) => {
     return client.callTool({ name, arguments: args,
-      _meta: { [MCP_PAYMENT_META_KEY]: { x402Version: 2, accepted, payload: { fixture: true } } } });
+      _meta: { [MCP_PAYMENT_META_KEY]: { x402Version: 2, accepted, payload: payment } } });
   };
   return { config, client, events, calls, challenge, pay };
 }

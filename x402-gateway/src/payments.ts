@@ -1,4 +1,4 @@
-import { HTTPFacilitatorClient, x402ResourceServer, type FacilitatorClient } from "@x402/core/server";
+import { HTTPFacilitatorClient, x402ResourceServer, type FacilitatorClient, type OnSettleFailureHook } from "@x402/core/server";
 import { ExactEvmScheme } from "@x402/evm/exact/server";
 import { declareDiscoveryExtension } from "@x402/extensions/bazaar";
 import { createPaymentWrapper } from "@x402/mcp";
@@ -6,8 +6,10 @@ import { ExactSvmScheme } from "@x402/svm/exact/server";
 import type { GatewayConfig } from "./config.js";
 import type { PaidWrappers } from "./tools.js";
 import { paidToolJsonSchema, type PaidToolName } from "./tool-schemas.js";
+import { devnetSettlementRecovery } from "./settlement.js";
 
-export async function createWrappers(config: GatewayConfig, facilitator?: FacilitatorClient): Promise<PaidWrappers> {
+export async function createWrappers(config: GatewayConfig, facilitator?: FacilitatorClient,
+  recoverSettlement: OnSettleFailureHook = devnetSettlementRecovery()): Promise<PaidWrappers> {
   const empty: PaidWrappers = { evidence: null, spec: null, compare: null, trends: null, audit: null, verdict: null };
   if (config.mode !== "live") return empty;
   const evmEnabled = config.evmNetworks.length > 0 && Boolean(config.evmPayTo);
@@ -16,6 +18,7 @@ export async function createWrappers(config: GatewayConfig, facilitator?: Facili
     for (const network of config.evmNetworks) resourceServer.register(network, new ExactEvmScheme());
   }
   resourceServer.register(config.svmNetwork, new ExactSvmScheme());
+  resourceServer.onSettleFailure(recoverSettlement);
   await resourceServer.initialize();
 
   async function wrapper(
