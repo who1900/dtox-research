@@ -6,6 +6,13 @@ const readme = readFileSync(new URL("../../README.md", import.meta.url), "utf8")
 const technical = readFileSync(new URL("../../docs/technical-reference.md", import.meta.url), "utf8");
 const site = readFileSync(new URL("../../site/index.html", import.meta.url), "utf8");
 const ci = readFileSync(new URL("../../.github/workflows/ci.yml", import.meta.url), "utf8");
+const mcpSource = readFileSync(new URL("../../mcp/server.py", import.meta.url), "utf8");
+
+function siteSection(id: string): string {
+  const section = site.match(new RegExp(`<section\\b[^>]*\\bid="${id}"[^>]*>([\\s\\S]*?)</section>`));
+  assert.ok(section, `missing site section: ${id}`);
+  return section[1];
+}
 
 test("self-host docs explicitly export local paths and port 8005 without claiming automatic env loading", () => {
   assert.ok(readme.includes("codex mcp add dtox --url https://read.whoim.space/mcp"));
@@ -44,17 +51,31 @@ test("public guide documents source metadata, attributed readings and payment te
   assert.ok(technical.includes("no default asset mapping"));
   assert.ok(!site.includes("when independent wallets agree"));
   assert.ok(!site.includes("The registry reports this claim as confirmed_prior_art"));
-  assert.ok(site.includes("observation time, not a corpus snapshot"));
-  assert.ok(site.includes("graph traversal is seed-dependent"));
-  assert.ok(site.includes("changing query wording can change the retrieved seeds"));
+  const coverage = siteSection("returns");
+  assert.match(coverage, /\bfull text\b/i);
+  assert.match(coverage, /\babstract-only records\b/i);
+  const solana = siteSection("solana");
+  assert.match(solana, /signature identifies who signed/i);
+  assert.match(solana, /Solana devnet/);
+  assert.match(solana, /free endpoint/);
+  for (const guide of ["attestor", "x402-gateway"]) {
+    assert.ok(solana.includes(`href="https://github.com/who1900/dtox-research/tree/main/${guide}"`));
+  }
 });
 
-test("site lists thirteen public tools including the real research bundle", () => {
-  const section = site.slice(site.indexOf('<section id="returns">'), site.indexOf('<section id="verdicts">'));
-  assert.ok(section.includes("Thirteen public MCP tools"));
+test("README and site catalogs match the default public MCP registrations", () => {
+  // Opt-in unsigned registry mutations register separately, without decorators.
+  const expected = [...mcpSource.matchAll(/^@mcp\.tool\(\)\r?\n(?:async )?def ([a-z_]+)\(/gm)]
+    .map((match) => match[1]).sort();
+  assert.ok(expected.length > 0);
+  const section = siteSection("tools");
+  assert.ok(section.includes(`${expected.length} public MCP tools`));
   const tools = [...section.matchAll(/<code>([a-z_]+)<\/code>/g)].map((match) => match[1]);
-  assert.equal(new Set(tools).size, 13);
-  assert.ok(tools.includes("get_research_bundle"));
+  assert.deepEqual(tools.sort(), expected);
+  const catalog = readme.match(/## Public tool catalog\r?\n([\s\S]*?)(?:\r?\n## |$)/);
+  assert.ok(catalog, "missing README tool catalog");
+  const readmeTools = [...catalog[1].matchAll(/^\| `([a-z_]+)` \|/gm)].map((match) => match[1]);
+  assert.deepEqual(readmeTools.sort(), expected);
 });
 
 test("CI includes bounded offline pipeline and operations suites", () => {
