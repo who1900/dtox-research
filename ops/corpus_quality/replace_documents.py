@@ -29,7 +29,6 @@ import urllib.request
 import uuid
 import sys
 
-from ops.corpus_quality.fresh_sources import is_arxiv_id, canonical_source_url
 
 
 CORPUS_BASE = Path('/opt/dtox-corpus-quality-20261013')
@@ -532,6 +531,13 @@ def _load_runtime(base, root=ROOT):
                 client=client, paths=paths, recipe=recipe, native_receipt=native_receipt)
 
 
+def is_arxiv_id(paper_id):
+    # The API ExecCondition runs this file directly outside the repository.
+    # Keep its startup-check path free of project imports.
+    from ops.corpus_quality.fresh_sources import is_arxiv_id as check
+    return check(paper_id)
+
+
 def _fresh_request(state, fresh):
     paper_id = state['arxiv_id']
     if paper_id.startswith('acl:'):
@@ -545,6 +551,7 @@ def _fresh_request(state, fresh):
                     title=resolved.get('title'), resolver_receipt=resolved)
     source_url = state.get('source_url')
     if paper_id.startswith('pmlr:') and isinstance(source_url, str):
+        from ops.corpus_quality.fresh_sources import canonical_source_url
         return dict(paper_id=paper_id, fresh_kind='PDF',
                     fresh_url=canonical_source_url(paper_id, source_url),
                     declared_source_url=source_url, title=state.get('title'))

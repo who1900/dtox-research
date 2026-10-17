@@ -11,6 +11,18 @@ from ops.corpus_quality import replace_documents as worker
 
 
 class BatchTests(unittest.TestCase):
+    def test_api_startup_check_runs_as_direct_script_outside_repository(self):
+        import os
+        import subprocess
+        import sys
+        env = dict(os.environ)
+        env.pop('PYTHONPATH', None)
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run([sys.executable, '-B', str(Path(worker.__file__).resolve()),
+                                     'api-startup-check', '--base', directory],
+                                    cwd=directory, env=env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_coarse_layer_reconciliation_preserves_vector_and_rejects_title_drift(self):
         state = dict(title='Verified', year=2026, layers='ai-agents,builder-tech')
         before = dict(id='coarse-id', vector=[1.0, 0.0],
