@@ -84,6 +84,51 @@ class OriginalsTests(unittest.TestCase):
         self.assertEqual(len(list((self.store.root / "blobs").iterdir())), 1)
         self.assertEqual(list((self.store.root / "private").iterdir()), [])
 
+    def test_layout_accepts_journal_unlinked_during_metadata_lookup(self):
+        journal = Path(str(self.store.db_path) + "-journal")
+        journal.write_bytes(b"transient rollback journal")
+        original_lstat = Path.lstat
+        original_stat = Path.stat
+        journal_lookups = 0
+
+        def disappearing_lstat(path, *args, **kwargs):
+            nonlocal journal_lookups
+            info = original_lstat(path, *args, **kwargs)
+            if path == journal:
+                journal_lookups += 1
+                if journal_lookups > 1:  # after the shared path/symlink check
+                    path.unlink(missing_ok=True)
+            return info
+
+        def disappearing_stat(path, *args, **kwargs):
+            info = original_stat(path, *args, **kwargs)
+            if path == journal and kwargs.get("follow_symlinks", True):
+                path.unlink(missing_ok=True)
+            return info
+
+        # Model SQLite unlinking a journal immediately after a successful lookup.
+        # Both pathname and non-following lookups see the same interleaving.
+        with patch.object(Path, "stat", disappearing_stat), patch.object(Path, "lstat", disappearing_lstat):
+            self.store._layout()
+        self.assertFalse(journal.exists())
+
+    def test_layout_rejects_unsafe_manifest_and_requires_primary(self):
+        journal = Path(str(self.store.db_path) + "-journal")
+        for kind in ("directory", "hardlink"):
+            with self.subTest(kind=kind):
+                if kind == "directory":
+                    journal.mkdir()
+                else:
+                    os.link(self.store.db_path, journal)
+                try:
+                    with self.assertRaisesRegex(OriginalError, "unsafe manifest file"):
+                        self.store._layout()
+                finally:
+                    journal.rmdir() if kind == "directory" else journal.unlink()
+        self.store.db_path.unlink()
+        with self.assertRaisesRegex(OriginalError, "missing manifest"):
+            self.store._layout()
+
     def test_versions_and_sources_share_blob(self):
         self.ingest()
         self.ingest(provenance=replace(self.provenance, edition="v2", source_url="https://mirror.example/paper"))

@@ -29,6 +29,8 @@ import urllib.request
 import uuid
 import sys
 
+from ops.corpus_quality.fresh_sources import is_arxiv_id, canonical_source_url
+
 
 CORPUS_BASE = Path('/opt/dtox-corpus-quality-20261013')
 BASE = CORPUS_BASE / 'whole-document-replacement-20261014'
@@ -534,7 +536,7 @@ def _fresh_request(state, fresh):
     paper_id = state['arxiv_id']
     if paper_id.startswith('acl:'):
         return dict(paper_id=paper_id, fresh_kind='PDF', fresh_version=paper_id)
-    if re.fullmatch(r'\d{4}\.\d{4,5}(?:v[1-9]\d*)?', paper_id):
+    if is_arxiv_id(paper_id):
         resolved = fresh.resolve_arxiv_version(paper_id, timeout=30)
         version = resolved.get('fresh_version')
         if not version:
@@ -542,6 +544,16 @@ def _fresh_request(state, fresh):
         return dict(paper_id=paper_id, fresh_kind='HTML', fresh_version=version,
                     title=resolved.get('title'), resolver_receipt=resolved)
     source_url = state.get('source_url')
+    if paper_id.startswith('pmlr:') and isinstance(source_url, str):
+        return dict(paper_id=paper_id, fresh_kind='PDF',
+                    fresh_url=canonical_source_url(paper_id, source_url),
+                    declared_source_url=source_url, title=state.get('title'))
+    if isinstance(source_url, str) and source_url.startswith('http://') and state.get('title'):
+        # Request TLS at the declared host/path. The existing acquisition helper
+        # still verifies credentials, redirect host, PDF body and expected title.
+        return dict(paper_id=paper_id, fresh_kind='PDF',
+                    fresh_url='https://' + source_url[len('http://'):],
+                    declared_source_url=source_url, title=state['title'])
     if isinstance(source_url, str) and source_url.startswith('https://') and state.get('title'):
         return dict(paper_id=paper_id, fresh_kind='PDF', fresh_url=source_url,
                     title=state['title'])
@@ -556,10 +568,8 @@ def _source_route(result, paper_id):
         return 'latex', 'latex'
     if kind in ('PDF', 'HTML') or route in ('pdf', 'html'):
         return 'paper_markdown', ('acl-pdf' if paper_id.startswith('acl:') else
-                                  'arxiv-html' if kind == 'HTML' and re.fullmatch(
-                                      r'\d{4}\.\d{4,5}(?:v[1-9]\d*)?', paper_id)
-                                  else 'arxiv-pdf' if re.fullmatch(
-                                      r'\d{4}\.\d{4,5}(?:v[1-9]\d*)?', paper_id)
+                                  'arxiv-html' if kind == 'HTML' and is_arxiv_id(paper_id)
+                                  else 'arxiv-pdf' if is_arxiv_id(paper_id)
                                   else 'source-pdf')
     raise DeferredPaper('unsupported_fresh_source_route')
 
@@ -671,6 +681,33 @@ def _preserving_embedder(runtime, metrics, paper_id, targets, existing):
     return embed, reuse
 
 
+def _candidate_metadata(state, fulltext, coarse_payload):
+    """Retain ancillary payload fields; bibliographic fields follow live state.
+
+    Coarse/state disagreement is still rejected by the caller. An old fulltext
+    payload is a reuse source, not an authority for the replacement's metadata.
+    """
+    template = dict(next(iter(fulltext.values()))['payload'] if fulltext else coarse_payload)
+    for key in ('title', 'year', 'abstract'):
+        if key in state:
+            template[key] = state[key]
+    template['layers'] = list(_layers(state.get('layers')))
+    return template
+
+
+def _coarse_metadata_candidate(state, coarse_point):
+    """Reconcile layer projection without changing coarse embedding inputs."""
+    payload = coarse_point['payload']
+    if payload.get('title') != state.get('title') or payload.get('year') != state.get('year'):
+        raise DeferredPaper('coarse_metadata_differs_from_current_state')
+    layers = list(_layers(state.get('layers')))
+    if payload.get('layers') == layers:
+        return None
+    # The publication owner snapshots before/after points and verifies rollback.
+    # Title, abstract and the existing vector remain untouched.
+    return dict(coarse_point, payload=dict(payload, layers=layers))
+
+
 def _prepare_candidate(paper_id, result, state, runtime, base, metrics):
     owner, restore = runtime['owner'], runtime['restore']
     extractor, cache = runtime['extractor'], runtime['document_cache']
@@ -699,7 +736,7 @@ def _prepare_candidate(paper_id, result, state, runtime, base, metrics):
         raise DeferredPaper('admitted_chunk_count_outside_owner_bound')
     mode, source_label = _source_route(result, paper_id)
     if (mode == 'paper_markdown' and not paper_id.startswith('acl:')
-            and not re.fullmatch(r'\d{4}\.\d{4,5}(?:v[1-9]\d*)?', paper_id)):
+            and not is_arxiv_id(paper_id)):
         source_label = state.get('fulltext_source') or 'source-pdf'
     binding = _source_binding(result)
     binding['extraction'] = diagnostics
@@ -715,22 +752,10 @@ def _prepare_candidate(paper_id, result, state, runtime, base, metrics):
     coarse = owner._scroll(runtime['client'], 'papers_coarse_base', paper_id)
     if len(coarse) != 1:
         raise DeferredPaper('coarse_baseline_not_unique')
-    state_layers = _layers(state.get('layers'))
     coarse_point = next(iter(coarse.values()))
     coarse_payload = coarse_point['payload']
-    if (coarse_payload.get('title') != state.get('title')
-            or coarse_payload.get('year') != state.get('year')
-            or coarse_payload.get('layers') != state_layers):
-        raise DeferredPaper('coarse_metadata_differs_from_current_state')
-    if fulltext:
-        template = next(iter(fulltext.values()))['payload']
-    else:
-        # Preserve the existing bibliographic record and coarse point unchanged.
-        template = dict(coarse_payload)
-        for key in ('title', 'year', 'abstract'):
-            if key in state:
-                template[key] = state[key]
-        template['layers'] = state_layers
+    coarse_candidate = _coarse_metadata_candidate(state, coarse_point)
+    template = _candidate_metadata(state, fulltext, coarse_payload)
     template.update(source_url=binding['url'], fulltext_source=source_label,
                     parser_mode=parser_mode, parser_revision=5, extractor_version=5)
     embed, reuse = _preserving_embedder(runtime, metrics, paper_id, targets, fulltext)
@@ -754,6 +779,8 @@ def _prepare_candidate(paper_id, result, state, runtime, base, metrics):
                      embedding_recipe=dict(runtime['recipe'], scope='newly_embedded_points'),
                      embedding_reuse=reuse,
                      state_updates=updates)
+    if coarse_candidate is not None:
+        candidate['coarse_point'] = coarse_candidate
     return candidate
 
 
@@ -963,6 +990,8 @@ def _error_reason(exc):
 def _record_error(base, paper_id, exc, metrics, *, defer=True):
     status = 'deferred' if defer else 'failed'
     reason = _error_reason(exc)
+    metrics = dict(metrics)
+    metrics.update(getattr(exc, 'source_metrics', {}))
     _update(base, paper_id, status, reason=reason, metrics=metrics)
 
 
@@ -1064,11 +1093,11 @@ def _acquire_one(paper_id, state, runtime, base, queued_at=None):
     stage = Path(base) / 'source-stage' / runtime['document_cache'].safe_id(paper_id)
     kwargs = dict(timeout=120, native_build=str(NATIVE_BUILD), original_store_root=str(ORIGINAL_STORE))
     started = time.monotonic()
-    is_arxiv = bool(re.fullmatch(r'\d{4}\.\d{4,5}(?:v[1-9]\d*)?', paper_id))
+    is_arxiv = is_arxiv_id(paper_id)
     routes = [request]
     if is_arxiv and request.get('fresh_kind') == 'HTML':
         routes = [dict(request, fresh_kind=kind) for kind in ('HTML', 'rawTexarchive', 'PDF')]
-    route_attempts, route_rejections = [], []
+    route_attempts, route_rejections, source_diagnostics = [], [], []
     result = None
     for route in routes:
         name = route['fresh_kind']
@@ -1083,6 +1112,9 @@ def _acquire_one(paper_id, state, runtime, base, queued_at=None):
             route_rejections.append({'route': name, 'reason': type(exc).__name__ + ':' + str(exc)[:240]})
             continue
         diagnostics = candidate_result.get('diagnostics') or {}
+        source_diagnostics.append(dict(route=name,
+            raw_sha256=(candidate_result.get('source_binding') or {}).get('raw_sha256'),
+            source_sha256=candidate_result.get('source_sha256'), diagnostics=diagnostics))
         if candidate_result.get('body_quality_candidate') is True:
             result = candidate_result
             break
@@ -1090,8 +1122,14 @@ def _acquire_one(paper_id, state, runtime, base, queued_at=None):
         route_rejections.append({'route': name, 'reason': str(reason)[:240]})
     if result is None:
         if not is_arxiv or len(routes) == 1:
-            raise DeferredPaper('fresh_source_not_quality_approved:' + json.dumps(route_rejections, ensure_ascii=False))
-        raise DeferredPaper('arxiv_source_routes_exhausted:' + json.dumps(route_rejections, ensure_ascii=False))
+            error = DeferredPaper('fresh_source_not_quality_approved:' + json.dumps(route_rejections, ensure_ascii=False))
+        else:
+            error = DeferredPaper('arxiv_source_routes_exhausted:' + json.dumps(route_rejections, ensure_ascii=False))
+        error.source_metrics = dict(source_route_attempts=route_attempts,
+            source_route_rejections=route_rejections, source_diagnostics=source_diagnostics,
+            acquire_parse_seconds=time.monotonic() - started,
+            acquisition_queue_wait_seconds=queue_wait, source_resolution_seconds=resolver_seconds)
+        raise error
     metrics = {'acquire_parse_seconds': time.monotonic() - started,
                'acquisition_queue_wait_seconds': queue_wait,
                'source_resolution_seconds': resolver_seconds,

@@ -11,6 +11,72 @@ from ops.corpus_quality import replace_documents as worker
 
 
 class BatchTests(unittest.TestCase):
+    def test_coarse_layer_reconciliation_preserves_vector_and_rejects_title_drift(self):
+        state = dict(title='Verified', year=2026, layers='ai-agents,builder-tech')
+        before = dict(id='coarse-id', vector=[1.0, 0.0],
+                      payload=dict(title='Verified', year=2026, layers=['ai-agents'], abstract='Unchanged'))
+        after = worker._coarse_metadata_candidate(state, before)
+        self.assertEqual(after['vector'], before['vector'])
+        self.assertEqual(after['id'], before['id'])
+        self.assertEqual(after['payload']['abstract'], 'Unchanged')
+        self.assertEqual(after['payload']['layers'], ['ai-agents', 'builder-tech'])
+        self.assertEqual(before['payload']['layers'], ['ai-agents'])
+        self.assertIsNone(worker._coarse_metadata_candidate(state, after))
+        with self.assertRaises(worker.DeferredPaper):
+            worker._coarse_metadata_candidate(dict(state, title='Different'), before)
+
+    def test_pmlr_http_input_keeps_identity_and_declared_url(self):
+        state = dict(arxiv_id='pmlr:v235/paper24a', title='A verified paper',
+                     source_url='http://proceedings.mlr.press/v235/paper24a/paper24a.pdf')
+        request = worker._fresh_request(state, object())
+        self.assertEqual(request['fresh_url'],
+                         'https://proceedings.mlr.press/v235/paper24a/paper24a.pdf')
+        self.assertEqual(request['declared_source_url'], state['source_url'])
+        self.assertEqual(request['paper_id'], state['arxiv_id'])
+
+    def test_generic_http_input_requests_tls_at_the_declared_path(self):
+        state = dict(arxiv_id='oa:W123', title='A verified paper',
+                     source_url='http://example.org/papers/one.pdf')
+        request = worker._fresh_request(state, object())
+        self.assertEqual(request['fresh_url'], 'https://example.org/papers/one.pdf')
+        self.assertEqual(request['declared_source_url'], state['source_url'])
+        self.assertEqual(request['title'], state['title'])
+
+    def test_rejected_pdf_keeps_actual_unicode_diagnostics_in_existing_ledger(self):
+        class Fresh:
+            class FreshSourceError(Exception): pass
+            class FreshSourceDependencyError(FreshSourceError): pass
+            @staticmethod
+            def acquire_and_parse(*args, **kwargs):
+                return dict(body_quality_candidate=False, source_sha256='source-sha',
+                            source_binding={'raw_sha256': 'raw-sha'},
+                            diagnostics=dict(body_quality_reason='replacement_characters_present',
+                                             replacement_characters=2, page_count=4))
+        runtime = dict(fresh=Fresh, document_cache=types.SimpleNamespace(safe_id=lambda x:x))
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(worker.DeferredPaper) as error:
+                worker._acquire_one('acl:paper', {'arxiv_id': 'acl:paper'}, runtime, directory)
+        with patch.object(worker, '_update') as update:
+            worker._record_error('base', 'acl:paper', error.exception, {})
+        saved = update.call_args.kwargs['metrics']['source_diagnostics'][0]
+        self.assertEqual(saved['raw_sha256'], 'raw-sha')
+        self.assertEqual(saved['diagnostics']['replacement_characters'], 2)
+
+    def test_replacement_does_not_inherit_stale_fulltext_bibliography(self):
+        state = dict(title='Verified title', year=2026, abstract='Current abstract',
+                     layers='ai-agents,builder-tech')
+        original = dict(title='Old title', year=2025, abstract='Old abstract',
+                        layers=['ai-agents'], citation_count=17)
+        points = {'p': {'payload': original}}
+        metadata = worker._candidate_metadata(state, points, {'layers': ['ai-agents', 'builder-tech']})
+        self.assertEqual(metadata['layers'], ['ai-agents', 'builder-tech'])
+        self.assertEqual((metadata['title'], metadata['year'], metadata['abstract']),
+                         ('Verified title', 2026, 'Current abstract'))
+        self.assertEqual(metadata['citation_count'], 17)
+        self.assertEqual(original['layers'], ['ai-agents'])
+        metadata['layers'].append('other')
+        self.assertEqual(state['layers'], 'ai-agents,builder-tech')
+
     def test_preserves_exact_existing_text_and_encodes_only_changed_text(self):
         paper = 'paper'
         old_id = str(uuid.uuid5(uuid.NAMESPACE_URL, paper + '#0'))

@@ -185,10 +185,15 @@ class OriginalStore:
                 raise OriginalError("missing store directory")
         for suffix in ("", "-journal", "-wal", "-shm"):
             path = _plain(str(self.db_path) + suffix)
-            if path.exists() and (not path.is_file() or path.stat().st_nlink != 1):
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                if not suffix:
+                    raise OriginalError("missing manifest; use create on a new dedicated root")
+                # SQLite can remove a rollback journal between layout checks.
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise OriginalError("unsafe manifest file")
-        if not self.db_path.is_file():
-            raise OriginalError("missing manifest; use create on a new dedicated root")
 
     @contextmanager
     def _db(self):

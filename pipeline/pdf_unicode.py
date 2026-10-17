@@ -8,7 +8,7 @@ import hashlib
 import re
 from pathlib import Path
 
-ADAPTER_REVISION = 'source-font-tounicode-v2'
+ADAPTER_REVISION = 'source-font-tounicode-v3'
 GLYPHLIST_SOURCE = 'https://raw.githubusercontent.com/apache/pdfbox/2.0.14/pdfbox/src/main/resources/org/apache/pdfbox/resources/glyphlist/additional.txt'
 GLYPHLIST_SHA256 = 'e70928360e577f03fa4fe354dc353a56526ef675e07790b9131acd27fd38c28f'
 MATHML_GLYPH_NAMES = {'mapsto':'\u21a6'}
@@ -76,8 +76,8 @@ def _encoding(document,xref,font):
     return codes
 
 
-def _cmap_codes(raw):
-    """Recognize only complete one-byte literal CMaps; never infer inheritance."""
+def _cmap_entries(raw):
+    """Read complete one-byte literal CMaps without treating empty targets as mappings."""
     text=re.sub(r'%[^\n]*','',raw.decode('ascii'))
     if 'usecmap' in text or text.count('endcmap')!=1:raise ValueError('unsupported inherited/malformed ToUnicode')
     spaces=re.findall(r'begincodespacerange(.*?)endcodespacerange',text,re.S)
@@ -91,11 +91,14 @@ def _cmap_codes(raw):
     # Keep insertion within an unambiguous full one-byte codespace; narrower
     # legacy contracts need their own explicit source-code attribution.
     if ranges!=[(0,255)]:raise ValueError('unsupported restricted ToUnicode codespace')
-    codes=set()
+    codes=set();empty={}
     for body in re.findall(r'beginbfchar(.*?)endbfchar',text,re.S):
-        pairs=re.findall(r'<([0-9a-fA-F]{2})>\s*<([0-9a-fA-F]+)>',body)
-        if re.sub(r'<[0-9a-fA-F]{2}>\s*<[0-9a-fA-F]+>','',body).strip():raise ValueError('unsupported ToUnicode bfchar')
-        codes.update(int(src,16) for src,_ in pairs)
+        pairs=re.findall(r'<([0-9a-fA-F]{2})>\s*<([0-9a-fA-F]*)>',body)
+        if re.sub(r'<[0-9a-fA-F]{2}>\s*<[0-9a-fA-F]*>','',body).strip():raise ValueError('unsupported ToUnicode bfchar')
+        for src,dst in pairs:
+            code=int(src,16)
+            if dst:codes.add(code)
+            else:empty[code]=empty.get(code,0)+1
     for body in re.findall(r'beginbfrange(.*?)endbfrange',text,re.S):
         pattern=r'<([0-9a-fA-F]{2})>\s*<([0-9a-fA-F]{2})>\s*(?:<[0-9a-fA-F]+>|\[[0-9a-fA-F<>\s]+\])'
         for match in re.finditer(pattern,body):
@@ -103,11 +106,51 @@ def _cmap_codes(raw):
             if last<first:raise ValueError('invalid ToUnicode range')
             codes.update(range(first,last+1))
         if re.sub(pattern,'',body).strip():raise ValueError('unsupported ToUnicode bfrange')
-    return codes
+    return codes,empty
+
+
+def _cmap_codes(raw):
+    """Return source codes with a non-empty ToUnicode destination."""
+    return _cmap_entries(raw)[0]
+
+
+def _replace_empty_bfchar(raw, replacements):
+    """Replace only one-line empty entries whose source glyph was proven."""
+    result=raw
+    for code,text in replacements.items():
+        pattern=rb'(?m)^([ \t]*)<%02X>[ \t]*<[ \t]*>[ \t]*(?:%%[^\r\n]*)?$'%code
+        result,count=re.subn(pattern,lambda match:match.group(1)+('<%02X> <%s>'%(code,text.encode('utf-16-be').hex().upper())).encode('ascii'),result)
+        if count!=1:raise ValueError('observed empty ToUnicode entry is not uniquely replaceable')
+    return result
 
 
 def _font_key(name):
     return re.sub(r'^[A-Z]{6}\+','',name)
+
+
+def _used_type1_codes(font, codes, glyph_ids):
+    """Resolve observed MuPDF Type 1 GIDs to unique PDF character codes."""
+    glyph_order=list(font.getGlyphSet())
+    # FreeType follows CharStrings order, but repairs missing or misplaced
+    # .notdef entries. Refuse those repairs because they change GID indices.
+    if (not glyph_order or glyph_order[0]!='.notdef'
+            or glyph_order.count('.notdef')!=1):
+        raise ValueError('Type1 CharStrings GID order is not verifiable')
+    by_name={}
+    for gid,name in enumerate(glyph_order):
+        by_name.setdefault(name,[]).append(gid)
+    result=[]
+    for glyph_id in sorted(glyph_ids):
+        if not isinstance(glyph_id,int) or glyph_id<0 or glyph_id>=len(glyph_order):
+            raise ValueError('texttrace Type1 glyph id is outside CharStrings')
+        glyph_name=glyph_order[glyph_id]
+        if len(by_name[glyph_name])!=1:
+            raise ValueError('texttrace Type1 glyph name is ambiguous')
+        matching=[code for code,name in enumerate(codes) if name==glyph_name]
+        if len(matching)!=1:
+            raise ValueError('texttrace Type1 glyph has no unique PDF encoding code')
+        result.append((matching[0],glyph_id,glyph_name))
+    return result
 
 
 def _new_cmap():
@@ -131,9 +174,9 @@ def normalize_pdf_bytes(raw):
     """Return a derivative PDF plus full mapping provenance; never write raw PDF.
 
     Runs inside the existing bounded native converter child. Only fonts observed
-    with missing Unicode in texttrace are considered; every missing encoding entry
-    receives a mapping solely when embedded glyph semantics are independently
-    supported. Unknown symbols remain unresolved for the caller's quality gate.
+    with missing Unicode in texttrace are considered; only uniquely bound
+    encoding codes receive trusted mappings. Unknown semantics reject only when
+    observed; unprovable GID/code bindings remain unresolved for the quality gate.
     """
     import fitz
     import fontTools
@@ -146,8 +189,10 @@ def normalize_pdf_bytes(raw):
     try:
         affected={};ambiguous=set();cmap_owners={}
         for page in document:
-            missing={_font_key(run['font']) for run in page.get_texttrace()
-                     if any(ch[0]==65533 for ch in run['chars'])}
+            missing={}
+            for run in page.get_texttrace():
+                glyph_ids={ch[1] for ch in run['chars'] if ch[0]==65533}
+                if glyph_ids:missing.setdefault(_font_key(run['font']),set()).update(glyph_ids)
             fonts=page.get_fonts(full=True)
             for row in fonts:
                 # PyMuPDF uses xref 0 when a page font dictionary is direct
@@ -156,7 +201,7 @@ def normalize_pdf_bytes(raw):
                 if row[0] > 0:
                     kind,value=document.xref_get_key(row[0],'ToUnicode')
                     if kind=='xref':cmap_owners.setdefault(int(value.split()[0]),set()).add(row[0])
-            for name in missing:
+            for name,glyph_ids in missing.items():
                 matches={row[0] for row in fonts if _font_key(row[3])==name}
                 if len(matches)!=1:
                     ambiguous.update(matches)
@@ -167,9 +212,11 @@ def normalize_pdf_bytes(raw):
                         diagnostics['unresolved'].append(dict(font_xref=0,font_name=name,
                             reason='direct page font dictionary has no indirect xref for source-grounded mapping'))
                     else:
-                        affected[xref]=name
+                        entry=affected.setdefault(xref,dict(font_name=name,glyph_ids=set()))
+                        entry['glyph_ids'].update(glyph_ids)
         used_cmaps={}
-        for xref,name in affected.items():
+        for xref,affected_font in affected.items():
+            name=affected_font['font_name']
             if xref in ambiguous:continue
             try:
                 if document.xref_get_key(xref,'Subtype')!=('name','/Type1'):raise ValueError('unsupported missing-Unicode font subtype')
@@ -177,6 +224,7 @@ def normalize_pdf_bytes(raw):
                 if not program or ext!='pfa':raise ValueError('embedded Type1 program required')
                 font=t1Lib.T1Font.__new__(t1Lib.T1Font);font.encoding='ascii';font.data=program;font.parse()
                 glyphs=set(font.getGlyphSet());codes=_encoding(document,xref,font)
+                used_codes=_used_type1_codes(font,codes,affected_font['glyph_ids'])
                 kind,value=document.xref_get_key(xref,'ToUnicode')
                 created=kind=='null'
                 if created:cmap_xref=None;before=_new_cmap()
@@ -184,23 +232,36 @@ def normalize_pdf_bytes(raw):
                     cmap_xref=int(value.split()[0]);before=document.xref_stream(cmap_xref)
                     if len(cmap_owners.get(cmap_xref,set()))!=1:raise ValueError('shared ToUnicode owner is ambiguous')
                 else:raise ValueError('unsupported explicit ToUnicode object')
-                covered=_cmap_codes(before)
+                covered,empty_entries=_cmap_entries(before)
                 mappings=[]
+                observed={code:(glyph_id,glyph) for code,glyph_id,glyph in used_codes}
                 for code,glyph in enumerate(codes):
                     if code in covered or glyph=='.notdef' or glyph not in glyphs:continue
+                    if code in empty_entries and code not in observed:continue
+                    if code in empty_entries and empty_entries[code]!=1:
+                        glyph_id,_=observed[code]
+                        diagnostics['unresolved'].append(dict(font_xref=xref,font_name=name,code=code,glyph_id=glyph_id,glyph_name=glyph,reason='ambiguous empty ToUnicode entries'))
+                        continue
                     text,origin=_glyph_text(glyph,actual_name,supplemental)
                     if text is None:
-                        diagnostics['unresolved'].append(dict(font_xref=xref,font_name=name,code=code,glyph_name=glyph,reason='no trusted Unicode glyph semantics'))
+                        if code in observed:
+                            glyph_id,_=observed[code]
+                            diagnostics['unresolved'].append(dict(font_xref=xref,font_name=name,code=code,glyph_id=glyph_id,glyph_name=glyph,reason='no trusted Unicode glyph semantics'))
                         continue
-                    mappings.append(dict(font_xref=xref,font_name=name,code=code,glyph_name=glyph,text=text,mapping_source=origin,
+                    mapping=dict(font_xref=xref,font_name=name,code=code,glyph_name=glyph,text=text,mapping_source=origin,
                         font_program_sha256=_sha(program),encoding_sha256=_sha('\n'.join(codes).encode()),
                         tounicode_before_sha256=None if created else _sha(before),tounicode_created=created,
-                        mapping_reference=MATHML_GLYPH_SOURCE if origin=='w3c-mathml-glyph-name' else None))
+                        mapping_reference=MATHML_GLYPH_SOURCE if origin=='w3c-mathml-glyph-name' else None)
+                    if code in observed:mapping['glyph_id']=observed[code][0]
+                    mappings.append(mapping)
                 if not mappings:continue
-                body=(str(len(mappings))+' beginbfchar\n'+''.join('<%02X> <%s>\n'%(m['code'],m['text'].encode('utf-16-be').hex().upper()) for m in mappings)+'endbfchar\n').encode('ascii')
+                replacements={m['code']:m['text'] for m in mappings if m['code'] in empty_entries}
+                before=_replace_empty_bfchar(before,replacements) if replacements else before
+                append_mappings=[m for m in mappings if m['code'] not in empty_entries]
+                body=(str(len(append_mappings))+' beginbfchar\n'+''.join('<%02X> <%s>\n'%(m['code'],m['text'].encode('utf-16-be').hex().upper()) for m in append_mappings)+'endbfchar\n').encode('ascii') if append_mappings else b''
                 closing=list(re.finditer(rb'(?m)^[ \t]*endcmap[ \t]*(?:%[^\r\n]*)?\r?$',before))
                 if len(closing)!=1:raise ValueError('unsupported ToUnicode closing syntax')
-                at=closing[0].start();after=before[:at]+body+before[at:]
+                at=closing[0].start();after=before[:at]+body+before[at:] if body else before
                 if created:
                     cmap_xref=document.get_new_xref()
                     document.update_object(cmap_xref,'<<>>')

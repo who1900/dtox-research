@@ -5,6 +5,7 @@ import tempfile
 import tarfile
 import unittest
 import zlib
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -120,6 +121,135 @@ class FreshSourceTests(unittest.TestCase):
             source_url="https://open.example/paper.pdf", session=_Session(response))
         self.assertEqual(artifact.source_url, response.url)
         self.assertEqual(artifact.edition, "sha256:" + artifact.raw_sha256)
+
+    def test_pmlr_http_pdf_url_normalizes_to_proceedings_https_pdf(self):
+        paper_id = "pmlr:v318/litvin26a"
+        declared = "http://proceedings.mlr.press/v318/litvin26a/litvin26a.pdf"
+        official = "https://proceedings.mlr.press/v318/litvin26a/litvin26a.pdf"
+        raw_github = "https://raw.githubusercontent.com/mlresearch/v318/main/assets/litvin26a/litvin26a.pdf"
+        self.assertEqual(fresh_sources.canonical_source_url(paper_id, declared), official)
+        self.assertEqual(fresh_sources.canonical_source_url(paper_id, raw_github), raw_github)
+        self.assertEqual(fresh_sources.expected_source(paper_id, "PDF", "sha256:pending"), official)
+
+        raw = b"%PDF-1.7\npmlr fixture"
+        response = _Response(raw)
+        response.url = raw_github
+        session = _Session(response)
+        artifact = fresh_sources.fetch_fresh_artifact(
+            paper_id, original_kind="PDF", edition="sha256:pending",
+            source_url=fresh_sources.canonical_source_url(paper_id, declared), session=session)
+
+        self.assertEqual(session.call[0], official)
+        self.assertEqual(artifact.canonical_id, paper_id)
+        self.assertEqual(artifact.source_url, official)
+        self.assertEqual(artifact.retrieval_url, raw_github)
+        self.assertEqual(artifact.raw_sha256, hashlib.sha256(raw).hexdigest())
+        self.assertEqual(artifact.edition, "sha256:" + artifact.raw_sha256)
+
+    def test_pmlr_direct_proceedings_pdf_and_exact_raw_github_redirect(self):
+        paper_id = "pmlr:v318/litvin26a"
+        proceedings = fresh_sources.expected_source(paper_id, "PDF", "sha256:pending")
+        raw_github = "https://raw.githubusercontent.com/mlresearch/v318/main/assets/litvin26a/litvin26a.pdf"
+        raw = b"%PDF-1.7\npmlr fixture"
+
+        direct = _Response(raw)
+        direct.url = proceedings
+        direct_session = _Session(direct)
+        direct_artifact = fresh_sources.fetch_fresh_artifact(
+            paper_id, original_kind="PDF", edition="sha256:pending", session=direct_session)
+        self.assertEqual(direct_session.call[0], proceedings)
+        self.assertEqual(direct_artifact.source_url, proceedings)
+        self.assertEqual(direct_artifact.retrieval_url, proceedings)
+
+        redirected = _Response(raw)
+        redirected.url = raw_github
+        redirect_session = _Session(redirected)
+        redirect_artifact = fresh_sources.fetch_fresh_artifact(
+            paper_id, original_kind="PDF", edition="sha256:pending", session=redirect_session)
+        self.assertEqual(redirect_session.call[0], proceedings)
+        self.assertEqual(redirect_artifact.source_url, proceedings)
+        self.assertEqual(redirect_artifact.retrieval_url, raw_github)
+        self.assertEqual(redirect_artifact.raw_sha256, hashlib.sha256(raw).hexdigest())
+
+    def test_pmlr_rejects_non_id_derived_cross_host_redirect(self):
+        paper_id = "pmlr:v318/litvin26a"
+        response = _Response(b"%PDF-1.7\nfixture")
+        response.url = "https://raw.githubusercontent.com/mlresearch/v318/main/assets/other/other.pdf"
+        with self.assertRaisesRegex(fresh_sources.FreshSourceError, "different host"):
+            fresh_sources.fetch_fresh_artifact(
+                paper_id, original_kind="PDF", edition="sha256:pending",
+                session=_Session(response))
+
+    def test_pmlr_url_canonicalization_rejects_id_or_host_mismatch(self):
+        with self.assertRaisesRegex(fresh_sources.FreshSourceError, "does not match canonical ID"):
+            fresh_sources.canonical_source_url(
+                "pmlr:v318/litvin26a",
+                "http://proceedings.mlr.press/v318/other/other.pdf")
+        with self.assertRaisesRegex(fresh_sources.FreshSourceError, "does not match canonical ID"):
+            fresh_sources.canonical_source_url(
+                "pmlr:v318/litvin26a", "http://example.org/litvin26a.pdf")
+
+    def test_pmlr_acquisition_binding_keeps_declared_url_and_verified_route(self):
+        paper_id = "pmlr:v265/eide25a"
+        declared = "http://proceedings.mlr.press/v265/eide25a/eide25a.pdf"
+        official = fresh_sources.canonical_source_url(paper_id, declared)
+        raw = b"%PDF-1.7\nsource fixture"
+        response = _Response(raw)
+        response.url = official
+
+        def build_chunks(_text, *, section_sink, element_sink, document_kind):
+            self.assertEqual(document_kind, "paper")
+            section_sink.append({"section_title": "Abstract", "section_type": "abstract", "text": "A source body."})
+            return ([{"chunk_index": 0, "section_title": "Abstract", "section_type": "abstract",
+                      "text": "A source body."}], "markdown")
+
+        extractor = SimpleNamespace(build_chunks_markdown=build_chunks)
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(fresh_sources, "_parse_pdf", return_value=(
+                    "BoRA: Bayesian Hierarchical Low-Rank Adaption for Multi-task Large Language Models\n\nA source body.",
+                    {"page_count": 1, "page_text_chars": 50, "unresolved_unicode_mappings": []})), \
+                    patch.object(fresh_sources, "_pipeline_modules", return_value=(extractor, None)), \
+                    patch.object(fresh_sources, "_validate_candidate_sections"), \
+                    patch.object(fresh_sources, "_register_original", return_value={
+                        "canonical_path": str(Path(tmp) / "original"),
+                        "edition": "sha256:" + hashlib.sha256(raw).hexdigest()}):
+                result = fresh_sources.acquire_and_parse(
+                    {"paper_id": paper_id, "fresh_kind": "PDF", "fresh_url": official,
+                     "declared_source_url": declared,
+                     "title": "BoRA: Bayesian Hierarchical Low-Rank Adaption for Multi-task Large Language Models"},
+                    Path(tmp) / "stage", session=_Session(response))
+
+        binding = result["source_binding"]
+        self.assertEqual(binding["declared_source_url"], declared)
+        self.assertEqual(binding["request_url"], official)
+        self.assertEqual(binding["retrieval_url"], official)
+        self.assertEqual(binding["url"], official)
+        self.assertEqual(binding["raw_sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(binding["edition"], "sha256:" + hashlib.sha256(raw).hexdigest())
+
+    def test_legacy_arxiv_id_uses_same_explicit_edition_binding(self):
+        self.assertTrue(fresh_sources.is_arxiv_id("hep-th/0611328"))
+        self.assertTrue(fresh_sources.is_arxiv_id("math-ph/0611021v2"))
+        self.assertFalse(fresh_sources.is_arxiv_id("hep-th/061132x"))
+        self.assertEqual(
+            fresh_sources.expected_source("hep-th/0611328", "PDF", "v1"),
+            "https://arxiv.org/pdf/hep-th/0611328v1")
+        with self.assertRaisesRegex(fresh_sources.FreshSourceError, "version and edition disagree"):
+            fresh_sources.expected_source("hep-th/0611328v2", "PDF", "v1")
+
+    def test_generic_pdf_title_error_names_the_markdown_prefix_check(self):
+        raw = b"%PDF-1.7\nsource fixture"
+        artifact = fresh_sources.FreshArtifact(
+            canonical_id="pmlr:v265/eide25a", source_url="https://example.org/paper.pdf",
+            request_url="https://example.org/paper.pdf", retrieval_url="https://example.org/paper.pdf",
+            original_kind="PDF", edition="sha256:" + hashlib.sha256(raw).hexdigest(),
+            retrieved_at="2026-10-14T00:00:00Z", raw_sha256=hashlib.sha256(raw).hexdigest(),
+            raw_size_bytes=len(raw), raw_bytes=raw)
+        with patch.object(fresh_sources, "_parse_pdf", return_value=("unrelated content", {"page_count": 1})):
+            with self.assertRaisesRegex(fresh_sources.FreshSourceError,
+                                        "converted Markdown prefix does not contain expected title"):
+                fresh_sources.parse_fresh_artifact(
+                    artifact, expected_title="BoRA: Bayesian Hierarchical Low-Rank Adaption")
 
     def test_arxiv_resolver_binds_explicit_current_version_and_title(self):
         atom = (b'<feed xmlns="http://www.w3.org/2005/Atom"><entry>'

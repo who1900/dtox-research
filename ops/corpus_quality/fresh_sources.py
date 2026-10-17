@@ -43,9 +43,22 @@ class FreshSourceDependencyError(FreshSourceError):
 
 
 _ARXIV_ID = re.compile(r"^(\d{4}\.\d{4,5})(?:v([1-9]\d*))?$")
+_LEGACY_ARXIV_ID = re.compile(
+    r"^([A-Za-z][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)?/\d{7})(?:v([1-9]\d*))?$")
+_PMLR_ID = re.compile(r"^pmlr:v([1-9]\d*)/([A-Za-z0-9][A-Za-z0-9._-]*)$")
 _ACL_ID = re.compile(r"^acl:([A-Za-z0-9][A-Za-z0-9._/-]*)$")
 _MAX_SOURCE_BYTES = 64 * 1024 * 1024
 _USER_AGENT = "DTOX-Research source recovery (contact: dtox-research)"
+
+
+def _arxiv_id_parts(canonical_id):
+    match = _ARXIV_ID.fullmatch(canonical_id or "") or _LEGACY_ARXIV_ID.fullmatch(canonical_id or "")
+    return match.groups() if match else None
+
+
+def is_arxiv_id(canonical_id):
+    """Return whether an ID uses modern or legacy arXiv canonical syntax."""
+    return _arxiv_id_parts(canonical_id) is not None
 
 
 @dataclass(frozen=True)
@@ -89,23 +102,45 @@ def expected_source(canonical_id, original_kind, edition):
             raise FreshSourceError("invalid ACL canonical ID")
         return f"https://aclanthology.org/{ident}.pdf"
 
-    arxiv = _ARXIV_ID.fullmatch(canonical_id or "")
-    if not arxiv:
-        raise FreshSourceError("unsupported canonical paper ID")
-    bare, id_version = arxiv.groups()
-    if not re.fullmatch(r"v[1-9]\d*", edition or ""):
-        raise FreshSourceError("arXiv edition must be an explicit version such as v1")
-    version = edition[1:]
-    if id_version and id_version != version:
-        raise FreshSourceError("canonical ID version and edition disagree")
-    suffix = f"{bare}v{version}"
-    if original_kind == "HTML":
-        return f"https://arxiv.org/html/{suffix}"
-    if original_kind == "rawTexarchive":
-        return f"https://arxiv.org/e-print/{suffix}"
-    if original_kind == "PDF":
-        return f"https://arxiv.org/pdf/{suffix}"
-    raise FreshSourceError("unsupported arXiv source kind")
+    arxiv = _arxiv_id_parts(canonical_id)
+    if arxiv:
+        bare, id_version = arxiv
+        if not re.fullmatch(r"v[1-9]\d*", edition or ""):
+            raise FreshSourceError("arXiv edition must be an explicit version such as v1")
+        version = edition[1:]
+        if id_version and id_version != version:
+            raise FreshSourceError("canonical ID version and edition disagree")
+        suffix = f"{bare}v{version}"
+        if original_kind == "HTML":
+            return f"https://arxiv.org/html/{suffix}"
+        if original_kind == "rawTexarchive":
+            return f"https://arxiv.org/e-print/{suffix}"
+        if original_kind == "PDF":
+            return f"https://arxiv.org/pdf/{suffix}"
+        raise FreshSourceError("unsupported arXiv source kind")
+
+    pmlr = _PMLR_ID.fullmatch(canonical_id or "")
+    if pmlr:
+        if original_kind != "PDF":
+            raise FreshSourceError("PMLR source kind must be PDF")
+        volume, slug = pmlr.groups()
+        return f"https://proceedings.mlr.press/v{volume}/{slug}/{slug}.pdf"
+    raise FreshSourceError("unsupported canonical paper ID")
+
+
+def canonical_source_url(canonical_id, declared_url):
+    """Validate a known PMLR URL and normalize its declared HTTP route to HTTPS."""
+    match = _PMLR_ID.fullmatch(canonical_id or "")
+    if not match:
+        raise FreshSourceError("unsupported canonical paper ID for URL canonicalization")
+    volume, slug = match.groups()
+    pmlr_pdf = expected_source(canonical_id, "PDF", "sha256:pending")
+    raw_pdf = f"https://raw.githubusercontent.com/mlresearch/v{volume}/main/assets/{slug}/{slug}.pdf"
+    if declared_url == pmlr_pdf.replace("https://", "http://", 1):
+        return pmlr_pdf
+    if declared_url not in {pmlr_pdf, raw_pdf}:
+        raise FreshSourceError("declared PMLR URL does not match canonical ID")
+    return declared_url
 
 
 def _response_bytes(response, limit):
@@ -140,9 +175,13 @@ def fetch_fresh_artifact(canonical_id, *, original_kind, edition, session=None,
             raise
         _url_parts(source_url)
         expected = source_url
+    pmlr = _PMLR_ID.fullmatch(canonical_id or "")
     if source_url is not None:
         _url_parts(source_url)
-        if source_url != expected:
+        allowed_source_urls = {expected}
+        if pmlr and original_kind == "PDF":
+            allowed_source_urls.add(canonical_source_url(canonical_id, source_url))
+        if source_url not in allowed_source_urls:
             raise FreshSourceError("provided source URL conflicts with canonical ID/edition route")
     source_url = expected
     parsed_source = _url_parts(source_url)
@@ -154,7 +193,15 @@ def fetch_fresh_artifact(canonical_id, *, original_kind, edition, session=None,
     try:
         retrieval_url = getattr(response, "url", source_url)
         parsed_final = _url_parts(retrieval_url)
-        if parsed_final.hostname != parsed_source.hostname:
+        valid_pmlr_redirect = False
+        if pmlr and original_kind == "PDF":
+            volume, slug = pmlr.groups()
+            pmlr_raw_pdf = (
+                f"https://raw.githubusercontent.com/mlresearch/v{volume}/main/"
+                f"assets/{slug}/{slug}.pdf"
+            )
+            valid_pmlr_redirect = (source_url == expected and retrieval_url == pmlr_raw_pdf)
+        if parsed_final.hostname != parsed_source.hostname and not valid_pmlr_redirect:
             raise FreshSourceError("source redirected to a different host")
         raw = _response_bytes(response, max_bytes)
     finally:
@@ -176,7 +223,7 @@ def fetch_fresh_artifact(canonical_id, *, original_kind, edition, session=None,
         raise FreshSourceError("response is not a supported arXiv source archive")
 
     raw_sha256 = hashlib.sha256(raw).hexdigest()
-    artifact_edition = edition if _ARXIV_ID.fullmatch(canonical_id or "") else "sha256:" + raw_sha256
+    artifact_edition = edition if is_arxiv_id(canonical_id) else "sha256:" + raw_sha256
     return FreshArtifact(
         canonical_id=canonical_id, source_url=source_url, request_url=source_url,
         retrieval_url=retrieval_url, original_kind=original_kind, edition=artifact_edition,
@@ -188,10 +235,10 @@ def fetch_fresh_artifact(canonical_id, *, original_kind, edition, session=None,
 def resolve_arxiv_version(canonical_id, *, session=None, timeout=30):
     """Resolve the current arXiv edition from its public Atom API, with title evidence."""
     started = time.perf_counter()
-    match = _ARXIV_ID.fullmatch(canonical_id or "")
-    if not match:
+    parts = _arxiv_id_parts(canonical_id)
+    if not parts:
         raise FreshSourceError("arXiv canonical ID required for version resolution")
-    bare, explicit = match.groups()
+    bare, explicit = parts
     if explicit:
         return {"fresh_version": "v" + explicit, "title": None,
                 "resolver_url": None, "resolved_at": _utc_now(),
@@ -808,9 +855,9 @@ def parse_fresh_artifact(artifact, *, timeout=120, native_build=None, expected_t
             raise FreshSourceError(
                 "HTML source exceeds the structured parser limits; try another route for this edition") from exc
         ir["_raw_text"] = artifact.raw_bytes.decode("utf-8", errors="strict")
-        arxiv = _ARXIV_ID.fullmatch(artifact.canonical_id)
+        arxiv = _arxiv_id_parts(artifact.canonical_id)
         if arxiv:
-            bare, id_version = arxiv.groups()
+            bare, id_version = arxiv
             version = artifact.edition[1:]
             if id_version and id_version != version:
                 raise FreshSourceError("HTML canonical ID and explicit edition disagree")
@@ -841,13 +888,13 @@ def parse_fresh_artifact(artifact, *, timeout=120, native_build=None, expected_t
         raise FreshSourceError("artifact parser is not supported by this bounded helper")
     if (artifact.original_kind == "PDF"
             and not _ACL_ID.fullmatch(artifact.canonical_id)
-            and not _ARXIV_ID.fullmatch(artifact.canonical_id)):
+            and not is_arxiv_id(artifact.canonical_id)):
         if not expected_title or len(_normalize_title(expected_title)) < 8:
             raise FreshSourceError("generic PDF source requires a usable expected title")
         title = _normalize_title(expected_title)
         extracted = _normalize_title(text[:12000])
         if title not in extracted:
-            raise FreshSourceError("generic PDF first-page text does not match expected title")
+            raise FreshSourceError("generic PDF converted Markdown prefix does not contain expected title")
     if not isinstance(text, str) or not text.strip():
         raise FreshSourceError("source parser produced no readable body")
     return text, diagnostics
@@ -925,6 +972,30 @@ def _register_original(artifact, raw_path, original_store_root):
             "storage": storage}
 
 
+def source_quality_reason(kind, diagnostics):
+    """Return the production source rejection reason, or None when approved."""
+    if diagnostics.get("replacement_characters", 0):
+        return "replacement_characters_present"
+    elif diagnostics.get("unsupported_structures"):
+        return "unresolved_source_structures"
+    elif kind == "HTML" and not (
+            diagnostics.get("source_title_match") is True
+            and diagnostics.get("article_source_chars", 0) > 0
+            and diagnostics.get("nonabstract_section_count", 0) > 0
+            and diagnostics.get("math") == diagnostics.get("article_math_rendered_count")
+            and diagnostics.get("tables") == diagnostics.get("article_tables_rendered_count")
+            and diagnostics.get("equation_layouts") == diagnostics.get("equation_layouts_rendered_count")):
+        return "incomplete_structured_article_projection"
+    elif kind == "PDF" and not (
+            diagnostics.get("page_count", 0) > 0
+            and diagnostics.get("page_text_chars", 0) > 0
+            and diagnostics.get("markdown_text_chars", 0) > 0
+            and not diagnostics.get("unresolved_unicode_mappings")):
+        return "incomplete_pdf_page_or_unicode_coverage"
+    else:
+        return None
+
+
 def acquire_and_parse(row, stage_dir, *, timeout=120, session=None, fetched_at=None,
                       native_build=None,
                       original_store_root="/opt/dtox-source-recovery-20261012/originals-store-v1"):
@@ -940,7 +1011,7 @@ def acquire_and_parse(row, stage_dir, *, timeout=120, session=None, fetched_at=N
     fresh_url = row.get("fresh_url") or row.get("source_url")
     if paper_id.startswith("acl:"):
         kind, edition = "PDF", paper_id
-    elif _ARXIV_ID.fullmatch(paper_id):
+    elif is_arxiv_id(paper_id):
         if not fresh_version:
             raise FreshSourceError("arXiv acquisition requires an explicitly resolved fresh version")
         kind, edition = row.get("fresh_kind", "rawTexarchive"), fresh_version
@@ -953,38 +1024,16 @@ def acquire_and_parse(row, stage_dir, *, timeout=120, session=None, fetched_at=N
     artifact = fetch_fresh_artifact(paper_id, original_kind=kind, edition=edition,
                                     timeout=timeout, session=session, retrieved_at=fetched_at,
                                     source_url=fresh_url if not paper_id.startswith("acl:") and
-                                    not _ARXIV_ID.fullmatch(paper_id) else None)
+                                    not is_arxiv_id(paper_id) else None)
     fetch_seconds = time.perf_counter() - fetch_started
     parse_started = time.perf_counter()
     text, diagnostics = parse_fresh_artifact(artifact, timeout=timeout, native_build=native_build,
                                              expected_title=row.get("title"))
     diagnostics["fetch_seconds"] = round(fetch_seconds, 6)
     diagnostics["parse_seconds"] = round(time.perf_counter() - parse_started, 6)
-    if diagnostics.get("replacement_characters", 0):
-        diagnostics["body_quality_candidate"] = False
-        diagnostics["body_quality_reason"] = "replacement_characters_present"
-    elif diagnostics.get("unsupported_structures"):
-        diagnostics["body_quality_candidate"] = False
-        diagnostics["body_quality_reason"] = "unresolved_source_structures"
-    elif kind == "HTML" and not (
-            diagnostics.get("source_title_match") is True
-            and diagnostics.get("article_source_chars", 0) > 0
-            and diagnostics.get("nonabstract_section_count", 0) > 0
-            and diagnostics.get("math") == diagnostics.get("article_math_rendered_count")
-            and diagnostics.get("tables") == diagnostics.get("article_tables_rendered_count")
-            and diagnostics.get("equation_layouts") == diagnostics.get("equation_layouts_rendered_count")):
-        diagnostics["body_quality_candidate"] = False
-        diagnostics["body_quality_reason"] = "incomplete_structured_article_projection"
-    elif kind == "PDF" and not (
-            diagnostics.get("page_count", 0) > 0
-            and diagnostics.get("page_text_chars", 0) > 0
-            and diagnostics.get("markdown_text_chars", 0) > 0
-            and not diagnostics.get("unresolved_unicode_mappings")):
-        diagnostics["body_quality_candidate"] = False
-        diagnostics["body_quality_reason"] = "incomplete_pdf_page_or_unicode_coverage"
-    else:
-        diagnostics["body_quality_candidate"] = True
-        diagnostics["body_quality_reason"] = "source_identity_and_extraction_coverage_verified"
+    quality_reason = source_quality_reason(kind, diagnostics)
+    diagnostics["body_quality_candidate"] = quality_reason is None
+    diagnostics["body_quality_reason"] = quality_reason or "source_identity_and_extraction_coverage_verified"
     stage = Path(stage_dir)
     original_path = stage / "originals" / artifact.raw_sha256
     source_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -998,8 +1047,10 @@ def acquire_and_parse(row, stage_dir, *, timeout=120, session=None, fetched_at=N
             raise FreshSourceError("candidate raw stage changed after ORIGINAL registration")
         original_path.unlink()
     binding = {key: value for key, value in asdict(artifact).items() if key != "raw_bytes"}
-    # `source_url` is the successful request endpoint that binds this exact raw SHA.
-    binding["source_url"] = artifact.retrieval_url
+    if row.get("declared_source_url"):
+        binding["declared_source_url"] = row["declared_source_url"]
+    # Preserve the declared request endpoint separately from any verified redirect.
+    binding["source_url"] = artifact.source_url
     binding["url"] = artifact.retrieval_url
     binding["edition"] = original_receipt["edition"]
     binding["version"] = original_receipt["edition"]
