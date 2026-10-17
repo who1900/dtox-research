@@ -5,6 +5,7 @@ import { loadConfig, type GatewayConfig } from "./config.js";
 import { registerTools, type PaidWrappers } from "./tools.js";
 import { createResearchUpstream } from "./upstream.js";
 import { createWrappers } from "./payments.js";
+import { PendingPayments } from "./pending-payments.js";
 
 
 async function createMcpServer(config: GatewayConfig, wrappers: PaidWrappers): Promise<McpServer> {
@@ -15,7 +16,13 @@ async function createMcpServer(config: GatewayConfig, wrappers: PaidWrappers): P
 
 export async function start(): Promise<void> {
   const config = loadConfig();
-  const wrappers = await createWrappers(config);
+  const pending = config.mode === "live" ? new PendingPayments(process.env.X402_PAYMENT_STATE_DIR ?? "./payment-state") : undefined;
+  const wrappers = await createWrappers(config, undefined, undefined, pending);
+  // Register handlers before resuming durable operations, even before the first
+  // client request after a service restart.
+  const bootstrap = await createMcpServer(config, wrappers);
+  await bootstrap.close();
+  pending?.start();
   const app = express();
   app.disable("x-powered-by");
   app.use(express.json({ limit: "256kb" }));

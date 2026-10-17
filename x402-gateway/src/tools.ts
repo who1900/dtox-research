@@ -5,6 +5,7 @@ import type { createResearchUpstream } from "./upstream.js";
 import { UpstreamToolError } from "./upstream.js";
 import type { GatewayConfig } from "./config.js";
 import { paidToolSchemas } from "./tool-schemas.js";
+import type { PendingPayments } from "./pending-payments.js";
 
 type Api = ReturnType<typeof createResearchUpstream>;
 type Paid = ReturnType<typeof createPaymentWrapper>;
@@ -54,6 +55,7 @@ function paidOrShadow<T extends Record<string, unknown>>(
 }
 
 export interface PaidWrappers {
+  payments?: PendingPayments;
   evidence: Paid | null;
   spec: Paid | null;
   compare: Paid | null;
@@ -74,7 +76,7 @@ export function registerTools(
       mode: config.mode,
       networks: [...config.evmNetworks, config.svmNetwork],
       settlement_asset: "USDC",
-      free_tools: ["dtox_service_info", "search_research_preview", "get_verdict_message"],
+      free_tools: ["dtox_service_info", "search_research_preview", "get_verdict_message", ...(wrappers.payments ? ["get_payment_status"] : [])],
       paid_tools: {
         get_evidence_bundle: config.prices.evidence,
         get_code_or_math_spec: config.prices.spec,
@@ -87,12 +89,17 @@ export function registerTools(
         reads: "authorization: settle after a successful handler",
         record_signed_verdict: "upfront: per-attempt fee settles before the write handler, not per accepted item",
         handler_failure: "after upfront settlement, isError includes x402/payment-response receipt; no automatic refund",
-        retry: "signed writes are never automatically retried after timeout; inspect receipts and attestation state before retrying",
+        retry: "pending payments recover automatically; poll get_payment_status with operation_id, never create a new payment. Exact signed records are reused by SAS after an interrupted write.",
         quorum: "payment and distinct wallets do not establish scientific quorum"
       },
       note: "Live mode gates the signed write by payment and wallet signature. Disabled/shadow modes do not charge. The gateway does not expose unsigned shared-API-key registry mutation tools."
     })
   );
+
+  if (wrappers.payments) server.tool("get_payment_status",
+    "Free: retrieve an automatically recovered payment receipt and its original tool result. Never pays or submits a verdict again. Keep operation_id from the pending response.",
+    { operation_id: z.string().uuid() },
+    async ({ operation_id }) => wrappers.payments!.status(operation_id));
 
   server.tool(
     "search_research_preview",

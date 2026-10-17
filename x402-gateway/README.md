@@ -36,10 +36,21 @@ X402_MODE=live
 X402_SVM_NETWORK=solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1
 X402_SVM_PAY_TO=...
 DTOX_UPSTREAM_MCP_URL=http://127.0.0.1:8011/mcp
+X402_PAYMENT_STATE_DIR=/var/lib/dtox-x402/payments
 # X402_EVM_PAY_TO left unset (or X402_EVM_NETWORKS="") keeps this Solana-only.
 ```
 
 No private key belongs on the resource server. `PAY_TO` values are public receiving addresses. Facilitator credentials, if required, must be injected by the service manager and never committed. The gateway calls the existing local dtox MCP rather than holding an internal research API key.
+
+## Automatic pending-payment recovery
+
+When a facilitator reports `settlement_pending` with a transaction signature, the gateway saves the operation on disk and checks that exact transaction on Solana devnet. Recovery verifies finalized execution, the transaction signature and identical buyer-signed message bytes. It never creates, signs or broadcasts another payment.
+
+If confirmation takes longer than the initial request, the response contains `operation_id`, the pending receipt and `next_tool: get_payment_status`. This free tool returns `status: completed`, `payment_response` and the original MCP `result` once recovery completes; the receipt is also included in standard x402 metadata. Pending is a status, not another payment challenge. The demo buyer waits automatically; after reconnecting, use `--payment-status <operation_id>` instead of buying again.
+
+The gateway resumes pending operations after a service restart. A research result computed before settlement is retained. Paid verdicts use the exact saved signed arguments; SAS reuses an identical record if a crash interrupted the response, rather than writing a second attestation. A failed verdict attempt still returns its payment receipt. Status polling never executes the verdict handler.
+
+`X402_PAYMENT_STATE_DIR` must be persistent, private and writable by the gateway service (default `./payment-state`). Run one gateway process for this directory. The store contains only pending-payment operations and their final responses; no extra database, queue service or wallet key is required. With systemd `ProtectSystem=strict`, grant `ReadWritePaths` to this directory.
 
 ## Facilitator: Solana devnet support, fee payer, and the recipient ATA
 

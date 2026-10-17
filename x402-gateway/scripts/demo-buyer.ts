@@ -38,7 +38,9 @@
  */
 import { readFileSync } from "node:fs";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { createx402MCPClient } from "@x402/mcp";
+import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
+import { createx402MCPClient, MCP_PAYMENT_RESPONSE_META_KEY } from "@x402/mcp";
+import type { SettleResponse } from "@x402/core/types";
 import { ExactSvmScheme } from "@x402/svm/exact/client";
 import { toClientSvmSigner } from "@x402/svm";
 import { createKeyPairSignerFromBytes, getBase58Decoder, signBytes } from "@solana/kit";
@@ -78,6 +80,36 @@ async function main(): Promise<void> {
   const transport = new StreamableHTTPClientTransport(new URL(gatewayUrl));
   await x402Client.connect(transport);
 
+  async function callAndWait(name: string, args: Record<string, unknown>) {
+    // The SDK's free-call convenience method drops payment response metadata.
+    // Use its existing raw transport for status, retaining the recovered receipt.
+    async function status(operation_id: string): Promise<Awaited<ReturnType<typeof x402Client.callTool>>> {
+      const raw = CallToolResultSchema.parse(await x402Client.client.callTool({ name: "get_payment_status", arguments: { operation_id } }));
+      const body = raw.structuredContent ?? JSON.parse((raw.content.find((item) => item.type === "text") as { text: string }).text);
+      const result = body.status === "completed" ? CallToolResultSchema.parse(body.result) : raw;
+      return { content: result.content, isError: result.isError, paymentMade: false,
+        paymentResponse: (body.payment_response ?? result._meta?.[MCP_PAYMENT_RESPONSE_META_KEY]) as SettleResponse | undefined };
+    }
+    let response = name === "get_payment_status" ? await status(String(args.operation_id)) : await x402Client.callTool(name, args);
+    while (true) {
+      const text = response.content.find((item) => item.type === "text")?.text;
+      if (typeof text !== "string") throw new Error("Missing tool result text");
+      const body = JSON.parse(text);
+      if (!["settlement_pending", "processing"].includes(body.status) || !body.operation_id) {
+        if (response.isError) process.exitCode = 1;
+        return response;
+      }
+      console.error(`payment operation ${body.operation_id}: ${body.status}; checking automatically`);
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+      response = await status(body.operation_id);
+    }
+  }
+
+  if (rest[0] === "--payment-status") {
+    console.log(JSON.stringify(await callAndWait("get_payment_status", { operation_id: rest[1] }), null, 2));
+    return;
+  }
+
   if (rest[0] === "--verdict") {
     const [, claim, paperId, verdict, evidenceSha256] = rest;
     if (!claim || !paperId || !verdict) {
@@ -97,7 +129,7 @@ async function main(): Promise<void> {
     const signatureBytes = await signBytes(keyPairSigner.keyPair.privateKey, new TextEncoder().encode(messagePayload.message));
     const signature = getBase58Decoder().decode(signatureBytes);
 
-    const recordResult = await x402Client.callTool("record_signed_verdict", {
+    const recordResult = await callAndWait("record_signed_verdict", {
       claim,
       judgments: [{
         id: paperId,
@@ -111,7 +143,7 @@ async function main(): Promise<void> {
 
     const recordText = (recordResult.content[0] as { text?: string }).text ?? "{}";
     console.log(JSON.stringify({
-      paid: recordResult.paymentMade,
+      paid: recordResult.paymentResponse?.success === true,
       network: recordResult.paymentResponse?.network,
       settlement_tx: recordResult.paymentResponse?.transaction,
       result: JSON.parse(recordText)
@@ -122,13 +154,13 @@ async function main(): Promise<void> {
   const toolName = rest[0] ?? "get_evidence_bundle";
   const args = rest[1] ? JSON.parse(rest[1]) : { query: "verifiable delay functions for decentralized sequencing" };
 
-  const result = await x402Client.callTool(toolName, args);
+  const result = await callAndWait(toolName, args);
   const resultText = (result.content[0] as { text?: string }).text ?? "{}";
   const payload = JSON.parse(resultText);
 
   console.log(JSON.stringify({
     tool: toolName,
-    paid: result.paymentMade,
+    paid: result.paymentResponse?.success === true,
     amount: result.paymentResponse?.amount,
     network: result.paymentResponse?.network,
     settlement_tx: result.paymentResponse?.transaction,

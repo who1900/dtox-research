@@ -7,9 +7,10 @@ import type { GatewayConfig } from "./config.js";
 import type { PaidWrappers } from "./tools.js";
 import { paidToolJsonSchema, type PaidToolName } from "./tool-schemas.js";
 import { devnetSettlementRecovery } from "./settlement.js";
+import type { PendingPayments } from "./pending-payments.js";
 
 export async function createWrappers(config: GatewayConfig, facilitator?: FacilitatorClient,
-  recoverSettlement: OnSettleFailureHook = devnetSettlementRecovery()): Promise<PaidWrappers> {
+  recoverSettlement: OnSettleFailureHook = devnetSettlementRecovery(), pending?: PendingPayments): Promise<PaidWrappers> {
   const empty: PaidWrappers = { evidence: null, spec: null, compare: null, trends: null, audit: null, verdict: null };
   if (config.mode !== "live") return empty;
   const evmEnabled = config.evmNetworks.length > 0 && Boolean(config.evmPayTo);
@@ -18,7 +19,12 @@ export async function createWrappers(config: GatewayConfig, facilitator?: Facili
     for (const network of config.evmNetworks) resourceServer.register(network, new ExactEvmScheme());
   }
   resourceServer.register(config.svmNetwork, new ExactSvmScheme());
-  resourceServer.onSettleFailure(recoverSettlement);
+  resourceServer.onSettleFailure(async (context) => {
+    const entry = pending?.capture(context);
+    const recovered = await recoverSettlement(context);
+    if (entry && recovered?.result.success) pending!.paid(entry, recovered.result);
+    return recovered;
+  });
   await resourceServer.initialize();
 
   async function wrapper(
@@ -38,7 +44,7 @@ export async function createWrappers(config: GatewayConfig, facilitator?: Facili
         extra: { paymentFlow }
       })
     ]);
-    return createPaymentWrapper(resourceServer, {
+    const paid = createPaymentWrapper(resourceServer, {
       accepts: requirements.flat(),
       resource: {
         url: `mcp://tool/${toolName}`, serviceName: "dtox research", description,
@@ -46,6 +52,7 @@ export async function createWrappers(config: GatewayConfig, facilitator?: Facili
       },
       extensions: declareDiscoveryExtension({ toolName, description, transport: "streamable-http", inputSchema: paidToolJsonSchema(toolName), example })
     });
+    return pending ? pending.wrap(toolName, paid) : paid;
   }
 
   const [evidence, spec, compare, trends, audit, verdict] = await Promise.all([
@@ -68,5 +75,5 @@ export async function createWrappers(config: GatewayConfig, facilitator?: Facili
       "A wallet-signed verdict attempt on Solana devnet. Payment settles before the write handler; handler failure keeps a receipt, with no automatic refund. Payment is not scientific quorum.",
       { claim: "the protocol tolerates byzantine faults under partial synchrony", judgments: [{ id: "2401.12345", verdict: "asserts", reviewer: "<base58 pubkey>", signature: "<base58 signature>", issued_at: "2026-09-26T00:00:00Z" }] })
   ]);
-  return { evidence, spec, compare, trends, audit, verdict };
+  return { evidence, spec, compare, trends, audit, verdict, ...(pending ? { payments: pending } : {}) };
 }

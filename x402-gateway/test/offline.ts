@@ -8,6 +8,7 @@ import type { PaymentRequired, PaymentRequirements } from "@x402/core/types";
 import { MCP_PAYMENT_META_KEY } from "@x402/mcp";
 import { loadConfig } from "../src/config.js";
 import { createWrappers } from "../src/payments.js";
+import type { PendingPayments } from "../src/pending-payments.js";
 import { registerTools } from "../src/tools.js";
 import { createResearchUpstream } from "../src/upstream.js";
 
@@ -33,6 +34,7 @@ export async function offlineGateway(t: TestContext, options: {
   settlePending?: boolean;
   settleTransaction?: string;
   recoverSettlement?: OnSettleFailureHook;
+  pending?: PendingPayments;
 } = {}) {
   const config = loadConfig({ X402_MODE: options.mode ?? "live",
     X402_EVM_NETWORKS: "eip155:84532",
@@ -51,7 +53,7 @@ export async function offlineGateway(t: TestContext, options: {
         network: requirements.network, errorReason: options.settlePending ? "settlement_pending" : options.settleSuccess === false ? "fixture_settlement_failed" : undefined };
     }
   };
-  const wrappers = await createWrappers(config, facilitator, options.recoverSettlement ?? (async () => {}));
+  const wrappers = await createWrappers(config, facilitator, options.recoverSettlement ?? (async () => {}), options.pending);
   const api = createResearchUpstream(config, () => ({
     connect: async () => {}, close: async () => {},
     callTool: async (request: { name: string; arguments?: Record<string, unknown> }) => {

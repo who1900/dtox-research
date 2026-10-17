@@ -26,7 +26,7 @@ function rpc(txRecord: unknown, genesis = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWo
     const { method, params } = JSON.parse(init!.body as string);
     calls.push(method);
     if (method === "getTransaction") assert.deepEqual(params, [transaction, {
-      encoding: "base64", commitment: "confirmed", maxSupportedTransactionVersion: 0
+      encoding: "base64", commitment: "finalized", maxSupportedTransactionVersion: 0
     }]);
     return Response.json({ result: method === "getGenesisHash" ? genesis : txRecord });
   }) as typeof fetch;
