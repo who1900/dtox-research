@@ -248,7 +248,8 @@ class ParseSafetyTests(unittest.TestCase):
             self.paper_id, self.chunks, self.old_cache, self.source_bytes, "pylatexenc", 4)
         document_cache.publish_section_manifest(self.section_path, old_manifest)
         old_manifest_bytes = self.section_path.read_bytes()
-        self.chunks[0]["section_title"] = "M" * 513
+        # Long headings are valid; an embedded control character is not.
+        self.chunks[0]["section_title"] = "M" * 513 + "\x00"
         self.canonical_sections[0]["section_title"] = self.chunks[0]["section_title"]
         with self.assertRaises(document_cache.ManifestInvalid):
             document_cache.make_section_manifest(

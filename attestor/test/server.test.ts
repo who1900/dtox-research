@@ -4,7 +4,7 @@ import type { AddressInfo } from "node:net";
 import test from "node:test";
 import * as ed from "@noble/ed25519";
 import bs58 from "bs58";
-import { buildVerdictMessage, claimTextSha256 } from "../src/message.js";
+import { buildVerdictMessage, claimTextSha256, buildLegacyVerdictMessage, legacyClaimTextSha256 } from "../src/message.js";
 import { AttestationConflictError, AttestationBusyError, getInitializationState, getAttestation } from "../src/sas.js";
 import { mockChain, TEST_ADDRESS, verdictRecord } from "./mock-chain.js";
 
@@ -29,7 +29,7 @@ async function withServer(
 
 test("POST /message rejects requests without a valid X-Internal-Token", async () => {
   await withServer(async (base) => {
-    const res = await fetch(`${base}/message`, {
+    const res = await fetch(`${base}/v2/message`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({}),
@@ -40,7 +40,7 @@ test("POST /message rejects requests without a valid X-Internal-Token", async ()
 
 test("POST /message returns the exact canonical message /attest will verify against", async () => {
   await withServer(async (base) => {
-    const res = await fetch(`${base}/message`, {
+    const res = await fetch(`${base}/v2/message`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Internal-Token": "test-internal-token" },
       body: JSON.stringify({
@@ -56,7 +56,7 @@ test("POST /message returns the exact canonical message /attest will verify agai
     assert.equal(
       body.message,
       [
-        "dtox-claim-verdict:v1",
+        "dtox-claim-verdict:v2",
         "claim_id:claim-1",
         `claim_sha256:${body.claim_sha256}`,
         "paper_id:2401.12345",
@@ -71,7 +71,7 @@ test("POST /message returns the exact canonical message /attest will verify agai
 test("POST /message stamps issued_at server-side when the caller omits it", async () => {
   await withServer(async (base) => {
     const before = Date.now();
-    const res = await fetch(`${base}/message`, {
+    const res = await fetch(`${base}/v2/message`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Internal-Token": "test-internal-token" },
       body: JSON.stringify({
@@ -90,7 +90,7 @@ test("POST /message stamps issued_at server-side when the caller omits it", asyn
 
 test("POST /message rejects an invalid verdict", async () => {
   await withServer(async (base) => {
-    const res = await fetch(`${base}/message`, {
+    const res = await fetch(`${base}/v2/message`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Internal-Token": "test-internal-token" },
       body: JSON.stringify({
@@ -106,7 +106,7 @@ test("POST /message rejects an invalid verdict", async () => {
 
 test("X-Internal-Token check rejects a token of a different length than the real one", async () => {
   await withServer(async (base) => {
-    const res = await fetch(`${base}/message`, {
+    const res = await fetch(`${base}/v2/message`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Internal-Token": "short" },
       body: JSON.stringify({}),
@@ -139,7 +139,7 @@ async function signedBody(issuedAt = new Date().toISOString().replace("Z", "+00:
 }
 
 function postAttest(base: string, body: unknown) {
-  return fetch(`${base}/attest`, {
+  return fetch(`${base}/v2/attest`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Internal-Token": "test-internal-token" },
     body: JSON.stringify(body),
@@ -279,4 +279,37 @@ test("GET /attestation is read-only for both missing and existing records", asyn
     assert.equal(chain.state.credentialReads, 0);
     assert.equal(chain.state.writes, 0);
   }, { getAttestation: (pda) => getAttestation(pda, chain.operations) });
+});
+
+
+test("retired v1 write routes fail visibly without chain access", async () => {
+  await withServer(async (base) => {
+    for (const path of ["/message", "/attest"]) {
+      const response = await fetch(`${base}${path}`, { method: "POST",
+        headers: { "Content-Type": "application/json", "X-Internal-Token": "test-internal-token" },
+        body: JSON.stringify({ claim_id: "old claim" }) });
+      assert.equal(response.status, 410);
+      assert.match((await response.json() as { error: string }).error, /v1 signing retired/);
+    }
+  }, { attestVerdict: async () => { throw new Error("must not write"); } });
+});
+
+
+test("v1 signatures and v2 exact-text tampering are rejected before chain access", async () => {
+  const secret = new Uint8Array(32).fill(29);
+  const body = { ...await signedBody(undefined, secret), claim_text: "X=1" };
+  const fields = { claimId: body.claim_id, claimSha256: legacyClaimTextSha256(body.claim_text),
+    paperId: body.paper_id, verdict: body.verdict, evidenceSha256: body.evidence_sha256, issuedAt: body.issued_at };
+  const sign = async (message: string) => bs58.encode(await ed.signAsync(new TextEncoder().encode(message), secret));
+  body.signature = await sign(buildLegacyVerdictMessage(fields));
+  await withServer(async (base) => {
+    for (const text of ["X=1", "x=1", "x>1", "x<1", "安全"]) {
+      assert.equal((await postAttest(base, { ...body, claim_text: text })).status, 400);
+    }
+    body.signature = await sign(buildVerdictMessage({ ...fields, claimSha256: claimTextSha256(body.claim_text) }));
+    for (const text of ["x=1", "X>1", "X≤1", "安全"]) {
+      assert.equal((await postAttest(base, { ...body, claim_text: text })).status, 400);
+    }
+    assert.equal((await postAttest(base, { ...body, claim_text: "\ud800" })).status, 400);
+  }, { attestVerdict: async () => { throw new Error("must not write"); } });
 });

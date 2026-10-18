@@ -6,7 +6,7 @@ import bs58 from "bs58";
 export const VALID_VERDICTS = ["asserts", "does_not_assert", "partial"] as const;
 export type Verdict = (typeof VALID_VERDICTS)[number];
 
-export const DOMAIN_TAG = "dtox-claim-verdict:v1";
+export const DOMAIN_TAG = "dtox-claim-verdict:v2";
 
 /** Anti-replay window: an issued_at older than this, or more than 1 minute in the future, is rejected. */
 export const MAX_AGE_MS = 10 * 60 * 1000;
@@ -26,15 +26,14 @@ export interface VerdictFields {
   issuedAt: string;
 }
 
-/**
- * Normalizes claim text before hashing: lowercase, trim, collapse runs of
- * whitespace to a single space. This keeps `claim_sha256` stable across
- * cosmetic differences (extra spaces, trailing newlines, case) that do not
- * change what is being asserted, while still binding the signature to the
- * actual claim text rather than to a mutable claim_id.
- */
+/** V2 preserves exact text: case, Unicode, operators and whitespace are data. */
 export function normalizeClaimText(text: string): string {
-  return text.toLowerCase().trim().replace(/\s+/g, " ");
+  return text;
+}
+
+/** Historical verification only; never used to authorize a new write. */
+export function legacyClaimTextSha256(text: string): string {
+  return sha256Hex(text.toLowerCase().trim().replace(/\s+/g, " "));
 }
 
 export function sha256Hex(input: string | Uint8Array): string {
@@ -101,9 +100,18 @@ export function parseIssuedAtTimestamp(value: string): number {
  * defines the wire format.
  */
 export function buildVerdictMessage(fields: VerdictFields): string {
+  return verdictMessage(fields, DOMAIN_TAG);
+}
+
+/** Reconstruct existing v1 receipts for independent read-only verification. */
+export function buildLegacyVerdictMessage(fields: VerdictFields): string {
+  return verdictMessage(fields, "dtox-claim-verdict:v1");
+}
+
+function verdictMessage(fields: VerdictFields, domain: string): string {
   assertVerdictFields(fields);
   return [
-    DOMAIN_TAG,
+    domain,
     `claim_id:${fields.claimId}`,
     `claim_sha256:${fields.claimSha256}`,
     `paper_id:${fields.paperId}`,

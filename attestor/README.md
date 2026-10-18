@@ -33,7 +33,7 @@ the word "mainnet". It refuses to start on a mismatch unless
 ## How it fits together
 
 ```
-agent wallet --sign--> canonical message --POST /attest--> attestor --SAS tx--> devnet
+agent wallet --sign--> canonical message --POST /v2/attest--> attestor --SAS tx--> devnet
                                                               |
                                                    verifies signature first,
                                                    only then touches the chain
@@ -42,7 +42,7 @@ agent wallet --sign--> canonical message --POST /attest--> attestor --SAS tx--> 
 1. The agent builds the canonical message (see below) and signs it with its
    own ed25519 keypair, the same key it would use for any Solana wallet.
 2. It POSTs the verdict, the claim text, its public key, and the signature to
-   `attestor`'s internal `/attest` endpoint.
+   `attestor`'s internal `/v2/attest` endpoint.
 3. `attestor` recomputes `claim_sha256` from the claim text itself (never
    trusts a caller-supplied hash), rebuilds the canonical message, and
    verifies the signature against the given public key.
@@ -73,19 +73,33 @@ agent wallet --sign--> canonical message --POST /attest--> attestor --SAS tx--> 
 ## Canonical message format
 
 ```
-dtox-claim-verdict:v1
+dtox-claim-verdict:v2
 claim_id:<id>
-claim_sha256:<hex sha256 of the normalized claim text>
+claim_sha256:<hex sha256 of the exact UTF-8 claim text>
 paper_id:<id>
 verdict:<asserts|does_not_assert|partial>
 evidence_sha256:<hex|->
 issued_at:<ISO 8601 UTC>
 ```
 
-Claim text normalization (`normalizeClaimText` in `src/message.ts`):
-lowercase, trim, collapse all whitespace runs to a single space. This makes
-`claim_sha256` stable across cosmetic differences (extra spaces, case,
-trailing newlines) without changing what is actually being asserted.
+V2 hashes the exact UTF-8 claim text without lowercasing, Unicode normalization,
+operator removal or whitespace folding. New API identities are
+`claim:v2:<sha256 of exact UTF-8 text>`; explicit reader links may select another
+canonical ID, while the signature still binds the exact supplied text.
+
+Legacy v1 signatures and on-chain records are unchanged. Existing attestations
+remain readable via `GET /attestation/:pda`; `buildLegacyVerdictMessage` and
+`legacyClaimTextSha256` reconstruct their historical verification bytes only.
+New writes accept v2 signatures exclusively. Internal preparation/write routes are
+`/v2/message` and `/v2/attest`; retired `/message` and `/attest` return 410.
+An old attestor returns 404 for the new routes, so mixed API/attestor versions
+fail before writes rather than silently choosing a signing format. Re-prepare and re-sign interrupted
+v1 submissions; a v1 signature is never upgraded or used to authorize v2.
+The existing SAS schema/layout stays unchanged (the schema name is historical).
+API `GET /v1/claims/legacy?claim_id=<explicit old ID>` reads legacy registry
+records with an ambiguity warning. New claims never automatically consult the
+old lossy normalized key. Existing explicit links are retained; migration needs
+independent evidence and an explicit link, never an inferred recovered wording.
 
 The signature is a standard ed25519 signature over the UTF-8 bytes of this
 message, base58-encoded, the same primitive any Solana wallet already uses.
@@ -124,12 +138,12 @@ npm run build   # or `npm run dev` for tsx without a build step
 
 ### Endpoints
 
-- `POST /message`, body: `{claim_id, claim_text, paper_id, verdict, evidence_sha256?, issued_at?}`.
+- `POST /v2/message`, body: `{claim_id, claim_text, paper_id, verdict, evidence_sha256?, issued_at?}`.
   Returns the exact canonical message to sign (`issued_at` is stamped by the
   server when omitted). Lets a caller build the message once here and get
-  back exactly what `/attest` will later verify against, instead of
+  back exactly what `/v2/attest` will later verify against, instead of
   reimplementing the canonical format itself.
-- `POST /attest`, body: `{claim_id, claim_text, paper_id, verdict, evidence_sha256?, reviewer, signature, issued_at}`.
+- `POST /v2/attest`, body: `{claim_id, claim_text, paper_id, verdict, evidence_sha256?, reviewer, signature, issued_at}`.
   Returns `{attestation, signature, explorer_url, reused, claim_sha256}`.
   400 on bad fields or a signature that doesn't verify; 429 on rate limit;
   502 on an RPC failure.
@@ -148,7 +162,7 @@ npx tsx scripts/demo-sign.ts /path/to/agent-keypair.json claim-1 2401.12345 asse
 ```
 
 Generates (or reuses) an ed25519 keypair at the given path and prints a JSON
-body ready to `curl -X POST http://127.0.0.1:8013/attest`.
+body ready to `curl -X POST http://127.0.0.1:8013/v2/attest`.
 
 `scripts/gen-keypair.ts` is a smaller helper that only generates a
 solana-keygen-format keypair file (useful for the issuer authority itself on
@@ -166,8 +180,8 @@ field invalidates the signature), the replay window, claim-text
 normalization and hashing, that the deterministic nonce differs across
 `(claim_id, paper_id, reviewer)` and cannot be confused by concatenation
 without the `|` separator, the devnet-genesis startup guard (mocked RPC), the
-timing-safe `X-Internal-Token` check, and `POST /message` returning the
-message `/attest` will verify against.
+timing-safe `X-Internal-Token` check, and `POST /v2/message` returning the
+message `/v2/attest` will verify against.
 
 `scripts/e2e-devnet.ts` is a manual, network-touching smoke test (airdrop,
 credential/schema creation, one attestation, read-back), not run in CI.

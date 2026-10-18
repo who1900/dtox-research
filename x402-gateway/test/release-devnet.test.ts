@@ -53,8 +53,7 @@ test("payment challenge accepts only one exact devnet-USDC option at or below 10
 test("canonical message must bind the requested claim, evidence, case, and fresh timestamp", () => {
   const now = Date.now();
   const claimSha = "83ac";
-  const normalized = RELEASE_CLAIM.toLowerCase().trim().replace(/\s+/g, " ");
-  const claimHash = createHash("sha256").update(normalized, "utf8").digest("hex");
+  const claimHash = createHash("sha256").update(RELEASE_CLAIM, "utf8").digest("hex");
   const issuedAt = new Date(now).toISOString();
   const payload = {
     claim_id: claimSha,
@@ -63,7 +62,7 @@ test("canonical message must bind the requested claim, evidence, case, and fresh
     verdict: RELEASE_VERDICT,
     evidence_sha256: evidenceSha256,
     issued_at: issuedAt,
-    message: ["dtox-claim-verdict:v1", `claim_id:${claimSha}`, `claim_sha256:${claimHash}`,
+    message: ["dtox-claim-verdict:v2", `claim_id:${claimSha}`, `claim_sha256:${claimHash}`,
       `paper_id:${RELEASE_PAPER_ID}`, `verdict:${RELEASE_VERDICT}`,
       `evidence_sha256:${evidenceSha256}`, `issued_at:${issuedAt}`].join("\n")
   };

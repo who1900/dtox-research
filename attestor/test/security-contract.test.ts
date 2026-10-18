@@ -110,7 +110,7 @@ test("TTL and future skew boundaries are exact and reject a bad clock", () => {
 test("malformed JSON and field types return bounded JSON 400 without writes", { timeout: 10000 }, async (t) => {
   let writes = 0;
   await withServer(t, async (base) => {
-    for (const path of ["message", "attest"]) {
+    for (const path of ["v2/message", "v2/attest"]) {
       for (const body of ["null", "[]", "1", '"text"', '{"claim_id":12}', '{"claim_text":{}}', '{"paper_id":null}', "{"]) {
         const response = await fetch(`${base}/${path}`, { method: "POST", headers, body });
         assert.equal(response.status, 400, `${path}: ${body}`);
@@ -128,7 +128,7 @@ test("HTTP rejects tampering before chain access; exact retries/concurrency are 
   const chain = mockChain();
   const body = await signedBody();
   await withServer(t, async (base) => {
-    const post = (value: unknown) => fetch(`${base}/attest`, { method: "POST", headers, body: JSON.stringify(value) });
+    const post = (value: unknown) => fetch(`${base}/v2/attest`, { method: "POST", headers, body: JSON.stringify(value) });
     for (const change of [{ claim_id: "other" }, { claim_text: "Other claim" }, { paper_id: "eip:7702" },
       { verdict: "partial" }, { evidence_sha256: "b".repeat(64) }, { signature: "0" },
       { issued_at: new Date(Date.parse(body.issued_at) + 1).toISOString() }, { reviewer: TEST_ADDRESS }]) {

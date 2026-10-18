@@ -5017,7 +5017,16 @@ JUDGMENT_MODEL_UNKNOWN = "unspecified"
 
 
 def _norm_claim(claim):
-    return " ".join(re.sub(r"[^a-z0-9 ]+", " ", (claim or "").lower()).split())
+    """V2 identity: SHA256 of exact UTF-8 text, with an explicit namespace.
+
+    The historical claim_norm column stores this opaque key for new rows.
+    Never look up its old lossy normalization for a new claim.
+    """
+    try:
+        digest = hashlib.sha256((claim or "").encode("utf-8")).hexdigest()
+    except UnicodeEncodeError:
+        raise HTTPException(status_code=400, detail="claim must be valid Unicode")
+    return "claim:v2:" + digest
 
 
 def _cosine(a, b):
@@ -5183,6 +5192,36 @@ def _judgments_conn():
         if name not in cols:
             conn.execute(f"ALTER TABLE claim_judgments ADD COLUMN {name} {decl}")
     return conn
+
+
+@app.get("/v1/claims/legacy")
+def legacy_claim(claim_id: str, x_api_key: Optional[str] = Header(default=None)):
+    """Read a historical ID explicitly; never infer a v2 alias from lost text."""
+    auth_and_limit(x_api_key)
+    if claim_id.startswith("claim:v2:"):
+        raise HTTPException(status_code=400, detail="expected an explicit legacy claim ID")
+    conn = _judgments_read_conn()
+    if conn is None:
+        raise HTTPException(status_code=404, detail="legacy claim not found")
+    try:
+        nodes = [dict(row) for row in conn.execute(
+            "SELECT claim_norm, claim_id, claim_text, created_at FROM claim_nodes "
+            "WHERE claim_id=? OR claim_norm=?", (claim_id, claim_id)).fetchall()]
+        judgments = [dict(row) for row in conn.execute(
+            "SELECT * FROM claim_judgments WHERE claim_id=? OR claim_norm=?",
+            (claim_id, claim_id)).fetchall()]
+        links = [dict(row) for row in conn.execute(
+            "SELECT * FROM claim_links WHERE from_claim=? OR to_claim=?",
+            (claim_id, claim_id)).fetchall()]
+        if not nodes and not judgments and not links:
+            raise HTTPException(status_code=404, detail="legacy claim not found")
+        return {"claim_id": claim_id, "identity_version": "legacy-v1",
+                "identity_status": "potentially_ambiguous",
+                "warning": "Legacy normalization lost case, operators and Unicode; "
+                           "stored text cannot establish all original formulations. No v2 alias is inferred.",
+                "nodes": nodes, "judgments": judgments, "links": links}
+    finally:
+        conn.close()
 
 
 def _reader_id(api_key):
@@ -5548,8 +5587,8 @@ def adjudicate(body: AdjudicateBody, x_api_key: Optional[str] = Header(default=N
     in the shared record, so the next caller asking the same thing starts from
     a reading rather than from a cosine score."""
     api_key, _info = auth_and_limit(x_api_key, "adjudicate")
-    claim = (body.claim or "").strip()
-    if not claim:
+    claim = body.claim or ""
+    if not claim.strip():
         raise HTTPException(status_code=400, detail="claim must not be empty")
     bad = [j.verdict for j in body.judgments if j.verdict not in JUDGMENT_VERDICTS]
     if bad:
@@ -5646,8 +5685,8 @@ def verdict_message(body: VerdictMessageBody, x_api_key: Optional[str] = Header(
     signature against, so signing anything else will fail verification.
     """
     auth_and_limit(x_api_key, "adjudicate")
-    claim = (body.claim or "").strip()
-    if not claim:
+    claim = body.claim or ""
+    if not claim.strip():
         raise HTTPException(status_code=400, detail="claim must not be empty")
     paper_id = (body.paper_id or "").strip()
     if not paper_id:
@@ -5670,7 +5709,7 @@ def verdict_message(body: VerdictMessageBody, x_api_key: Optional[str] = Header(
         payload["issued_at"] = body.issued_at
 
     try:
-        resp = requests.post(f"{ATTESTOR_URL}/message", headers=_attestor_headers(),
+        resp = requests.post(f"{ATTESTOR_URL}/v2/message", headers=_attestor_headers(),
                              json=payload, timeout=10)
     except requests.RequestException as e:
         raise HTTPException(status_code=503, detail=f"attestor unavailable: {e}")
@@ -5713,8 +5752,8 @@ def adjudicate_signed(body: AdjudicateSignedBody, x_api_key: Optional[str] = Hea
     _judgment_status).
     """
     auth_and_limit(x_api_key, "adjudicate")
-    claim = (body.claim or "").strip()
-    if not claim:
+    claim = body.claim or ""
+    if not claim.strip():
         raise HTTPException(status_code=400, detail="claim must not be empty")
 
     claim_id, is_new = _signing_claim_id(claim), False
@@ -5742,7 +5781,7 @@ def adjudicate_signed(body: AdjudicateSignedBody, x_api_key: Optional[str] = Hea
             payload["evidence_sha256"] = j.evidence_sha256
 
         try:
-            resp = requests.post(f"{ATTESTOR_URL}/attest", headers=_attestor_headers(),
+            resp = requests.post(f"{ATTESTOR_URL}/v2/attest", headers=_attestor_headers(),
                                  json=payload, timeout=20)
         except requests.RequestException as e:
             # a partial batch already attested cannot be undone, but nothing
@@ -5833,8 +5872,8 @@ def link_claims(body: LinkClaimBody, x_api_key: Optional[str] = Header(default=N
     memory. So the decision belongs to whoever has read both claims, and it is
     recorded with their identity like any other verdict."""
     api_key, info = auth_and_limit(x_api_key)
-    claim = (body.claim or "").strip()
-    if not claim:
+    claim = body.claim or ""
+    if not claim.strip():
         raise HTTPException(status_code=400, detail="claim must not be empty")
     conn = _judgments_conn()
     try:
@@ -5896,10 +5935,10 @@ def validate_project(body: ValidateBody, x_api_key: Optional[str] = Header(defau
     claim_specs = []
     for c in body.claims[:VALIDATE_MAX_CLAIMS]:
         if isinstance(c, str):
-            text, extra = c.strip(), []
+            text, extra = c, []
         else:
-            text, extra = (c.claim or "").strip(), [x.strip() for x in c.phrasings if x.strip()]
-        if text:
+            text, extra = c.claim or "", [x for x in c.phrasings if x.strip()]
+        if text.strip():
             claim_specs.append((text, extra))
     claims = [t for t, _ in claim_specs]
     if not claims:

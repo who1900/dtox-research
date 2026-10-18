@@ -169,6 +169,8 @@ class EvidenceIntegrityTests(unittest.TestCase):
                            "INSERT INTO claim_nodes VALUES ('known alias','target');"
                            "INSERT INTO claim_links VALUES ('sourcealias','target','2026-10-01');"
                            "INSERT INTO claim_links VALUES ('target','final','2026-10-02');")
+        conn.execute("UPDATE claim_nodes SET claim_norm=? WHERE claim_norm='known alias'", (main._norm_claim("known alias"),))
+        conn.execute("UPDATE claim_links SET from_claim=? WHERE from_claim='sourcealias'", (main._norm_claim("sourcealias"),))
         queries = []
         conn.set_trace_callback(queries.append)
         for claim in ("sourcealias", "known alias"):
@@ -278,7 +280,7 @@ class EvidenceIntegrityTests(unittest.TestCase):
         with (patch.object(main, "_judgments_read_conn", side_effect=[conn, None]),
               patch.object(main, "_judgments_conn", side_effect=AssertionError("write connection")),
               patch.object(main, "_canonical_claim", side_effect=AssertionError("node creation"))):
-            self.assertEqual(main._registry_for_claim("new claim"), ("new claim", {}))
+            self.assertEqual(main._registry_for_claim("new claim"), (main._norm_claim("new claim"), {}))
         self.assertTrue(all(q.lstrip().upper().startswith("SELECT") for q in queries))
 
 

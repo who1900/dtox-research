@@ -4,6 +4,8 @@ import * as ed from "@noble/ed25519";
 import bs58 from "bs58";
 import {
   buildVerdictMessage,
+  buildLegacyVerdictMessage,
+  legacyClaimTextSha256,
   checkIssuedAtWindow,
   claimTextSha256,
   normalizeClaimText,
@@ -21,14 +23,14 @@ const baseFields = (): VerdictFields => ({
   issuedAt: "2026-09-26T03:00:00Z",
 });
 
-test("normalizeClaimText lowercases, trims and collapses whitespace", () => {
-  assert.equal(normalizeClaimText("  Foo   BAR\n\tBaz  "), "foo bar baz");
+test("normalizeClaimText preserves exact text", () => {
+  assert.equal(normalizeClaimText("  Foo   BAR\n\tBaz  "), "  Foo   BAR\n\tBaz  ");
 });
 
-test("claimTextSha256 is stable across cosmetic differences", () => {
+test("claimTextSha256 preserves case and whitespace differences", () => {
   const a = claimTextSha256("The protocol IS   byzantine fault tolerant.");
   const b = claimTextSha256("the protocol is byzantine fault tolerant.  ");
-  assert.equal(a, b);
+  assert.notEqual(a, b);
 });
 
 test("sha256Hex matches known RFC test vectors", () => {
@@ -42,7 +44,7 @@ test("buildVerdictMessage produces the fixed canonical layout", () => {
   assert.equal(
     message,
     [
-      "dtox-claim-verdict:v1",
+      "dtox-claim-verdict:v2",
       `claim_id:${fields.claimId}`,
       `claim_sha256:${fields.claimSha256}`,
       `paper_id:${fields.paperId}`,
@@ -119,4 +121,29 @@ test("verifyVerdictSignature returns false (not throw) on malformed base58", () 
   return verifyVerdictSignature("anything", "not-base58!!", "also-not-base58!!").then((result) => {
     assert.equal(result, false);
   });
+});
+
+
+test("v2 preserves Unicode, operators, case and exact whitespace", () => {
+  const claims = ["X=1", "x=1", "x>1", "x<1", "x≤1", "安全", "危険", "é", "e\u0301", "x=1 "];
+  assert.equal(new Set(claims.map(claimTextSha256)).size, claims.length);
+  for (const claim of claims) assert.equal(claimTextSha256(claim), sha256Hex(Buffer.from(claim, "utf8")));
+});
+
+test("legacy receipt can be verified but its signature cannot authorize v2", async () => {
+  const key = new Uint8Array(32).fill(19);
+  const pubkey = bs58.encode(await ed.getPublicKeyAsync(key));
+  const fields = { ...baseFields(), claimId: "x 1", claimSha256: legacyClaimTextSha256("X=1") };
+  const oldMessage = buildLegacyVerdictMessage(fields);
+  const signature = bs58.encode(await ed.signAsync(new TextEncoder().encode(oldMessage), key));
+  assert.ok(oldMessage.startsWith("dtox-claim-verdict:v1\n"));
+  assert.equal(await verifyVerdictSignature(oldMessage, signature, pubkey), true);
+  for (const text of ["X=1", "x=1", "x>1", "x<1", "安全"]) {
+    assert.equal(await verifyVerdictSignature(buildVerdictMessage({ ...fields, claimSha256: claimTextSha256(text) }), signature, pubkey), false);
+  }
+});
+
+test("cross-language exact UTF-8 golden vector includes combining and astral characters", () => {
+  assert.equal(claimTextSha256("X\u22641; \u5b89\u5168; e\u0301\u{1f600}"),
+    "a4cf66e8fda8bf53cd20af97875007cead14624f040c3849d98e14f76908fdc9");
 });

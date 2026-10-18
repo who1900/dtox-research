@@ -84,16 +84,15 @@ export function validateServiceInfo(value: unknown): void {
   }
 }
 
-function normalizedClaimHash(claim: string): string {
-  const normalized = claim.toLowerCase().trim().replace(/\s+/g, " ");
-  return createHash("sha256").update(normalized, "utf8").digest("hex");
+function exactClaimHash(claim: string): string {
+  return createHash("sha256").update(claim, "utf8").digest("hex");
 }
 
 export function validateCanonicalMessage(value: unknown, args: ReleaseArgs, now = Date.now()): CanonicalMessage {
   if (!value || typeof value !== "object") throw new Error("invalid message response");
   const payload = value as Partial<CanonicalMessage>;
   if (typeof payload.message !== "string" || typeof payload.claim_id !== "string" || !payload.claim_id
-      || payload.claim_sha256 !== normalizedClaimHash(args.claim) || payload.paper_id !== args.paperId
+      || payload.claim_sha256 !== exactClaimHash(args.claim) || payload.paper_id !== args.paperId
       || payload.verdict !== args.verdict || payload.evidence_sha256 !== args.evidenceSha256
       || typeof payload.issued_at !== "string") {
     throw new Error("message fields do not match the approved release case");
@@ -103,7 +102,7 @@ export function validateCanonicalMessage(value: unknown, args: ReleaseArgs, now 
     throw new Error("message timestamp is outside the signing window");
   }
   const expected = [
-    "dtox-claim-verdict:v1",
+    "dtox-claim-verdict:v2",
     `claim_id:${payload.claim_id}`,
     `claim_sha256:${payload.claim_sha256}`,
     `paper_id:${payload.paper_id}`,

@@ -100,12 +100,16 @@ export function buildApp(dependencies: Partial<{
   app.disable("x-powered-by");
   app.use(express.json({ limit: "64kb" }));
   app.use(requireInternalToken);
+  app.post(["/message", "/attest"], (_req, res) => {
+    res.status(410).json({ error: "v1 signing retired; prepare and sign via /v2/message and /v2/attest" });
+  });
   app.use((req, res, next) => {
-    if (req.method === "POST" && (req.path === "/message" || req.path === "/attest")) {
+    if (req.method === "POST" && (req.path === "/v2/message" || req.path === "/v2/attest")) {
       const body: unknown = req.body;
       if (!body || typeof body !== "object" || Array.isArray(body)
-          || Object.values(body).some((value) => typeof value !== "string")) {
-        badRequest(res, "body must be a JSON object with string fields");
+          || Object.values(body).some((value) => typeof value !== "string"
+            || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(value))) {
+        badRequest(res, "body must be a JSON object with valid Unicode string fields");
         return;
       }
     }
@@ -126,7 +130,7 @@ export function buildApp(dependencies: Partial<{
     }
   });
 
-  app.post("/message", (req, res) => {
+  app.post("/v2/message", (req, res) => {
     const body = req.body as Pick<
       AttestBody,
       "claim_id" | "claim_text" | "paper_id" | "verdict" | "evidence_sha256" | "issued_at"
@@ -142,7 +146,7 @@ export function buildApp(dependencies: Partial<{
     // rebuild and check the signature against.
     const issuedAt = (body.issued_at ?? "").trim() || new Date().toISOString();
 
-    if (!claimId || !normalizeClaimText(claimText) || !paperId || !verdict) {
+    if (!claimId || !claimText.trim() || !paperId || !verdict) {
       badRequest(res, "claim_id, claim_text, paper_id and verdict are required");
       return;
     }
@@ -167,6 +171,7 @@ export function buildApp(dependencies: Partial<{
       });
       res.json({
         message,
+        message_version: "v2",
         claim_id: claimId,
         claim_sha256: claimSha256,
         paper_id: paperId,
@@ -179,7 +184,7 @@ export function buildApp(dependencies: Partial<{
     }
   });
 
-  app.post("/attest", async (req, res) => {
+  app.post("/v2/attest", async (req, res) => {
     const body = req.body as AttestBody;
 
     const claimId = (body.claim_id ?? "").trim();
@@ -191,7 +196,7 @@ export function buildApp(dependencies: Partial<{
     const issuedAt = (body.issued_at ?? "").trim();
     const evidenceSha256 = (body.evidence_sha256 ?? "-").trim() || "-";
 
-    if (!claimId || !normalizeClaimText(claimText) || !paperId || !verdict || !reviewer || !signature || !issuedAt) {
+    if (!claimId || !claimText.trim() || !paperId || !verdict || !reviewer || !signature || !issuedAt) {
       badRequest(res, "claim_id, claim_text, paper_id, verdict, reviewer, signature and issued_at are required");
       return;
     }

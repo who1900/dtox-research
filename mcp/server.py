@@ -746,7 +746,7 @@ def get_verdict_message(
 
     Step one of filing a wallet-backed verdict; no chain transaction is
     submitted by this preparation call. The API resolves the claim against
-    existing nodes and explicit links, falling back to normalized claim text;
+    existing v2 nodes and explicit links, falling back to an exact UTF-8 digest;
     it does not embed or create/register a claim node. It returns the canonical
     UTF-8 string this claim/paper/verdict combination hashes
     to. Sign it with the ed25519 secret key of a Solana wallet you control --
@@ -759,8 +759,8 @@ def get_verdict_message(
     attested on-chain data without trusting dtox at all.
 
     Args:
-        claim: The claim, in your own words. Identity is the normalized exact
-            claim text unless an explicit existing claim link resolves it to
+        claim: The claim, in your own words. Identity is claim:v2:<SHA256 of
+            exact UTF-8 text> unless an explicit existing claim link resolves it to
             another node. This preview does not register a new node. The
             returned claim_id is required by record_signed_verdict.
         paper_id: The paper you are ruling on, e.g. "2401.12345".
@@ -772,7 +772,10 @@ def get_verdict_message(
         dict with "message" (the exact string to sign), "claim_id",
         "claim_sha256", "paper_id", "verdict", "evidence_sha256" and
         "issued_at" (stamped by the server -- pass it through unchanged to
-        record_signed_verdict, since your signature covers it).
+        record_signed_verdict, since your signature covers it). V2 preserves case,
+        Unicode, operators and whitespace; old signatures must be prepared and
+        signed again. Explicit legacy IDs remain readable through the API
+        /v1/claims/legacy endpoint; no automatic legacy aliases are inferred.
     """
     try:
         payload = {"claim": claim, "paper_id": paper_id, "verdict": verdict}

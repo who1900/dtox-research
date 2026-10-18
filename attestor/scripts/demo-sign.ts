@@ -1,6 +1,6 @@
 /**
  * Demo / test CLI: signs a claim verdict with an agent keypair and prints the
- * JSON body ready to POST to /attest.
+ * JSON body ready to POST to /v2/attest.
  *
  * Usage:
  *   tsx scripts/demo-sign.ts <keypair.json> <claim_id> <paper_id> <verdict> <claim_text> [evidence_sha256]
