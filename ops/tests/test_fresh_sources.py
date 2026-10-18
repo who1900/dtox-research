@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from ops.corpus_quality import fresh_sources
+from pipeline.originals import OriginalStore, Provenance
 
 
 class _Response:
@@ -166,6 +167,22 @@ class FreshSourceTests(unittest.TestCase):
         self.assertEqual(artifact.retrieval_url, raw_github)
         self.assertEqual(artifact.raw_sha256, hashlib.sha256(raw).hexdigest())
         self.assertEqual(artifact.edition, "sha256:" + artifact.raw_sha256)
+
+    def test_pmlr_validated_raw_asset_url_is_the_requested_route(self):
+        paper_id = "pmlr:v318/litvin26a"
+        raw_github = "https://raw.githubusercontent.com/mlresearch/v318/main/assets/litvin26a/litvin26a.pdf"
+        raw = b"%PDF-1.7\npmlr fixture"
+        response = _Response(raw)
+        response.url = raw_github
+        session = _Session(response)
+
+        artifact = fresh_sources.fetch_fresh_artifact(
+            paper_id, original_kind="PDF", edition="sha256:pending",
+            source_url=raw_github, session=session)
+
+        self.assertEqual(session.call[0], raw_github)
+        self.assertEqual(artifact.source_url, raw_github)
+        self.assertEqual(artifact.retrieval_url, raw_github)
 
     def test_pmlr_direct_proceedings_pdf_and_exact_raw_github_redirect(self):
         paper_id = "pmlr:v318/litvin26a"
@@ -471,6 +488,87 @@ class FreshSourceTests(unittest.TestCase):
 
         self.assertEqual(receipt["storage"], "existing_verified_blob_reference")
         self.assertEqual(receipt["edition"], "sha256:" + sha)
+
+    def test_opt_in_original_reuse_requires_exact_arxiv_edition_and_verified_blob(self):
+        raw = b"%PDF-1.7\nverified arxiv fixture"
+        sha = hashlib.sha256(raw).hexdigest()
+        source_url = "https://arxiv.org/pdf/2408.11826v1"
+        with tempfile.TemporaryDirectory() as tmp:
+            store = OriginalStore.create(Path(tmp) / "originals")
+            source = Path(tmp) / "source.pdf"
+            source.write_bytes(raw)
+            store.ingest_file(source, Provenance(
+                canonical_id="2408.11826", source_url=source_url,
+                retrieval_url=source_url, original_kind="PDF", edition="v1",
+                retrieved_at="2026-10-14T00:00:00Z", raw_sha256=sha), max_bytes=1024)
+
+            cached = fresh_sources._cached_original({
+                "paper_id": "2408.11826", "fresh_kind": "PDF", "fresh_version": "v1",
+                "reuse_original": True}, store.root)
+            stale = fresh_sources._cached_original({
+                "paper_id": "2408.11826", "fresh_kind": "PDF", "fresh_version": "v2",
+                "reuse_original": True}, store.root)
+
+            self.assertEqual(cached[0].raw_bytes, raw)
+            self.assertEqual(cached[0].edition, "v1")
+            self.assertEqual(cached[0].retrieved_at, "2026-10-14T00:00:00Z")
+            self.assertEqual(cached[1]["storage"], "verified_existing_original")
+            self.assertIsNone(stale)
+
+            store.blob_path(sha).write_bytes(b"%PDF-1.7\ncorrupt")
+            with self.assertRaisesRegex(fresh_sources.FreshSourceDependencyError,
+                                        "failed verification"):
+                fresh_sources._cached_original({
+                    "paper_id": "2408.11826", "fresh_kind": "PDF", "fresh_version": "v1",
+                    "reuse_original": True}, store.root)
+
+    def test_hash_pending_original_reuse_rejects_distinct_hash_ambiguity(self):
+        paper_id = "pmlr:v318/litvin26a"
+        source_url = "https://raw.githubusercontent.com/mlresearch/v318/main/assets/litvin26a/litvin26a.pdf"
+        with tempfile.TemporaryDirectory() as tmp:
+            store = OriginalStore.create(Path(tmp) / "originals")
+            for index, raw in enumerate((b"%PDF-1.7\none", b"%PDF-1.7\ntwo")):
+                source = Path(tmp) / f"source-{index}.pdf"
+                source.write_bytes(raw)
+                sha = hashlib.sha256(raw).hexdigest()
+                store.ingest_file(source, Provenance(
+                    canonical_id=paper_id, source_url=source_url,
+                    retrieval_url=source_url, original_kind="PDF", edition="sha256:" + sha,
+                    retrieved_at=f"2026-10-1{index + 4}T00:00:00Z", raw_sha256=sha), max_bytes=1024)
+
+            cached = fresh_sources._cached_original({
+                "paper_id": paper_id, "fresh_kind": "PDF", "fresh_url": source_url,
+                "reuse_original": True}, store.root)
+            self.assertIsNone(cached)
+
+    def test_hash_pending_reuse_ignores_unknown_legacy_provenance(self):
+        paper_id = "pmlr:v318/litvin26a"
+        source_url = "https://raw.githubusercontent.com/mlresearch/v318/main/assets/litvin26a/litvin26a.pdf"
+        raw = b"%PDF-1.7\nknown fresh source"
+        sha = hashlib.sha256(raw).hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = OriginalStore.create(Path(tmp) / "originals")
+            known = Path(tmp) / "known.pdf"
+            known.write_bytes(raw)
+            store.ingest_file(known, Provenance(
+                canonical_id=paper_id, source_url=source_url, retrieval_url=source_url,
+                original_kind="PDF", edition="sha256:" + sha,
+                retrieved_at="2026-10-14T00:00:00Z", raw_sha256=sha), max_bytes=1024)
+            legacy_raw = b"%PDF-1.7\nlegacy unknown source"
+            legacy_sha = hashlib.sha256(legacy_raw).hexdigest()
+            legacy = Path(tmp) / "legacy.pdf"
+            legacy.write_bytes(legacy_raw)
+            store.ingest_file(legacy, Provenance(
+                canonical_id=paper_id, source_url=source_url, retrieval_url="UNKNOWN",
+                original_kind="PDF", edition="UNKNOWN", retrieved_at="UNKNOWN",
+                raw_sha256=legacy_sha), max_bytes=1024)
+
+            cached = fresh_sources._cached_original({
+                "paper_id": paper_id, "fresh_kind": "PDF", "fresh_url": source_url,
+                "reuse_original": True}, store.root)
+
+            self.assertEqual(cached[0].raw_sha256, sha)
+            self.assertEqual(cached[0].raw_bytes, raw)
 
     def test_eprint_uses_existing_path_resolving_assembler_without_service_import(self):
         archive_bytes = io.BytesIO()

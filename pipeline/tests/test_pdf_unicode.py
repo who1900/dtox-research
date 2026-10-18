@@ -28,7 +28,10 @@ class SourceFontUnicodeTests(unittest.TestCase):
     def test_bbding_requires_exact_reference_shape_and_source_encoding_slot(self):
         glyphlist=adapter._supplemental()
         charstring=object()
-        proofs=((34,'enc-34','\u2714','e22502702922356ffce54fe58ca5dfa82343e173ff50430dadd07c87a65abaf9'),
+        proofs=((33,'enc-33','\u2713','8a24e322f7a74b54d41379d4559f3f9eaf548bc0dbc810e760d0c4910427b6a4'),
+                (35,'enc-35','\u2715','f856aaf9c9a6b1a85ac5928b1f37d2a30d648bc1e9294dcfc570ab0191383785'),
+                (36,'enc-36','\u2716','10e1e743523eb2c0c989beace3ad8f3f15b513e62ba09227b48d845de09804ea'),
+                (34,'enc-34','\u2714','e22502702922356ffce54fe58ca5dfa82343e173ff50430dadd07c87a65abaf9'),
                 (37,'enc-37','\u2717','ef9aa05a5c7b0e7ef254ce81683d229e086476a570c21cad8f663dbc0adaf005'))
         for code,name,unicode_value,fingerprint in proofs:
             with patch.object(adapter,'_type1_outline_sha256',return_value=fingerprint):

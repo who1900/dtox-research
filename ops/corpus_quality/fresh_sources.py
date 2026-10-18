@@ -183,7 +183,9 @@ def fetch_fresh_artifact(canonical_id, *, original_kind, edition, session=None,
             allowed_source_urls.add(canonical_source_url(canonical_id, source_url))
         if source_url not in allowed_source_urls:
             raise FreshSourceError("provided source URL conflicts with canonical ID/edition route")
-    source_url = expected
+    # Keep a validated publisher-provided PMLR asset URL. The proceedings URL
+    # may redirect to that same ID-bound asset, but can itself be unavailable.
+    source_url = source_url or expected
     parsed_source = _url_parts(source_url)
     if session is None:
         import requests
@@ -975,6 +977,107 @@ def _register_original(artifact, raw_path, original_store_root):
             "storage": storage}
 
 
+def _cached_original(row, original_store_root):
+    """Load an explicitly requested, identity-matched ORIGINAL CAS artifact.
+
+    Versioned sources require an exact edition match. Hash-pending sources may
+    reuse a prior reference only when all matching provenance points to one
+    distinct raw hash. A corrupt selected blob is a dependency failure, never a
+    cache miss.
+    """
+    if row.get("reuse_original") is not True:
+        return None
+    paper_id = row.get("paper_id") or row.get("arxiv_id")
+    if not isinstance(paper_id, str) or not paper_id:
+        raise FreshSourceError("ORIGINAL reuse requires a canonical paper ID")
+    kind = row.get("fresh_kind", "PDF")
+    edition = row.get("fresh_version")
+    if is_arxiv_id(paper_id):
+        if not edition:
+            raise FreshSourceError("arXiv ORIGINAL reuse requires an explicit version")
+        requested_url = expected_source(paper_id, kind, edition)
+    elif paper_id and paper_id.startswith("acl:"):
+        edition = edition or paper_id
+        requested_url = expected_source(paper_id, kind, edition)
+    else:
+        if not isinstance(edition, str):
+            edition = "sha256:pending"
+        requested_url = row.get("fresh_url") or row.get("source_url")
+        if not isinstance(requested_url, str):
+            return None
+        if _PMLR_ID.fullmatch(paper_id or ""):
+            requested_url = canonical_source_url(paper_id, requested_url)
+        else:
+            _url_parts(requested_url)
+    try:
+        from pipeline.originals import OriginalError, OriginalStore
+        store = OriginalStore(original_store_root)
+        references = store.references(paper_id)
+    except Exception as exc:
+        raise FreshSourceDependencyError("configured ORIGINAL store cannot resolve cached provenance") from exc
+
+    matches = [reference for reference in references
+               if reference.get("canonical_id") == paper_id
+               and reference.get("original_kind") == kind
+               and reference.get("source_url") == requested_url
+               and reference.get("retrieved_at") not in (None, "UNKNOWN")]
+    # Legacy rows with incomplete URL provenance cannot establish the exact
+    # publisher route, even when their canonical ID and bytes look familiar.
+    known_matches = []
+    for reference in matches:
+        try:
+            _url_parts(reference.get("retrieval_url"))
+        except FreshSourceError:
+            continue
+        known_matches.append(reference)
+    matches = known_matches
+    if edition and re.fullmatch(r"v[1-9]\d*", edition):
+        matches = [reference for reference in matches if reference.get("edition") == edition]
+    elif re.fullmatch(r"sha256:[0-9a-f]{64}", edition or ""):
+        matches = [reference for reference in matches
+                   if reference.get("raw_sha256") == edition[7:]
+                   and reference.get("edition") == edition]
+    else:
+        # ACL's canonical proceedings ID is the requested edition; the ORIGINAL
+        # schema stores its byte edition as sha256:<raw hash>. Ignore UNKNOWN
+        # legacy provenance before checking ambiguity.
+        matches = [reference for reference in matches
+                   if re.fullmatch(r"[0-9a-f]{64}", reference.get("raw_sha256", ""))
+                   and reference.get("edition") == "sha256:" + reference["raw_sha256"]]
+        hashes = {reference.get("raw_sha256") for reference in matches}
+        if len(hashes) != 1:
+            return None
+        raw_hash = next(iter(hashes))
+        matches = [reference for reference in matches
+                   if reference.get("raw_sha256") == raw_hash
+                   and reference.get("edition") == "sha256:" + raw_hash]
+    if not matches:
+        return None
+    reference = min(matches, key=lambda item: (item.get("retrieved_at", ""), item.get("id", 0)))
+    raw_hash = reference["raw_sha256"]
+    try:
+        blob_path = store.blob_path(raw_hash)
+        size = blob_path.stat().st_size
+        if size <= 0 or size > _MAX_SOURCE_BYTES:
+            raise OriginalError("cached source exceeds byte limit")
+        blob_path = store.verify_blob(raw_hash, size)
+        raw = blob_path.read_bytes()
+    except (OriginalError, OSError, KeyError, TypeError) as exc:
+        raise FreshSourceDependencyError("selected ORIGINAL CAS blob failed verification") from exc
+    if len(raw) != size or hashlib.sha256(raw).hexdigest() != raw_hash:
+        raise FreshSourceDependencyError("selected ORIGINAL CAS blob changed after verification")
+    artifact = FreshArtifact(
+        canonical_id=paper_id, source_url=reference["source_url"],
+        request_url=requested_url, retrieval_url=reference["retrieval_url"],
+        original_kind=kind, edition=reference["edition"],
+        retrieved_at=reference["retrieved_at"], raw_sha256=raw_hash,
+        raw_size_bytes=len(raw), raw_bytes=raw)
+    receipt = {"store_root": str(Path(original_store_root).resolve()),
+               "raw_sha256": raw_hash, "canonical_path": str(blob_path),
+               "edition": reference["edition"], "storage": "verified_existing_original"}
+    return artifact, receipt
+
+
 def source_quality_reason(kind, diagnostics):
     """Return the production source rejection reason, or None when approved."""
     if diagnostics.get("replacement_characters", 0):
@@ -1028,14 +1131,20 @@ def acquire_and_parse(row, stage_dir, *, timeout=120, session=None, fetched_at=N
             raise FreshSourceError("generic source requires a fresh HTTPS PDF URL")
         edition = fresh_version or "sha256:pending"
     fetch_started = time.perf_counter()
-    artifact = fetch_fresh_artifact(paper_id, original_kind=kind, edition=edition,
-                                    timeout=timeout, session=session, retrieved_at=fetched_at,
-                                    source_url=fresh_url if not paper_id.startswith("acl:") and
-                                    not is_arxiv_id(paper_id) else None)
+    cached = _cached_original(row, original_store_root)
+    if cached is None:
+        artifact = fetch_fresh_artifact(paper_id, original_kind=kind, edition=edition,
+                                        timeout=timeout, session=session, retrieved_at=fetched_at,
+                                        source_url=fresh_url if not paper_id.startswith("acl:") and
+                                        not is_arxiv_id(paper_id) else None)
+        original_receipt = None
+    else:
+        artifact, original_receipt = cached
     fetch_seconds = time.perf_counter() - fetch_started
     parse_started = time.perf_counter()
     text, diagnostics = parse_fresh_artifact(artifact, timeout=timeout, native_build=native_build,
                                              expected_title=row.get("title"))
+    diagnostics["original_cache_reused"] = cached is not None
     diagnostics["fetch_seconds"] = round(fetch_seconds, 6)
     diagnostics["parse_seconds"] = round(time.perf_counter() - parse_started, 6)
     quality_reason = source_quality_reason(kind, diagnostics)
@@ -1046,9 +1155,12 @@ def acquire_and_parse(row, stage_dir, *, timeout=120, session=None, fetched_at=N
     source_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
     suffix = ".tex" if kind == "rawTexarchive" else ".md"
     source_path = stage / "sources" / re.sub(r"[^A-Za-z0-9._-]", "_", paper_id) / (source_hash + suffix)
-    staged_original_created = _write_content_once(original_path, artifact.raw_bytes)
+    staged_original_created = False
+    if original_receipt is None:
+        staged_original_created = _write_content_once(original_path, artifact.raw_bytes)
     _write_content_once(source_path, text.encode("utf-8"))
-    original_receipt = _register_original(artifact, original_path, original_store_root)
+    if original_receipt is None:
+        original_receipt = _register_original(artifact, original_path, original_store_root)
     if staged_original_created:
         if hashlib.sha256(original_path.read_bytes()).hexdigest() != artifact.raw_sha256:
             raise FreshSourceError("candidate raw stage changed after ORIGINAL registration")

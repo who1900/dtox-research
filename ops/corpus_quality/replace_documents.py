@@ -542,7 +542,8 @@ def is_arxiv_id(paper_id):
 def _fresh_request(state, fresh):
     paper_id = state['arxiv_id']
     if paper_id.startswith('acl:'):
-        return dict(paper_id=paper_id, fresh_kind='PDF', fresh_version=paper_id)
+        return dict(paper_id=paper_id, fresh_kind='PDF', fresh_version=paper_id,
+                    reuse_original=True)
     if is_arxiv_id(paper_id):
         resolved = fresh.resolve_arxiv_version(paper_id, timeout=30)
         version = resolved.get('fresh_version')
@@ -555,7 +556,8 @@ def _fresh_request(state, fresh):
         from ops.corpus_quality.fresh_sources import canonical_source_url
         return dict(paper_id=paper_id, fresh_kind='PDF',
                     fresh_url=canonical_source_url(paper_id, source_url),
-                    declared_source_url=source_url, title=state.get('title'))
+                    declared_source_url=source_url, title=state.get('title'),
+                    reuse_original=True)
     if isinstance(source_url, str) and source_url.startswith('http://') and state.get('title'):
         # Request TLS at the declared host/path. The existing acquisition helper
         # still verifies credentials, redirect host, PDF body and expected title.
@@ -1273,7 +1275,8 @@ def _runtime_preflight(runtime, worker):
 
 def _unsafe_preparation_error(exc):
     """Only storage or explicitly signalled integrity faults stop preparation."""
-    return (isinstance(exc, (WorkerError, sqlite3.DatabaseError, MemoryError))
+    from ops.corpus_quality.fresh_sources import FreshSourceDependencyError
+    return (isinstance(exc, (WorkerError, FreshSourceDependencyError, sqlite3.DatabaseError, MemoryError))
             or isinstance(exc, OSError) and exc.errno in
             (errno.ENOSPC, errno.EIO, errno.EROFS, errno.EMFILE, errno.ENFILE))
 

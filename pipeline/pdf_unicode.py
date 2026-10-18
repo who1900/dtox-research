@@ -13,7 +13,7 @@ if __package__:
 else:
     from pdf_cid_unicode import invalid_scalar, repair_identity_h
 
-ADAPTER_REVISION = 'source-font-tounicode-v4'
+ADAPTER_REVISION = 'source-font-tounicode-v5'
 GLYPHLIST_SOURCE = 'https://raw.githubusercontent.com/apache/pdfbox/2.0.14/pdfbox/src/main/resources/org/apache/pdfbox/resources/glyphlist/additional.txt'
 GLYPHLIST_SHA256 = 'e70928360e577f03fa4fe354dc353a56526ef675e07790b9131acd27fd38c28f'
 MATHML_GLYPH_NAMES = {'mapsto':'\u21a6'}
@@ -23,7 +23,10 @@ BBDING_REFERENCE_SOURCE = 'https://mirrors.ctan.org/fonts/niceframe/type1/bbding
 BBDING_SYMBOL_SOURCE = 'https://mirrors.ctan.org/fonts/bbding/bbding.pdf'
 BBDING_UNICODE_SOURCE = 'https://mirrors.ctan.org/macros/latex/contrib/hyperref/doc/hyperref.pdf'
 BBDING_REFERENCE_GLYPHS = {
+    33: ('enc-33', '\u2713', '8a24e322f7a74b54d41379d4559f3f9eaf548bc0dbc810e760d0c4910427b6a4'),
     34: ('enc-34', '\u2714', 'e22502702922356ffce54fe58ca5dfa82343e173ff50430dadd07c87a65abaf9'),
+    35: ('enc-35', '\u2715', 'f856aaf9c9a6b1a85ac5928b1f37d2a30d648bc1e9294dcfc570ab0191383785'),
+    36: ('enc-36', '\u2716', '10e1e743523eb2c0c989beace3ad8f3f15b513e62ba09227b48d845de09804ea'),
     37: ('enc-37', '\u2717', 'ef9aa05a5c7b0e7ef254ce81683d229e086476a570c21cad8f663dbc0adaf005'),
 }
 

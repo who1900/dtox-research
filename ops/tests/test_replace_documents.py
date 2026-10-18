@@ -11,6 +11,12 @@ from ops.corpus_quality import replace_documents as worker
 
 
 class BatchTests(unittest.TestCase):
+    def test_original_store_integrity_fault_is_not_a_document_deferral(self):
+        from ops.corpus_quality.fresh_sources import FreshSourceDependencyError, FreshSourceError
+        self.assertTrue(worker._unsafe_preparation_error(
+            FreshSourceDependencyError('selected ORIGINAL CAS blob failed verification')))
+        self.assertFalse(worker._unsafe_preparation_error(FreshSourceError('source request returned HTTP 404')))
+
     def test_api_startup_check_runs_as_direct_script_outside_repository(self):
         import os
         import subprocess
@@ -45,6 +51,7 @@ class BatchTests(unittest.TestCase):
                          'https://proceedings.mlr.press/v235/paper24a/paper24a.pdf')
         self.assertEqual(request['declared_source_url'], state['source_url'])
         self.assertEqual(request['paper_id'], state['arxiv_id'])
+        self.assertIs(request['reuse_original'], True)
 
     def test_generic_http_input_requests_tls_at_the_declared_path(self):
         state = dict(arxiv_id='oa:W123', title='A verified paper',
