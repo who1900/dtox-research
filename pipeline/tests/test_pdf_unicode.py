@@ -35,15 +35,28 @@ class SourceFontUnicodeTests(unittest.TestCase):
                 (37,'enc-37','\u2717','ef9aa05a5c7b0e7ef254ce81683d229e086476a570c21cad8f663dbc0adaf005'))
         for code,name,unicode_value,fingerprint in proofs:
             with patch.object(adapter,'_type1_outline_sha256',return_value=fingerprint):
-                self.assertEqual(adapter._bbding_text(name,code,charstring,[0.001,0,0,0.001,0,0]),unicode_value)
+                self.assertEqual(adapter._reference_text(name,code,charstring,[0.001,0,0,0.001,0,0],adapter.BBDING_REFERENCE_GLYPHS),unicode_value)
                 self.assertEqual(adapter._glyph_text(name,'arbitrary-font',glyphlist,code=code,
                     charstring=charstring,font_matrix=[0.001,0,0,0.001,0,0]),
                     (unicode_value,'ctan-bbding-outline-match'))
             with patch.object(adapter,'_type1_outline_sha256',return_value='0'*64):
-                self.assertIsNone(adapter._bbding_text(name,code,charstring,[0.001,0,0,0.001,0,0]))
+                self.assertIsNone(adapter._reference_text(name,code,charstring,[0.001,0,0,0.001,0,0],adapter.BBDING_REFERENCE_GLYPHS))
             with patch.object(adapter,'_type1_outline_sha256',return_value=fingerprint):
-                self.assertIsNone(adapter._bbding_text(name,code+1,charstring,[0.001,0,0,0.001,0,0]))
-                self.assertIsNone(adapter._bbding_text('enc-999',code,charstring,[0.001,0,0,0.001,0,0]))
+                self.assertIsNone(adapter._reference_text(name,code+1,charstring,[0.001,0,0,0.001,0,0],adapter.BBDING_REFERENCE_GLYPHS))
+                self.assertIsNone(adapter._reference_text('enc-999',code,charstring,[0.001,0,0,0.001,0,0],adapter.BBDING_REFERENCE_GLYPHS))
+
+    def test_marvosym_letter_requires_exact_reference_outline_and_code(self):
+        glyphlist=adapter._supplemental()
+        fingerprint='dfc0ecf9e21cad018a58240388c4d301817314e87b6be6f4451838f5157b66bb'
+        def resolve(name='Letter',code=66):
+            return adapter._glyph_text(name,'arbitrary-font',glyphlist,code=code,
+                charstring=object(),font_matrix=[0.001,0,0,0.001,0,0])
+        with patch.object(adapter,'_type1_outline_sha256',return_value=fingerprint):
+            self.assertEqual(resolve(),('\u2709','ctan-marvosym-outline-match'))
+            self.assertEqual(resolve(code=65),(None,None))
+            self.assertEqual(resolve(name='UnknownLetter'),(None,None))
+        with patch.object(adapter,'_type1_outline_sha256',return_value='0'*64):
+            self.assertEqual(resolve(),(None,None))
 
     def test_existing_cmap_entries_remain_covered(self):
         raw=b'1 begincodespacerange\n<00><FF>\nendcodespacerange\n1 beginbfchar\n<50><2211>\nendbfchar\n1 beginbfrange\n<61><63><0061>\nendbfrange\nendcmap'

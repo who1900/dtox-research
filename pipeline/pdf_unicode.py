@@ -13,7 +13,7 @@ if __package__:
 else:
     from pdf_cid_unicode import invalid_scalar, repair_identity_h
 
-ADAPTER_REVISION = 'source-font-tounicode-v5'
+ADAPTER_REVISION = 'source-font-tounicode-v6'
 GLYPHLIST_SOURCE = 'https://raw.githubusercontent.com/apache/pdfbox/2.0.14/pdfbox/src/main/resources/org/apache/pdfbox/resources/glyphlist/additional.txt'
 GLYPHLIST_SHA256 = 'e70928360e577f03fa4fe354dc353a56526ef675e07790b9131acd27fd38c28f'
 MATHML_GLYPH_NAMES = {'mapsto':'\u21a6'}
@@ -28,6 +28,18 @@ BBDING_REFERENCE_GLYPHS = {
     35: ('enc-35', '\u2715', 'f856aaf9c9a6b1a85ac5928b1f37d2a30d648bc1e9294dcfc570ab0191383785'),
     36: ('enc-36', '\u2716', '10e1e743523eb2c0c989beace3ad8f3f15b513e62ba09227b48d845de09804ea'),
     37: ('enc-37', '\u2717', 'ef9aa05a5c7b0e7ef254ce81683d229e086476a570c21cad8f663dbc0adaf005'),
+}
+MARVOSYM_REFERENCE_GLYPHS = {
+    66: ('Letter', '\u2709', 'dfc0ecf9e21cad018a58240388c4d301817314e87b6be6f4451838f5157b66bb'),
+}
+OUTLINE_REFERENCES = {
+    'ctan-bbding-outline-match': (BBDING_REFERENCE_GLYPHS, BBDING_REFERENCE_SHA256,
+        BBDING_REFERENCE_SOURCE, BBDING_SYMBOL_SOURCE, BBDING_UNICODE_SOURCE),
+    'ctan-marvosym-outline-match': (MARVOSYM_REFERENCE_GLYPHS,
+        'f915a6a65c80058683c74962b8390f2f533f6c8bec02d462a6a09b29334aa74e',
+        'https://mirrors.ctan.org/fonts/marvosym/fonts/type1/public/marvosym/marvosym.pfb',
+        'https://mirrors.ctan.org/fonts/marvosym/tex/latex/marvosym/marvosym.sty',
+        'https://raw.githubusercontent.com/latex3/hyperref/main/hyperref.dtx'),
 }
 
 
@@ -75,9 +87,9 @@ def _type1_outline_sha256(charstring, font_matrix):
     return _sha(payload.encode('ascii'))
 
 
-def _bbding_text(name, code, charstring, font_matrix):
-    """Use CTAN bbding semantics only after an exact code and outline proof."""
-    reference = BBDING_REFERENCE_GLYPHS.get(code)
+def _reference_text(name, code, charstring, font_matrix, references):
+    """Use source semantics only after an exact code, name and outline proof."""
+    reference = references.get(code)
     if reference is None or name != reference[0] or charstring is None:
         return None
     if _type1_outline_sha256(charstring, font_matrix) != reference[2]:
@@ -97,8 +109,11 @@ def _glyph_text(name, fontname, supplemental, *, code=None, charstring=None,
     if not value: value=supplemental.get(name,'');source='pdfbox-additional-glyphlist'
     if not value: value=MATHML_GLYPH_NAMES.get(name,'');source='w3c-mathml-glyph-name'
     if not value:
-        value=_bbding_text(name,code,charstring,font_matrix)
-        if value:source='ctan-bbding-outline-match'
+        for origin,reference in OUTLINE_REFERENCES.items():
+            value=_reference_text(name,code,charstring,font_matrix,reference[0])
+            if value:
+                source=origin
+                break
     if (not value or any(ord(x)<32 or ord(x)==65533 or 0xD800<=ord(x)<=0xDFFF
             or 0xE000<=ord(x)<=0xF8FF for x in value)):
         return None,None
@@ -320,12 +335,13 @@ def normalize_pdf_bytes(raw):
                         font_program_sha256=_sha(program),encoding_sha256=_sha('\n'.join(codes).encode()),
                         tounicode_before_sha256=None if created else _sha(before),tounicode_created=created,
                         mapping_reference=MATHML_GLYPH_SOURCE if origin=='w3c-mathml-glyph-name' else None)
-                    if origin=='ctan-bbding-outline-match':
+                    if origin in OUTLINE_REFERENCES:
+                        _,reference_sha,reference_source,symbol_source,unicode_source=OUTLINE_REFERENCES[origin]
                         mapping.update(glyph_outline_sha256=_type1_outline_sha256(charstring,font_matrix),
-                            semantic_reference_font_sha256=BBDING_REFERENCE_SHA256,
-                            semantic_reference_font_source=BBDING_REFERENCE_SOURCE,
-                            mapping_reference=BBDING_UNICODE_SOURCE,
-                            symbol_reference=BBDING_SYMBOL_SOURCE)
+                            semantic_reference_font_sha256=reference_sha,
+                            semantic_reference_font_source=reference_source,
+                            mapping_reference=unicode_source,
+                            symbol_reference=symbol_source)
                     if code in observed:mapping['glyph_id']=observed[code][0]
                     mappings.append(mapping)
                 if not mappings:continue
