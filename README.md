@@ -76,6 +76,8 @@ A typical tool sequence is:
 
 For a reproducible starting point, open `2005.11401` with `get_paper`, then read its `Introduction` using `read_paper_section`. This is *Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks*; its card, outline and section read were checked through the public MCP on 17 October 2026.
 
+For a protocol engineering example, follow the [Web3 case: what a blob commitment actually proves](docs/web3-case-study.md). It traces a live-checked question through EIP-4844's networking, proof and availability boundaries, with the source passages needed to assess the conclusion.
+
 To try claim-oriented research:
 
 > Use validate_project to investigate a retrieval-augmented language model. Evaluate this claim separately: “Retrieval augmented generation conditions language-model answers on retrieved documents.” Show the candidate papers and supporting passages, then explain what still needs verification.
