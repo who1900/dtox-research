@@ -118,9 +118,9 @@ def _schema(conn):
       CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS targets(
         paper_id TEXT PRIMARY KEY,
-        cache_ufffd INTEGER NOT NULL,
-        source_ufffd INTEGER NOT NULL,
-        empty_fulltext INTEGER NOT NULL,
+        cache_ufffd INTEGER,
+        source_ufffd INTEGER,
+        empty_fulltext INTEGER,
         status TEXT NOT NULL CHECK(status IN
           ('pending','staging','prepared','applying','applied','deferred','failed')),
         reason TEXT,
@@ -716,7 +716,7 @@ def _coarse_metadata_candidate(state, coarse_point):
     return dict(coarse_point, payload=dict(payload, layers=layers))
 
 
-def _prepare_candidate(paper_id, result, state, runtime, base, metrics):
+def _prepare_candidate(paper_id, result, state, runtime, base, metrics, source_request=None):
     owner, restore = runtime['owner'], runtime['restore']
     extractor, cache = runtime['extractor'], runtime['document_cache']
     source_path = Path(result['source_path']).resolve(strict=True)
@@ -746,6 +746,10 @@ def _prepare_candidate(paper_id, result, state, runtime, base, metrics):
     if (mode == 'paper_markdown' and not paper_id.startswith('acl:')
             and not is_arxiv_id(paper_id)):
         source_label = state.get('fulltext_source') or 'source-pdf'
+    if state.get('fulltext_source') == 'iacr-abstract':
+        source_label = 'source-pdf'
+    if source_request and source_request.get('source_label'):
+        source_label = source_request['source_label']
     binding = _source_binding(result)
     binding['extraction'] = diagnostics
     binding['source_helper_sha256'] = hashlib.sha256(
@@ -930,7 +934,8 @@ def maintenance_gate(base, worker, paper_ids, *, cleanup=None):
             _atomic_json(marker_path, gate)
 
 
-def recover_journals(records, *, owner, qdrant, gate_factory, update, trusted_terminal=False):
+def recover_journals(records, *, owner, qdrant, gate_factory, update, trusted_terminal=False,
+                     gate_base=None):
     """Resolve owner journals before selecting new work; never guess after writes."""
     loaded = []
     uncertain = []
@@ -976,7 +981,10 @@ def recover_journals(records, *, owner, qdrant, gate_factory, update, trusted_te
             raise WorkerError('interrupted owner journal did not reach verified rollback')
         else:
             raise WorkerError('unknown whole-document owner journal phase: ' + str(phase))
-    marker = Path(records[0]['journal_path']).parents[1] / 'maintenance-gate.json' if records and records[0].get('journal_path') else None
+    marker = (Path(gate_base) if gate_base is not None else
+              Path(records[0]['journal_path']).parents[1] if records and records[0].get('journal_path') else None)
+    if marker is not None:
+        marker = marker / 'maintenance-gate.json'
     # If the previous process died after closing the API, restore only after every
     # recoverable journal has passed its before/published verification above.
     if marker and marker.exists():
@@ -1092,11 +1100,15 @@ def _wait_for_api(sleeper=None):
             sleeper(1)
 
 
-def _acquire_one(paper_id, state, runtime, base, queued_at=None):
+def _acquire_one(paper_id, state, runtime, base, queued_at=None, source_request=None):
     task_started = time.monotonic()
     queue_wait = max(0.0, task_started - queued_at) if queued_at is not None else 0.0
     resolver_started = time.monotonic()
-    request = _source_attempt(lambda: _fresh_request(state, runtime['fresh']), runtime)
+    request = (dict(source_request) if source_request is not None else
+               _source_attempt(lambda: _fresh_request(state, runtime['fresh']), runtime))
+    if source_request is not None and (request.get('paper_id') != paper_id
+                                       or request.get('title') != state.get('title')):
+        raise WorkerError('curated source request identity/title differs from live paper')
     resolver_seconds = time.monotonic() - resolver_started
     stage = Path(base) / 'source-stage' / runtime['document_cache'].safe_id(paper_id)
     kwargs = dict(timeout=120, native_build=str(NATIVE_BUILD), original_store_root=str(ORIGINAL_STORE))
@@ -1178,12 +1190,12 @@ def _recover_batch_plans(plans, runtime, base):
             raise WorkerError('batch exception left an unknown owner journal phase: ' + str(phase))
 
 
-def _apply_batch(plans, runtime, base, worker):
+def _apply_batch(plans, runtime, base, worker, gate_base=None):
     if not plans:
         return
     gate_started = time.monotonic()
     try:
-        with maintenance_gate(base, worker, [paper_id for paper_id, _, _ in plans],
+        with maintenance_gate(gate_base or base, worker, [paper_id for paper_id, _, _ in plans],
                               cleanup=lambda: _recover_batch_plans(plans, runtime, base)) as gate:
             for paper_id, journal, metrics in plans:
                 _update(base, paper_id, 'applying', reason=None, journal_path=journal, metrics=metrics)
@@ -1227,7 +1239,7 @@ def _apply_batch(plans, runtime, base, worker):
 
 
 @contextmanager
-def _locks(base):
+def _locks(base, *, wait=False, preflight=None):
     import fcntl
     paths = (Path(base).parent / 'labels-worker.lock',
              Path(base).parent / 'points-worker.lock',
@@ -1237,9 +1249,11 @@ def _locks(base):
             path.parent.mkdir(parents=True, exist_ok=True)
             stream = stack.enter_context(path.open('a'))
             try:
-                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(stream, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise WorkerError('another corpus worker holds ' + path.name) from exc
+        if preflight is not None:
+            preflight()
         yield
 
 
@@ -1264,11 +1278,14 @@ def _unsafe_preparation_error(exc):
             (errno.ENOSPC, errno.EIO, errno.EROFS, errno.EMFILE, errno.ENFILE))
 
 
-def _candidate_one(paper_id, source_result, state, runtime, base, metrics):
+def _candidate_one(paper_id, source_result, state, runtime, base, metrics, source_request=None):
     started = time.monotonic()
     for attempt in range(3):
         try:
-            candidate = _prepare_candidate(paper_id, source_result, state, runtime, base, metrics)
+            candidate = (_prepare_candidate(paper_id, source_result, state, runtime, base, metrics)
+                         if source_request is None else
+                         _prepare_candidate(paper_id, source_result, state, runtime, base, metrics,
+                                           source_request=source_request))
             metrics['candidate_build_seconds'] = max(
                 0.0, time.monotonic() - started - metrics.get('embedding_seconds', 0.0))
             return candidate, metrics
@@ -1280,7 +1297,8 @@ def _candidate_one(paper_id, source_result, state, runtime, base, metrics):
             time.sleep((5, 15)[attempt])
 
 
-def _submit_preparation(sources, candidates, paper_id, state, runtime, base, metrics):
+def _submit_preparation(sources, candidates, paper_id, state, runtime, base, metrics,
+                        source_request=None):
     """Forward source completion into embedding without waiting for the writer."""
     completed = Future()
     def candidate_ready(future):
@@ -1292,16 +1310,21 @@ def _submit_preparation(sources, candidates, paper_id, state, runtime, base, met
         try:
             result, source_metrics = future.result()
             metrics.update(source_metrics)
-            candidate = candidates.submit(_candidate_one, paper_id, result, state, runtime, base, metrics)
+            args = (paper_id, result, state, runtime, base, metrics)
+            candidate = (candidates.submit(_candidate_one, *args) if source_request is None else
+                         candidates.submit(_candidate_one, *args, source_request))
             candidate.add_done_callback(candidate_ready)
         except BaseException as exc:
             completed.set_exception(exc)
-    source = sources.submit(_acquire_one, paper_id, state, runtime, base, time.monotonic())
+    source_args = (paper_id, state, runtime, base, time.monotonic())
+    source = (sources.submit(_acquire_one, *source_args) if source_request is None else
+              sources.submit(_acquire_one, *source_args, source_request))
     source.add_done_callback(source_ready)
     return completed
 
 
-def _run_stages(selected, runtime, base, root, rowid_floors):
+def _run_stages(selected, runtime, base, root, rowid_floors, *, source_requests=None,
+                gate_base=None):
     """Bounded independent source/embedding stages feed one publication owner.
 
     Source acquisition uses the standard fresh-source adapters, extractor and
@@ -1340,7 +1363,8 @@ def _run_stages(selected, runtime, base, root, rowid_floors):
                     _record_error(base, paper_id, exc, {})
                     continue
                 metrics = {}
-                future = _submit_preparation(sources, candidates, paper_id, state, runtime, base, metrics)
+                future = _submit_preparation(sources, candidates, paper_id, state, runtime, base,
+                                             metrics, (source_requests or {}).get(paper_id))
                 pending[future] = (paper_id, metrics)
             if pending:
                 done = {future for future in pending if future.done()}
@@ -1383,7 +1407,10 @@ def _run_stages(selected, runtime, base, root, rowid_floors):
                                 raise WorkerError('preparation left an unsafe owner journal') from exc
                         _record_error(base, paper_id, exc, metrics)
             if ready:
-                _apply_batch(ready, runtime, base, runtime['worker'])
+                if gate_base is None:
+                    _apply_batch(ready, runtime, base, runtime['worker'])
+                else:
+                    _apply_batch(ready, runtime, base, runtime['worker'], gate_base=gate_base)
                 for paper_id, journal, metrics in ready:
                     current = _get_targets(base, ('applied',), [paper_id])
                     if current:
@@ -1391,26 +1418,27 @@ def _run_stages(selected, runtime, base, root, rowid_floors):
                                                   json.loads(current[0]['metrics_json']))
 
 
-def run(base=BASE, root=ROOT, *, papers=None, limit=None, retry_deferred=False):
+def run(base=BASE, root=ROOT, *, papers=None, limit=None, retry_deferred=False,
+        source_requests=None, gate_base=None, wait_for_lock=False, lock_preflight=None):
     base, root = Path(base).resolve(), Path(root).resolve(strict=True)
     if limit is not None and (type(limit) is not int or limit < 1):
         raise ValueError('limit must be a positive integer')
     papers = list(dict.fromkeys(papers or []))
     started = time.monotonic()
     run_id = hashlib.sha256((utc_now() + str(os.getpid())).encode()).hexdigest()[:16]
-    with _locks(base):
+    with _locks(base, wait=wait_for_lock, preflight=lock_preflight):
         runtime = _load_runtime(base, root)
         worker = runtime['worker']
         _runtime_preflight(runtime, worker)
         recovery_records = _get_targets(base, ('staging','prepared','applying','applied','failed'))
-        gate_state = _read_meta_state(base / 'maintenance-gate.json') or {}
+        gate_state = _read_meta_state(Path(gate_base or base) / 'maintenance-gate.json') or {}
         trusted_terminal = (gate_state.get('phase') in ('closed', 'restored')
                             and gate_state.get('safe_to_restore') is True
                             and gate_state.get('attention_required') is False)
         recover_journals(recovery_records, owner=runtime['owner'], qdrant=runtime['client'],
-                         gate_factory=lambda ids: maintenance_gate(base, worker, ids),
+                         gate_factory=lambda ids: maintenance_gate(gate_base or base, worker, ids),
                          update=lambda pid, status, **kw: _update(base, pid, status, **kw),
-                         trusted_terminal=trusted_terminal)
+                         trusted_terminal=trusted_terminal, gate_base=gate_base)
         rowid_floors = _rowid_floors(runtime)
         for record in _get_targets(base, ('prepared',)):
             if record.get('journal_path') and Path(record['journal_path']).exists():
@@ -1442,7 +1470,8 @@ def run(base=BASE, root=ROOT, *, papers=None, limit=None, retry_deferred=False):
         finally:
             conn.close()
         write_status(base)
-        _run_stages(selected, runtime, base, root, rowid_floors)
+        _run_stages(selected, runtime, base, root, rowid_floors,
+                    source_requests=source_requests, gate_base=gate_base)
         elapsed = time.monotonic() - started
         selected_statuses = _selected_counts(base, active_run['target_ids'])
         successful = selected_statuses.get('applied', 0)
@@ -1514,6 +1543,7 @@ def main(argv=None):
     work.add_argument('--limit', type=int)
     work.add_argument('--retry-deferred', action='store_true')
     work.add_argument('--managed', action='store_true')
+    work.add_argument('--wait-for-lock', action='store_true')
     args = parser.parse_args(argv)
     if args.command == 'api-startup-check':
         return api_startup_check(args.base)
@@ -1531,7 +1561,8 @@ def main(argv=None):
                 _atomic_json(args.base / 'bulk-controller.pid', os.getpid())
                 lifecycle('bulk_running', 'running')
                 result = run(args.base, args.root, papers=args.paper, limit=args.limit,
-                             retry_deferred=args.retry_deferred)
+                             retry_deferred=args.retry_deferred,
+                             wait_for_lock=args.wait_for_lock)
                 # Explicit bounded subsets and manual retry selections keep their scope.
                 if not args.paper and args.limit is None and not args.retry_deferred:
                     retry_ids = _transport_retry_targets(args.base)
@@ -1540,7 +1571,8 @@ def main(argv=None):
                                   retry_documents=len(retry_ids))
                         time.sleep(60)
                         lifecycle('bulk_running', 'running')
-                        result = run(args.base, args.root, papers=retry_ids)
+                        result = run(args.base, args.root, papers=retry_ids,
+                                     wait_for_lock=args.wait_for_lock)
                 counts = result.get('statuses', {})
                 lifecycle('bulk_complete', 'pass_complete',
                           deferred_documents=counts.get('deferred', 0),
@@ -1558,7 +1590,8 @@ def main(argv=None):
                 return 75 if retryable else 78
         else:
             result = run(args.base, args.root, papers=args.paper, limit=args.limit,
-                         retry_deferred=args.retry_deferred)
+                         retry_deferred=args.retry_deferred,
+                         wait_for_lock=args.wait_for_lock)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0
 

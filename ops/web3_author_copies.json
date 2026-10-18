@@ -69,10 +69,11 @@
     "curated_standalone": true
   },
   {
-    "originaliacr_id": "2010/009",
+    "originaliacr_id": null,
     "title": "Constant-Size Commitments to Polynomials and Their Applications",
     "authors": ["Aniket Kate", "Gregory M. Zaverucha", "Ian Goldberg"],
     "year": 2010,
+    "doi": "10.1007/978-3-642-17373-8_11",
     "copy_url": "https://www.cypherpunks.ca/~iang/pubs/PolyCommit-AsiaCrypt.pdf",
     "landing_url": "https://www.cypherpunks.ca/~iang/pubs/PolyCommit-AsiaCrypt.pdf",
     "identity_source": "https://cypherpunks.ca/~iang/cv.html",

@@ -39,6 +39,27 @@ class _Session:
 
 
 class FreshSourceTests(unittest.TestCase):
+    def test_unresolved_latex_inputs_require_another_source_route(self):
+        diagnostics = dict(replacement_characters=0, word_count=5000,
+            parse_status='warning', unresolved_include_warnings=['missing case.tikz'])
+        self.assertEqual(fresh_sources.source_quality_reason('rawTexarchive', diagnostics),
+                         'unresolved_latex_includes')
+        diagnostics.update(parse_status='ok', unresolved_include_warnings=[])
+        self.assertIsNone(fresh_sources.source_quality_reason('rawTexarchive', diagnostics))
+
+    def test_pdf_edition_pins_exact_bytes_before_parsing(self):
+        raw = b'%PDF-1.7\nsource fixture'
+        url = 'https://eprint.iacr.org/2016/260.pdf'
+        response = _Response(raw)
+        response.url = url
+        digest = hashlib.sha256(raw).hexdigest()
+        artifact = fresh_sources.fetch_fresh_artifact('iacr:2016/260', original_kind='PDF',
+            edition='sha256:' + digest, source_url=url, session=_Session(response))
+        self.assertEqual(artifact.edition, 'sha256:' + digest)
+        with self.assertRaisesRegex(fresh_sources.FreshSourceError, 'requested source edition'):
+            fresh_sources.fetch_fresh_artifact('iacr:2016/260', original_kind='PDF',
+                edition='sha256:' + '0' * 64, source_url=url, session=_Session(response))
+
     def test_abs_mobile_breadcrumb_uses_explicit_submission_history_version(self):
         response = _Response(
             b'<meta name="citation_title" content="Paper">'

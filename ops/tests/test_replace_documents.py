@@ -54,6 +54,31 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(request['declared_source_url'], state['source_url'])
         self.assertEqual(request['title'], state['title'])
 
+    def test_curated_request_is_bound_to_live_identity_and_skips_resolver(self):
+        class Fresh:
+            class FreshSourceError(Exception): pass
+            class FreshSourceDependencyError(FreshSourceError): pass
+            __file__ = __file__
+            calls = []
+            @staticmethod
+            def resolve_arxiv_version(*args, **kwargs):
+                raise AssertionError('curated request must not use resolver')
+            @classmethod
+            def acquire_and_parse(cls, request, stage, **kwargs):
+                cls.calls.append(request)
+                return dict(body_quality_candidate=True, diagnostics={}, source_path='unused')
+        runtime = dict(fresh=Fresh, document_cache=types.SimpleNamespace(safe_id=lambda x:x))
+        state = dict(arxiv_id='iacr:2016/260', title='Verified title')
+        request = dict(paper_id=state['arxiv_id'], title=state['title'], fresh_kind='PDF',
+                       fresh_url='https://publisher.example/paper.pdf', fresh_version='v1')
+        result, _ = worker._acquire_one(state['arxiv_id'], state, runtime, '.',
+                                        source_request=request)
+        self.assertTrue(result['body_quality_candidate'])
+        self.assertEqual(Fresh.calls, [request])
+        with self.assertRaisesRegex(worker.WorkerError, 'identity/title'):
+            worker._acquire_one(state['arxiv_id'], state, runtime, '.',
+                                source_request=dict(request, title='Different'))
+
     def test_rejected_pdf_keeps_actual_unicode_diagnostics_in_existing_ledger(self):
         class Fresh:
             class FreshSourceError(Exception): pass

@@ -377,11 +377,16 @@ def publish_snapshot(conn, job, qdrant_write, fts_write, complete, preflight):
 
 
 def reconcile_publications(conn, data_dir, qdrant_write, fts_write, complete, preflight, limit=1,
-                           *, on_success=None):
+                           *, on_success=None, paper_ids=None):
     if not callable(preflight):
         raise TypeError("publication reconciliation requires a Qdrant preflight callback")
+    scope = tuple(sorted(set(paper_ids))) if paper_ids is not None else None
+    if scope == ():
+        return 0
+    clause = (" AND arxiv_id IN (" + ",".join("?" for _ in scope) + ")") if scope else ""
     rows = conn.execute("SELECT * FROM paper_publications WHERE kind='snapshot' AND state IN ('ready','staged') "
-                        "AND retry_after<=? ORDER BY retry_after LIMIT ?", (__import__('time').time(), limit)).fetchall()
+                        "AND retry_after<=?" + clause + " ORDER BY retry_after LIMIT ?",
+                        (__import__('time').time(), *(scope or ()), limit)).fetchall()
     count = 0
     for row in rows:
         job = {"paper_id": row["arxiv_id"], "revision": row["revision"], "job_kind": "snapshot"}

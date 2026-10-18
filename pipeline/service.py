@@ -563,6 +563,13 @@ GITHUB_DOC_SOURCES = {
                         "rpc", "tokenization", "defi", "finance", "frontend"))
                     + ("apps/docs/content/cookbook/",)},
     "agave-svm": {"repo": "anza-xyz/agave", "branch": "master", "paths": ("svm/doc/",), "web3": True},
+    "firedancer": {"repo": "firedancer-io/firedancer", "branch": "main", "web3": True,
+                   "paths": ("book/guide/", "book/api/")},
+    # gnark docs/ contains a known-users list, not technical documentation.
+    "gnark": {"repo": "Consensys-Incorporated/gnark", "branch": "master", "web3": True,
+              "paths": ("README.md",)},
+    "linea-docs": {"repo": "Consensys-Incorporated/doc.linea", "branch": "main", "web3": True,
+                   "paths": ("docs/protocol/", "docs/network/", "docs/stack/")},
     "jupiter": {"repo": "jup-ag/docs", "branch": "main", "web3": True,
                 "paths": ("swap/", "lend/", "perps/", "trigger/", "ultra/", "recurring/", "guides/")},
     "meteora": {"repo": "MeteoraAG/docs", "branch": "main", "web3": True,
@@ -3479,12 +3486,16 @@ def _complete_paper(conn, arxiv_id, commit=True):
     return True
 
 
-def _reconcile_index_sync(conn, session, limit=1):
+def _reconcile_index_sync(conn, session, limit=1, *, paper_ids=None):
+    scope = tuple(sorted(set(paper_ids))) if paper_ids is not None else None
+    if scope == ():
+        return 0
+    clause = (" AND p.arxiv_id IN (" + ",".join("?" for _ in scope) + ")") if scope else ""
     rows = conn.execute("SELECT p.*,s.revision,g.revision AS progress_revision,g.completed AS sync_completed "
                         "FROM paper_index_sync s JOIN papers p USING(arxiv_id) "
                         "LEFT JOIN paper_index_sync_progress g USING(arxiv_id) "
-                        "WHERE s.retry_after<=? AND p.status='done' ORDER BY s.retry_after LIMIT ?",
-                        (time.time(), limit)).fetchall()
+                        "WHERE s.retry_after<=? AND p.status='done'" + clause + " ORDER BY s.retry_after LIMIT ?",
+                        (time.time(), *(scope or ()), limit)).fetchall()
     conn.commit()
     completed = 0
     for row in rows:
@@ -3523,7 +3534,11 @@ def _reconcile_index_sync(conn, session, limit=1):
     return completed
 
 
-def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT):
+def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT, *, paper_ids=None):
+    scope = tuple(sorted(set(paper_ids))) if paper_ids is not None else None
+    if scope == ():
+        return 0
+    clause = (" AND arxiv_id IN (" + ",".join("?" for _ in scope) + ")") if scope else ""
     try:
         from pipeline.publication import prepare_snapshot, publish_snapshot, reconcile_publications
     except ModuleNotFoundError:
@@ -3553,8 +3568,9 @@ def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT):
                                             _fresh_fts_ids(conn, current["paper_id"])),
         lambda paper_id, commit=False: _complete_paper(conn, paper_id, commit=commit),
         _preflight, limit=limit,
-        on_success=lambda _job: stage_heartbeat("embed", "progress", 1))
-    processed += _reconcile_index_sync(conn, session)
+        on_success=lambda _job: stage_heartbeat("embed", "progress", 1),
+        **({"paper_ids": scope} if scope is not None else {}))
+    processed += _reconcile_index_sync(conn, session, **({"paper_ids": scope} if scope is not None else {}))
     # Specs and docs first, oldest first after that: they are short, and while
     # thousands of reprocessed 300-chunk papers queued ahead of them, Geyser,
     # RISC Zero and Aave v3 sat unsearchable for a day
@@ -3565,11 +3581,11 @@ def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT):
         "AND NOT EXISTS (SELECT 1 FROM paper_publications j WHERE j.arxiv_id=papers.arxiv_id "
         "AND j.kind='snapshot') "
         "AND EXISTS (SELECT 1 FROM completion_history h WHERE h.arxiv_id=papers.arxiv_id "
-        "AND h.first_known=1 AND h.completed=0) "
+        "AND h.first_known=1 AND h.completed=0) " + clause +
         "ORDER BY CASE WHEN substr(arxiv_id, 1, 3) IN ('gh:', 'wp:') "
         "OR substr(arxiv_id, 1, 4) = 'eip:' OR substr(arxiv_id, 1, 5) = 'simd:' THEN 0 ELSE 1 END, "
         "updated_at LIMIT ?",
-        (limit,),
+        (*(scope or ()), limit),
     ).fetchall()
     if not rows:
         return processed

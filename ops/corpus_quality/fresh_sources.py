@@ -223,6 +223,9 @@ def fetch_fresh_artifact(canonical_id, *, original_kind, edition, session=None,
         raise FreshSourceError("response is not a supported arXiv source archive")
 
     raw_sha256 = hashlib.sha256(raw).hexdigest()
+    if (original_kind == "PDF" and re.fullmatch(r"sha256:[0-9a-f]{64}", edition)
+            and edition != "sha256:" + raw_sha256):
+        raise FreshSourceError("PDF bytes differ from the requested source edition")
     artifact_edition = edition if is_arxiv_id(canonical_id) else "sha256:" + raw_sha256
     return FreshArtifact(
         canonical_id=canonical_id, source_url=source_url, request_url=source_url,
@@ -978,6 +981,10 @@ def source_quality_reason(kind, diagnostics):
         return "replacement_characters_present"
     elif diagnostics.get("unsupported_structures"):
         return "unresolved_source_structures"
+    elif kind == "rawTexarchive" and diagnostics.get("unresolved_include_warnings"):
+        # A usable main body does not establish completeness when inputs were
+        # omitted. Let the existing route selector try the rendered PDF.
+        return "unresolved_latex_includes"
     elif kind == "HTML" and not (
             diagnostics.get("source_title_match") is True
             and diagnostics.get("article_source_chars", 0) > 0
