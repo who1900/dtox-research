@@ -1,18 +1,31 @@
-"""Source-grounded missing Type1 ToUnicode mappings, on a memory-only PDF.
+"""Source-grounded Unicode mappings, on a memory-only derivative PDF.
 
-Existing mappings are never overridden. Unsupported font/CMap contracts remain
+Valid mappings are never overridden. Unsupported font/CMap contracts remain
 unresolved. A glyph must exist in its embedded CharStrings and actual PDF font
 encoding; no OCR, language inference, page IDs or Markdown replacements occur.
 """
 import hashlib
+import json
 import re
 from pathlib import Path
+if __package__:
+    from .pdf_cid_unicode import invalid_scalar, repair_identity_h
+else:
+    from pdf_cid_unicode import invalid_scalar, repair_identity_h
 
-ADAPTER_REVISION = 'source-font-tounicode-v3'
+ADAPTER_REVISION = 'source-font-tounicode-v4'
 GLYPHLIST_SOURCE = 'https://raw.githubusercontent.com/apache/pdfbox/2.0.14/pdfbox/src/main/resources/org/apache/pdfbox/resources/glyphlist/additional.txt'
 GLYPHLIST_SHA256 = 'e70928360e577f03fa4fe354dc353a56526ef675e07790b9131acd27fd38c28f'
 MATHML_GLYPH_NAMES = {'mapsto':'\u21a6'}
 MATHML_GLYPH_SOURCE = 'https://www.w3.org/TR/1998/PR-math-19980224/chap6/MMALIAS2.html'
+BBDING_REFERENCE_SHA256 = 'fd11709c57988d2b790b580e0e8d29dc026490f3b3f245468d615e517b5d4a7b'
+BBDING_REFERENCE_SOURCE = 'https://mirrors.ctan.org/fonts/niceframe/type1/bbding10.pfb'
+BBDING_SYMBOL_SOURCE = 'https://mirrors.ctan.org/fonts/bbding/bbding.pdf'
+BBDING_UNICODE_SOURCE = 'https://mirrors.ctan.org/macros/latex/contrib/hyperref/doc/hyperref.pdf'
+BBDING_REFERENCE_GLYPHS = {
+    34: ('enc-34', '\u2714', 'e22502702922356ffce54fe58ca5dfa82343e173ff50430dadd07c87a65abaf9'),
+    37: ('enc-37', '\u2717', 'ef9aa05a5c7b0e7ef254ce81683d229e086476a570c21cad8f663dbc0adaf005'),
+}
 
 
 def _sha(raw):
@@ -30,7 +43,47 @@ def _supplemental():
     return result
 
 
-def _glyph_text(name, fontname, supplemental):
+def _type1_outline_sha256(charstring, font_matrix):
+    """Hash an expanded Type 1 outline together with its advance and matrix."""
+    from fontTools.pens.recordingPen import RecordingPen
+    if not isinstance(font_matrix, (list, tuple)) or len(font_matrix) != 6:
+        return None
+    if any(isinstance(value, bool) or not isinstance(value, (int, float))
+           for value in font_matrix):
+        return None
+    pen = RecordingPen()
+    charstring.draw(pen)  # expands local/global subroutines through fontTools
+    width = getattr(charstring, 'width', None)
+    if isinstance(width, bool) or not isinstance(width, (int, float)):
+        return None
+    def canonical(value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, (list, tuple)):
+            return [canonical(item) for item in value]
+        return value
+    try:
+        payload = json.dumps([canonical(font_matrix), float(width), canonical(pen.value)],
+                             ensure_ascii=True, separators=(',', ':'), allow_nan=False)
+    except (TypeError, ValueError):
+        return None
+    return _sha(payload.encode('ascii'))
+
+
+def _bbding_text(name, code, charstring, font_matrix):
+    """Use CTAN bbding semantics only after an exact code and outline proof."""
+    reference = BBDING_REFERENCE_GLYPHS.get(code)
+    if reference is None or name != reference[0] or charstring is None:
+        return None
+    if _type1_outline_sha256(charstring, font_matrix) != reference[2]:
+        return None
+    return reference[1]
+
+
+def _glyph_text(name, fontname, supplemental, *, code=None, charstring=None,
+                font_matrix=None):
     from fontTools import agl
     # Icon fonts deliberately use private codes. Represent the verified source
     # glyph's name explicitly rather than inventing a prose Unicode substitute.
@@ -40,6 +93,9 @@ def _glyph_text(name, fontname, supplemental):
     source='adobe-glyph-list'
     if not value: value=supplemental.get(name,'');source='pdfbox-additional-glyphlist'
     if not value: value=MATHML_GLYPH_NAMES.get(name,'');source='w3c-mathml-glyph-name'
+    if not value:
+        value=_bbding_text(name,code,charstring,font_matrix)
+        if value:source='ctan-bbding-outline-match'
     if (not value or any(ord(x)<32 or ord(x)==65533 or 0xD800<=ord(x)<=0xDFFF
             or 0xE000<=ord(x)<=0xF8FF for x in value)):
         return None,None
@@ -191,7 +247,7 @@ def normalize_pdf_bytes(raw):
         for page in document:
             missing={}
             for run in page.get_texttrace():
-                glyph_ids={ch[1] for ch in run['chars'] if ch[0]==65533}
+                glyph_ids={ch[1] for ch in run['chars'] if invalid_scalar(ch[0])}
                 if glyph_ids:missing.setdefault(_font_key(run['font']),set()).update(glyph_ids)
             fonts=page.get_fonts(full=True)
             for row in fonts:
@@ -219,6 +275,10 @@ def normalize_pdf_bytes(raw):
             name=affected_font['font_name']
             if xref in ambiguous:continue
             try:
+                if document.xref_get_key(xref,'Subtype')==('name','/Type0'):
+                    diagnostics['mappings'].extend(repair_identity_h(
+                        document,xref,affected_font['glyph_ids'],cmap_owners))
+                    continue
                 if document.xref_get_key(xref,'Subtype')!=('name','/Type1'):raise ValueError('unsupported missing-Unicode font subtype')
                 actual_name,ext,kind,program=document.extract_font(xref)
                 if not program or ext!='pfa':raise ValueError('embedded Type1 program required')
@@ -242,7 +302,12 @@ def normalize_pdf_bytes(raw):
                         glyph_id,_=observed[code]
                         diagnostics['unresolved'].append(dict(font_xref=xref,font_name=name,code=code,glyph_id=glyph_id,glyph_name=glyph,reason='ambiguous empty ToUnicode entries'))
                         continue
-                    text,origin=_glyph_text(glyph,actual_name,supplemental)
+                    parsed_font=getattr(font,'font',{})
+                    charstrings=parsed_font.get('CharStrings',{}) if isinstance(parsed_font,dict) else {}
+                    charstring=charstrings.get(glyph)
+                    font_matrix=parsed_font.get('FontMatrix') if isinstance(parsed_font,dict) else None
+                    text,origin=_glyph_text(glyph,actual_name,supplemental,code=code,
+                                            charstring=charstring,font_matrix=font_matrix)
                     if text is None:
                         if code in observed:
                             glyph_id,_=observed[code]
@@ -252,6 +317,12 @@ def normalize_pdf_bytes(raw):
                         font_program_sha256=_sha(program),encoding_sha256=_sha('\n'.join(codes).encode()),
                         tounicode_before_sha256=None if created else _sha(before),tounicode_created=created,
                         mapping_reference=MATHML_GLYPH_SOURCE if origin=='w3c-mathml-glyph-name' else None)
+                    if origin=='ctan-bbding-outline-match':
+                        mapping.update(glyph_outline_sha256=_type1_outline_sha256(charstring,font_matrix),
+                            semantic_reference_font_sha256=BBDING_REFERENCE_SHA256,
+                            semantic_reference_font_source=BBDING_REFERENCE_SOURCE,
+                            mapping_reference=BBDING_UNICODE_SOURCE,
+                            symbol_reference=BBDING_SYMBOL_SOURCE)
                     if code in observed:mapping['glyph_id']=observed[code][0]
                     mappings.append(mapping)
                 if not mappings:continue

@@ -315,7 +315,7 @@ def _selected_counts(base, paper_ids):
 
 
 def _order_preparation(selected, cache_dir, cache):
-    """Start costly sources early using existing cache-file sizes as estimates."""
+    """Resume prepared work, then prioritize Unicode recovery and costly sources."""
     sizes = {}
     for row in selected:
         path = Path(cache_dir) / (cache.safe_id(row['paper_id']) + '.json')
@@ -324,6 +324,7 @@ def _order_preparation(selected, cache_dir, cache):
         except FileNotFoundError:
             sizes[row['paper_id']] = 0
     return sorted(selected, key=lambda row: (row['status'] != 'prepared',
+                  'replacement_characters_present' not in (row.get('reason') or ''),
                   -sizes[row['paper_id']], row['paper_id']))
 
 

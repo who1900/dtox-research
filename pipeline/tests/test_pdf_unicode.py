@@ -11,6 +11,37 @@ class SourceFontUnicodeTests(unittest.TestCase):
         self.assertEqual(adapter._glyph_text('unrecognizedmath','CMEX10',glyphlist),(None,None))
         self.assertEqual(adapter._glyph_text('uniE123','OtherFont',glyphlist),(None,None))
 
+    def test_type1_outline_fingerprint_covers_width_and_expanded_shape(self):
+        class CharString:
+            width=1000
+            endpoint=10
+            def draw(self,pen):
+                pen.moveTo((0,0));pen.lineTo((self.endpoint,0));pen.closePath()
+        font_matrix=[0.001,0,0,0.001,0,0]
+        baseline=adapter._type1_outline_sha256(CharString(),font_matrix)
+        self.assertEqual(baseline,adapter._type1_outline_sha256(CharString(),font_matrix))
+        changed_width=CharString();changed_width.width=999
+        changed_shape=CharString();changed_shape.endpoint=11
+        self.assertNotEqual(baseline,adapter._type1_outline_sha256(changed_width,font_matrix))
+        self.assertNotEqual(baseline,adapter._type1_outline_sha256(changed_shape,font_matrix))
+
+    def test_bbding_requires_exact_reference_shape_and_source_encoding_slot(self):
+        glyphlist=adapter._supplemental()
+        charstring=object()
+        proofs=((34,'enc-34','\u2714','e22502702922356ffce54fe58ca5dfa82343e173ff50430dadd07c87a65abaf9'),
+                (37,'enc-37','\u2717','ef9aa05a5c7b0e7ef254ce81683d229e086476a570c21cad8f663dbc0adaf005'))
+        for code,name,unicode_value,fingerprint in proofs:
+            with patch.object(adapter,'_type1_outline_sha256',return_value=fingerprint):
+                self.assertEqual(adapter._bbding_text(name,code,charstring,[0.001,0,0,0.001,0,0]),unicode_value)
+                self.assertEqual(adapter._glyph_text(name,'arbitrary-font',glyphlist,code=code,
+                    charstring=charstring,font_matrix=[0.001,0,0,0.001,0,0]),
+                    (unicode_value,'ctan-bbding-outline-match'))
+            with patch.object(adapter,'_type1_outline_sha256',return_value='0'*64):
+                self.assertIsNone(adapter._bbding_text(name,code,charstring,[0.001,0,0,0.001,0,0]))
+            with patch.object(adapter,'_type1_outline_sha256',return_value=fingerprint):
+                self.assertIsNone(adapter._bbding_text(name,code+1,charstring,[0.001,0,0,0.001,0,0]))
+                self.assertIsNone(adapter._bbding_text('enc-999',code,charstring,[0.001,0,0,0.001,0,0]))
+
     def test_existing_cmap_entries_remain_covered(self):
         raw=b'1 begincodespacerange\n<00><FF>\nendcodespacerange\n1 beginbfchar\n<50><2211>\nendbfchar\n1 beginbfrange\n<61><63><0061>\nendbfrange\nendcmap'
         self.assertEqual(adapter._cmap_codes(raw),{80,97,98,99})

@@ -32,7 +32,7 @@ def stage():
                                 'ops/corpus_quality/run_label_worker.py',
                                 'ops/corpus_quality/fresh_sources.py',
                                 'ops/corpus_quality/replace_documents.py',
-                                'pipeline/structured_html.py', 'pipeline/pdf_unicode.py',
+                                'pipeline/structured_html.py', 'pipeline/pdf_unicode.py', 'pipeline/pdf_cid_unicode.py',
                                 'pipeline/pdfbox_additional_glyphlist.txt', 'pipeline/PDFBOX_GLYPHLIST_LICENSE.txt',
                                 'pipeline/service.py', 'pipeline/originals.py',
                                 'ops/restore_cache_tails.py', 'pipeline/publication.py',

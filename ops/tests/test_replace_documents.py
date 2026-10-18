@@ -412,6 +412,9 @@ class ContinuousStageTests(unittest.TestCase):
             self.assertEqual([row['paper_id'] for row in ordered],
                              ['ready', 'large', 'tie-a', 'tie-b', 'small', 'absent', 'empty'])
             self.assertEqual(records[0]['paper_id'], 'small')
+            records[0]['reason'] = 'PDF:replacement_characters_present'
+            self.assertEqual([row['paper_id'] for row in worker._order_preparation(records, cache_dir, cache)][:3],
+                             ['ready', 'small', 'large'])
         with patch.object(Path, 'lstat', side_effect=PermissionError('denied')):
             with self.assertRaises(PermissionError):
                 worker._order_preparation(records, cache_dir, cache)
