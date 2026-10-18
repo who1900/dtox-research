@@ -48,12 +48,12 @@ class ParseSafetyTests(unittest.TestCase):
         self.manifests.ManifestInvalid = ManifestInvalid
         self.manifests.make_section_manifest = Mock(return_value={"paper_id": self.paper_id})
         self.manifests.publish_section_manifest = Mock(
-            side_effect=lambda path, manifest: path.write_bytes(json.dumps(manifest).encode("utf-8")))
+            side_effect=lambda path, manifest, **kwargs: path.write_bytes(json.dumps(manifest).encode("utf-8")))
         self.upsert = Mock(return_value=True)
         self.worker = load_functions(
             "init_db", "safe_id", "_record_parse_failure", "_write_parse_cache", "_make_embed_fn",
             "chunk_step", "_complete_paper", "_queue_index_sync", "_preflight_chunk_snapshot", "embed_step",
-            __package__="pipeline", BASE_DIR=self.root, CHUNK_DIR=self.root / "chunk_cache",
+            __package__="pipeline", BASE_DIR=self.root, PUBLICATION_PATHS={}, CHUNK_DIR=self.root / "chunk_cache",
             FULLTEXT_DIR=self.root / "fulltext_cache", EXTRACTOR_VERSION=4,
             PARSE_RETRY_BASE_SECONDS=60, PARSE_RETRY_MAX_SECONDS=3600,
             CHUNK_CYCLE_LIMIT=10, extractor=self.extractor, os=os, tempfile=tempfile, Path=Path,
@@ -195,7 +195,7 @@ class ParseSafetyTests(unittest.TestCase):
         self.manifests.make_section_manifest.assert_called_once_with(
             self.paper_id, self.canonical_sections, self.cache_path.read_bytes(), self.source_bytes, "pylatexenc", 4)
         self.manifests.publish_section_manifest.assert_called_once_with(
-            self.section_path, {"paper_id": self.paper_id})
+            self.section_path, {"paper_id": self.paper_id}, cache_dir=self.section_path.parent)
         self.assertEqual(list(self.cache_path.parent.glob("*.tmp")), [])
 
     def test_standalone_manifest_import_uses_same_contract(self):
@@ -277,6 +277,31 @@ class ParseSafetyTests(unittest.TestCase):
                 self.assertEqual(self.paper()["parse_error"], f"cache_publish_failed:{type(error).__name__}")
                 self.clock = self.paper()["parse_retry_after"]
         self.manifests.publish_section_manifest.assert_not_called()
+
+    def test_migrated_section_directory_resolves_but_document_symlinks_are_rejected(self):
+        from pipeline import document_cache
+        directory = self.root / "section_cache"
+        migrated = self.root / "migrated_sections"
+        directory.rename(migrated)
+        try:
+            directory.symlink_to(migrated, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"directory symlinks unavailable: {exc}")
+        self.worker._write_parse_cache.__globals__['PUBLICATION_PATHS'] = {'section_cache_dir': migrated}
+        with patch.dict("sys.modules", {"pipeline.document_cache": document_cache}):
+            self.worker._write_parse_cache(self.paper_id, self.chunks, self.source_bytes, "pylatexenc",
+                                           canonical_sections=self.canonical_sections)
+        self.assertTrue((migrated / self.cache_path.name).is_file())
+        target = migrated / self.cache_path.name
+        saved = migrated / "saved.json"
+        target.rename(saved)
+        target.symlink_to(saved)
+        before = saved.read_bytes()
+        with patch.dict("sys.modules", {"pipeline.document_cache": document_cache}):
+            with self.assertRaisesRegex(ManifestInvalid, "symlinked document path"):
+                self.worker._write_parse_cache(self.paper_id, self.chunks, self.source_bytes, "pylatexenc",
+                                               canonical_sections=self.canonical_sections)
+        self.assertEqual(saved.read_bytes(), before)
 
     def test_cache_replace_failure_with_invalid_projection_still_preserves_old_cache(self):
         self.manifests.make_section_manifest.side_effect = ManifestInvalid("unverified assembly")

@@ -77,13 +77,13 @@ def ensure_publication_schema(conn):
                  "ON paper_publications(kind,state,retry_after)")
 
 
-def _safe_dir(data_dir):
+def _safe_dir(data_dir, configured=None):
     root = Path(data_dir).resolve()
-    target = root / "publication_cache"
+    target = Path(configured) if configured is not None else root / "publication_cache"
     if target.is_symlink():
         raise PublicationBlocked("unsafe_path", "publication_cache is a symlink")
     target.mkdir(parents=True, exist_ok=True)
-    if target.resolve().parent != root:
+    if configured is None and target.resolve().parent != root:
         raise PublicationBlocked("unsafe_path", "publication cache escaped data directory")
     return target
 
@@ -112,11 +112,12 @@ def _atomic(path, data):
             temporary.unlink(missing_ok=True)
 
 
-def _store(conn, data_dir, paper_id, revision, kind, value, cache_sha=None):
+def _store(conn, data_dir, paper_id, revision, kind, value, cache_sha=None, *, paths=None):
     if conn.in_transaction:
         raise PublicationBlocked("transaction_active", "publication staging requires idle connection")
     ensure_publication_schema(conn)
-    path = _safe_dir(data_dir) / f"{hashlib.sha256(paper_id.encode()).hexdigest()}-{revision}.json"
+    publication_root = _safe_dir(data_dir, (paths or {}).get('publication_cache_dir'))
+    path = publication_root / f"{hashlib.sha256(paper_id.encode()).hexdigest()}-{revision}.json"
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
                          allow_nan=False).encode("utf-8")
     if len(encoded) > (64 * 1024 * 1024 if kind == "snapshot" else 8 * 1024 * 1024):
@@ -132,12 +133,12 @@ def _store(conn, data_dir, paper_id, revision, kind, value, cache_sha=None):
         if prior:
             if prior[1] == "published" and kind == "snapshot":
                 raise PublicationBlocked("already_published", "published point IDs cannot be replaced")
-            if _bounded_read(prior[0], Path(data_dir) / "publication_cache", 64 * 1024 * 1024) != encoded:
+            if _bounded_read(prior[0], publication_root, 64 * 1024 * 1024) != encoded:
                 raise PublicationBlocked("revision_conflict", "revision already has different artifact")
             path = Path(prior[0])
         else:
             if path.exists():
-                if _bounded_read(path, Path(data_dir) / "publication_cache", 64 * 1024 * 1024) != encoded:
+                if _bounded_read(path, publication_root, 64 * 1024 * 1024) != encoded:
                     raise PublicationBlocked("artifact_conflict", "immutable artifact path contains other data")
             else:
                 _atomic(path, encoded)
@@ -178,7 +179,7 @@ def stage_source(conn, data_dir, paper_id, source_bytes, metadata):
             "job_kind": "source", "artifact_path": path}
 
 
-def prepare_snapshot(conn, data_dir, paper_id, points, cache_path):
+def prepare_snapshot(conn, data_dir, paper_id, points, cache_path, *, paths=None):
     if conn.in_transaction:
         raise PublicationBlocked("transaction_active", "snapshot staging requires idle connection")
     row = conn.execute("SELECT status,parse_status,title,year,layers,source_url FROM papers WHERE arxiv_id=?",
@@ -190,7 +191,7 @@ def prepare_snapshot(conn, data_dir, paper_id, points, cache_path):
     if history is None or not history[0] or history[1]:
         raise PublicationBlocked("legacy_or_completed", "only genuinely new papers may be published")
     cache = Path(cache_path)
-    cache_root = Path(data_dir).resolve() / "chunk_cache"
+    cache_root = (paths or {}).get('cache_dir', Path(data_dir).resolve() / 'chunk_cache')
     cache_bytes = _bounded_read(cache, cache_root, 8 * 1024 * 1024)
     cache_hash = hashlib.sha256(cache_bytes).hexdigest()
     try:
@@ -246,7 +247,7 @@ def prepare_snapshot(conn, data_dir, paper_id, points, cache_path):
     for point in cloned:
         point.setdefault("payload", {}).update(arxiv_id=paper_id, publication_revision=revision)
     path = _store(conn, data_dir, paper_id, revision, "snapshot",
-                   {"points": cloned, "cache_path": str(cache.resolve()), "metadata": metadata}, cache_hash)
+                   {"points": cloned, "cache_path": str(cache.resolve()), "metadata": metadata}, cache_hash, paths=paths)
     state = conn.execute("SELECT state FROM paper_publications WHERE arxiv_id=? AND revision=?",
                          (paper_id, revision)).fetchone()[0]
     if state == "blocked":
@@ -258,7 +259,7 @@ def prepare_snapshot(conn, data_dir, paper_id, points, cache_path):
             "job_kind": "snapshot", "artifact_path": path}
 
 
-def publish_snapshot(conn, job, qdrant_write, fts_write, complete, preflight):
+def publish_snapshot(conn, job, qdrant_write, fts_write, complete, preflight, *, paths=None):
     if not callable(preflight):
         raise TypeError("snapshot publication requires a Qdrant preflight callback")
     if conn.in_transaction:
@@ -275,7 +276,9 @@ def publish_snapshot(conn, job, qdrant_write, fts_write, complete, preflight):
                     "AND revision<>? LIMIT 1", (job["paper_id"], job["revision"])).fetchone():
         raise PublicationBlocked("snapshot_conflict", "paper owns conflicting snapshot revisions")
     artifact_path = Path(row["artifact_path"])
-    if artifact_path.parent.name != "publication_cache" or artifact_path.parent.is_symlink():
+    publication_root = (paths or {}).get('publication_cache_dir')
+    if ((artifact_path.parent != Path(publication_root) if publication_root is not None
+         else artifact_path.parent.name != 'publication_cache') or artifact_path.parent.is_symlink()):
         raise PublicationBlocked("unsafe_path", "artifact is outside publication_cache")
     raw = _bounded_read(artifact_path, artifact_path.parent, 64 * 1024 * 1024)
     try:
@@ -312,9 +315,11 @@ def publish_snapshot(conn, job, qdrant_write, fts_write, complete, preflight):
         raise PublicationBlocked("artifact_hash_mismatch", "staged artifact integrity check failed")
     cache_path = Path(artifact["cache_path"])
     def assert_cache_current():
-        if (cache_path.parent.name != "chunk_cache" or cache_path.parent.is_symlink()
-                or cache_path.parent.parent.resolve() != artifact_path.parent.parent.resolve()
-                or hashlib.sha256(_bounded_read(cache_path, cache_path.parent.parent,
+        cache_root = (paths or {}).get('cache_dir')
+        if ((cache_path.parent != Path(cache_root) if cache_root is not None else
+             cache_path.parent.name != 'chunk_cache' or cache_path.parent.parent.resolve() != artifact_path.parent.parent.resolve())
+                or cache_path.parent.is_symlink()
+                or hashlib.sha256(_bounded_read(cache_path, cache_path.parent,
                                                 8 * 1024 * 1024)).hexdigest() != row["cache_sha256"]):
             raise PublicationBlocked("cache_hash_mismatch", "chunk cache changed after snapshot staging")
 
@@ -377,7 +382,7 @@ def publish_snapshot(conn, job, qdrant_write, fts_write, complete, preflight):
 
 
 def reconcile_publications(conn, data_dir, qdrant_write, fts_write, complete, preflight, limit=1,
-                           *, on_success=None, paper_ids=None):
+                           *, on_success=None, paper_ids=None, paths=None):
     if not callable(preflight):
         raise TypeError("publication reconciliation requires a Qdrant preflight callback")
     scope = tuple(sorted(set(paper_ids))) if paper_ids is not None else None
@@ -391,7 +396,7 @@ def reconcile_publications(conn, data_dir, qdrant_write, fts_write, complete, pr
     for row in rows:
         job = {"paper_id": row["arxiv_id"], "revision": row["revision"], "job_kind": "snapshot"}
         try:
-            published = bool(publish_snapshot(conn, job, qdrant_write, fts_write, complete, preflight))
+            published = bool(publish_snapshot(conn, job, qdrant_write, fts_write, complete, preflight, paths=paths))
         except PublicationRetry as exc:
             conn.execute("UPDATE paper_publications SET retry_after=?,error_code=? WHERE arxiv_id=? AND revision=?",
                          (__import__('time').time() + 30, exc.code, row["arxiv_id"], row["revision"]))

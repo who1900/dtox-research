@@ -166,10 +166,12 @@ def manifest_bytes(manifest):
     return json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-def publish_section_manifest(path, manifest):
+def publish_section_manifest(path, manifest, *, cache_dir=None):
     data = manifest_bytes(manifest)
     path = _plain_path(path)
-    if path.parent.name != "section_cache" or path.name != safe_id(manifest["paper_id"]) + ".json":
+    directory_matches = (path.parent.name == "section_cache" if cache_dir is None
+                         else path.parent == _plain_path(cache_dir))
+    if not directory_matches or path.name != safe_id(manifest["paper_id"]) + ".json":
         raise ManifestInvalid("manifest path does not match paper ID")
     path.parent.mkdir(parents=True, exist_ok=True)
     _plain_path(path)

@@ -39,6 +39,47 @@ class PublicationTests(unittest.TestCase):
               "payload": {"arxiv_id": "p", "chunk_index": 0, "text": "hello"}}
         return prepare_snapshot(self.conn, self.root, "p", [pt], self.cache), pt
 
+    def test_configured_migrated_storage_recovers_same_snapshot(self):
+        from pipeline import publication, document_cache
+        paths = {}
+        for name, key in [('chunk_cache', 'cache_dir'), ('section_cache', 'section_cache_dir'),
+                          ('publication_cache', 'publication_cache_dir')]:
+            link = self.root / name
+            physical = self.root / ('physical_' + name) / 'payload'
+            physical.parent.mkdir()
+            if link.exists():
+                link.rename(physical)
+            else:
+                physical.mkdir()
+            try:
+                link.symlink_to(physical, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f'directory symlinks unavailable: {exc}')
+            paths[key] = physical
+        cache = paths['cache_dir'] / self.cache.name
+        sections = [{'section_title': 'Method', 'section_type': 'method', 'text': 'hello'}]
+        manifest = document_cache.make_section_manifest('p', sections, cache.read_bytes(), b'source', 'pylatexenc', 4)
+        document_cache.publish_section_manifest(paths['section_cache_dir'] / 'p.json', manifest,
+                                               cache_dir=paths['section_cache_dir'])
+        point = {'id': str(uuid.uuid5(uuid.NAMESPACE_URL, 'p#0')), 'vector': [0.2, 0.3],
+                 'payload': {'arxiv_id': 'p', 'chunk_index': 0, 'text': 'hello'}}
+        job = prepare_snapshot(self.conn, self.root, 'p', [point], cache, paths=paths)
+        writes = []
+        with self.assertRaises(PublicationRetry):
+            publish_snapshot(self.conn, job, lambda *_: writes.append('qdrant') or True,
+                             lambda *_: False, lambda *_: True, lambda *_: True, paths=paths)
+        self.assertEqual(prepare_snapshot(self.conn, self.root, 'p', [point], cache, paths=paths), job)
+        def complete(pid, commit=False):
+            self.conn.execute("UPDATE papers SET status='done' WHERE arxiv_id=?", (pid,))
+            self.conn.execute('UPDATE completion_history SET completed=1 WHERE arxiv_id=?', (pid,))
+            return True
+        self.assertEqual(publication.reconcile_publications(self.conn, self.root,
+            lambda *_: self.fail('acknowledged Qdrant write repeated'), lambda *_: True,
+            complete, lambda *_: True, paths=paths), 1)
+        self.assertEqual(writes, ['qdrant'])
+        self.assertEqual(self.conn.execute('SELECT state FROM paper_publications').fetchone()[0], 'published')
+        self.assertEqual(json.loads((paths['section_cache_dir'] / 'p.json').read_bytes()), manifest)
+
     def test_ready_is_not_published_and_success_persists_reader_record(self):
         job, original = self.job()
         self.assertEqual(self.conn.execute("SELECT state FROM paper_publications").fetchone()[0], "ready")

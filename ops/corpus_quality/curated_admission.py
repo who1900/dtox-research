@@ -170,6 +170,13 @@ def _service(root, runtime, coarse_endpoint):
     if 'service' in sys.modules:
         raise worker.WorkerError('pipeline service must be imported after production configuration')
     service = importlib.import_module('service')
+    paths = runtime['paths']
+    service.DB_PATH = paths['state_db']
+    service.FTS_DB_PATH = str(paths['fts_db'])
+    service.FULLTEXT_DIR = paths['fulltext_cache_dir']
+    service.CHUNK_DIR = paths['cache_dir']
+    service.PUBLICATION_PATHS = paths
+    importlib.import_module('build_paper_fts').PAPER_FTS_PATH = str(paths['paper_fts_db'])
     return service
 
 

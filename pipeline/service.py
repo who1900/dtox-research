@@ -45,6 +45,8 @@ import niche_filter
 
 BASE_DIR = Path(os.getenv("DTOX_DATA_DIR", Path(__file__).resolve().parent))
 DB_PATH = BASE_DIR / "state.db"
+# Explicit physical directories supplied by a runtime with migrated storage.
+PUBLICATION_PATHS = {}
 LOCK_FILE = BASE_DIR / "service.lock"
 LOG_FILE = BASE_DIR / "pipeline.log"
 STAGE_HEARTBEAT_FILE = BASE_DIR / "stage_heartbeats.json"
@@ -3055,9 +3057,12 @@ def _write_parse_cache(arxiv_id, chunks, source_bytes, mode, canonical_sections=
             output.flush()
             os.fsync(output.fileno())
         if manifest is not None:
-            section_path = BASE_DIR / "section_cache" / path.name
+            # The configured cache directory may be a migrated storage link;
+            # retain strict validation of the final document path itself.
+            section_path = PUBLICATION_PATHS.get(
+                'section_cache_dir', BASE_DIR / "section_cache") / path.name
             section_path.parent.mkdir(exist_ok=True)
-            publish_section_manifest(section_path, manifest)
+            publish_section_manifest(section_path, manifest, cache_dir=section_path.parent)
         os.replace(temporary, path)
     finally:
         if temporary is not None:
@@ -3549,14 +3554,15 @@ def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT, *, paper_ids=None):
 
     def _publish(arxiv_id, points):
         job = prepare_snapshot(conn, BASE_DIR, arxiv_id, points,
-                               CHUNK_DIR / f"{safe_id(arxiv_id)}.json")
+                               CHUNK_DIR / f"{safe_id(arxiv_id)}.json",
+                               paths=PUBLICATION_PATHS)
         published = publish_snapshot(
             conn, job,
             lambda current, snapshot: _upsert_chunk_snapshot(session, current["paper_id"], snapshot),
             lambda current, snapshot: fts_write(snapshot, [current["paper_id"]],
                                                 _fresh_fts_ids(conn, current["paper_id"])),
             lambda paper_id, commit=False: _complete_paper(conn, paper_id, commit=commit),
-            _preflight)
+            _preflight, paths=PUBLICATION_PATHS)
         if published:
             stage_heartbeat("embed", "progress", 1)
         return published
@@ -3569,6 +3575,7 @@ def embed_step(conn, session, limit=EMBED_CYCLE_LIMIT, *, paper_ids=None):
         lambda paper_id, commit=False: _complete_paper(conn, paper_id, commit=commit),
         _preflight, limit=limit,
         on_success=lambda _job: stage_heartbeat("embed", "progress", 1),
+        paths=PUBLICATION_PATHS,
         **({"paper_ids": scope} if scope is not None else {}))
     processed += _reconcile_index_sync(conn, session, **({"paper_ids": scope} if scope is not None else {}))
     # Specs and docs first, oldest first after that: they are short, and while
