@@ -13,11 +13,18 @@ if __package__:
 else:
     from pdf_cid_unicode import invalid_scalar, repair_identity_h
 
-ADAPTER_REVISION = 'source-font-tounicode-v6'
+ADAPTER_REVISION = 'source-font-tounicode-v7'
 GLYPHLIST_SOURCE = 'https://raw.githubusercontent.com/apache/pdfbox/2.0.14/pdfbox/src/main/resources/org/apache/pdfbox/resources/glyphlist/additional.txt'
 GLYPHLIST_SHA256 = 'e70928360e577f03fa4fe354dc353a56526ef675e07790b9131acd27fd38c28f'
 MATHML_GLYPH_NAMES = {'mapsto':'\u21a6'}
 MATHML_GLYPH_SOURCE = 'https://www.w3.org/TR/1998/PR-math-19980224/chap6/MMALIAS2.html'
+# stmaryrd declares these left/right delimiters at encoding slots 0x4A/0x4B.
+# Unicode assigns mathematical white square brackets to U+27E6/U+27E7;
+# unicode-math-table.tex independently assigns those characters to lBrack/rBrack.
+STMARY_GLYPH_NAMES = {'llbracket': '\u27e6', 'rrbracket': '\u27e7'}
+STMARY_GLYPH_SOURCE = 'https://mirrors.ctan.org/macros/latex/contrib/stmaryrd/stmaryrd.dtx'
+STMARY_UNICODE_SOURCE = 'https://www.unicode.org/charts/PDF/U27C0.pdf'
+STMARY_UNICODE_TEX_SOURCE = 'https://raw.githubusercontent.com/latex3/unicode-math/master/unicode-math-table.tex'
 BBDING_REFERENCE_SHA256 = 'fd11709c57988d2b790b580e0e8d29dc026490f3b3f245468d615e517b5d4a7b'
 BBDING_REFERENCE_SOURCE = 'https://mirrors.ctan.org/fonts/niceframe/type1/bbding10.pfb'
 BBDING_SYMBOL_SOURCE = 'https://mirrors.ctan.org/fonts/bbding/bbding.pdf'
@@ -108,6 +115,7 @@ def _glyph_text(name, fontname, supplemental, *, code=None, charstring=None,
     source='adobe-glyph-list'
     if not value: value=supplemental.get(name,'');source='pdfbox-additional-glyphlist'
     if not value: value=MATHML_GLYPH_NAMES.get(name,'');source='w3c-mathml-glyph-name'
+    if not value: value=STMARY_GLYPH_NAMES.get(name,'');source='ctan-stmaryrd-unicode-delimiter'
     if not value:
         for origin,reference in OUTLINE_REFERENCES.items():
             value=_reference_text(name,code,charstring,font_matrix,reference[0])
@@ -335,6 +343,10 @@ def normalize_pdf_bytes(raw):
                         font_program_sha256=_sha(program),encoding_sha256=_sha('\n'.join(codes).encode()),
                         tounicode_before_sha256=None if created else _sha(before),tounicode_created=created,
                         mapping_reference=MATHML_GLYPH_SOURCE if origin=='w3c-mathml-glyph-name' else None)
+                    if origin=='ctan-stmaryrd-unicode-delimiter':
+                        mapping.update(mapping_reference=STMARY_UNICODE_SOURCE,
+                            symbol_reference=STMARY_GLYPH_SOURCE,
+                            tex_unicode_reference=STMARY_UNICODE_TEX_SOURCE)
                     if origin in OUTLINE_REFERENCES:
                         _,reference_sha,reference_source,symbol_source,unicode_source=OUTLINE_REFERENCES[origin]
                         mapping.update(glyph_outline_sha256=_type1_outline_sha256(charstring,font_matrix),

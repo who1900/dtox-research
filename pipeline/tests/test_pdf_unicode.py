@@ -4,12 +4,61 @@ from pipeline import pdf_unicode as adapter
 
 
 class SourceFontUnicodeTests(unittest.TestCase):
+    def test_stmary_delimiters_have_exact_direction_and_no_name_guessing(self):
+        import unicodedata
+        glyphlist=adapter._supplemental()
+        for name,code,expected in (('llbracket',74,'\u27e6'),('rrbracket',75,'\u27e7')):
+            with self.subTest(name=name):
+                text,source=adapter._glyph_text(name,'ABCDEF+stmary10',glyphlist,code=code)
+                self.assertEqual(text,expected)
+                self.assertEqual(source,'ctan-stmaryrd-unicode-delimiter')
+                self.assertEqual(unicodedata.name(text),'MATHEMATICAL '+('LEFT' if code==74 else 'RIGHT')+' WHITE SQUARE BRACKET')
+        for unknown in ('llbracketbig','llbracket.1','rrbracket.alt','LLbracket'):
+            self.assertEqual(adapter._glyph_text(unknown,'stmary10',glyphlist),(None,None))
+        # Existing trusted semantics take precedence over the new name source.
+        self.assertEqual(adapter._glyph_text('llbracket','stmary10',{'llbracket':'['}),('[','pdfbox-additional-glyphlist'))
+
     def test_trusted_math_icon_and_unknown_semantics(self):
         glyphlist=adapter._supplemental()
         self.assertEqual(adapter._glyph_text('summationtext','ABCDEF+CMEX10',glyphlist),('\u2211','pdfbox-additional-glyphlist'))
         self.assertEqual(adapter._glyph_text('envelope-open','ABCDEF+FontAwesome5Free-Regular',glyphlist),('[icon:envelope-open]','source-icon-glyphname'))
         self.assertEqual(adapter._glyph_text('unrecognizedmath','CMEX10',glyphlist),(None,None))
         self.assertEqual(adapter._glyph_text('uniE123','OtherFont',glyphlist),(None,None))
+
+    def test_stmary_fixture_repairs_source_encoding_and_preserves_existing_cmap(self):
+        class Font:
+            def parse(self):pass
+            def __getitem__(self,key):
+                codes=['.notdef']*256
+                codes[74]='llbracket';codes[75]='rrbracket';codes[76]='llbracket.1'
+                return codes
+            def getGlyphSet(self):return dict.fromkeys(('.notdef','llbracket','rrbracket','llbracket.1'))
+        class Page:
+            def get_texttrace(self):return [{'font':'stmary10','chars':[(65533,1),(65533,2),(65533,3)]}]
+            def get_fonts(self,full):return [(1,'pfa','Type1','stmary10','F1')]
+        cmap=b'1 begincodespacerange\n<00><FF>\nendcodespacerange\n1 beginbfchar\n<41><0041>\nendbfchar\nendcmap'
+        class Document:
+            def __init__(self):self.streams={2:cmap}
+            def __iter__(self):return iter([Page()])
+            def xref_get_key(self,xref,key):
+                if key=='Subtype':return 'name','/Type1'
+                if key=='ToUnicode':return 'xref','2 0 R'
+                return 'null','null'
+            def xref_stream(self,xref):return self.streams[xref]
+            def extract_font(self,xref):return 'stmary10','pfa','Type1',b'independent encoded bracket fixture'
+            def update_stream(self,xref,data):self.streams[xref]=data
+            def tobytes(self,**kwargs):return b'%PDF-derived bracket fixture'
+            def close(self):pass
+        document=Document();raw=b'%PDF-original bracket fixture'
+        with patch('fitz.open',return_value=document),patch('fontTools.t1Lib.T1Font',Font):
+            derived,proof=adapter.normalize_pdf_bytes(raw)
+        self.assertNotEqual(derived,raw)
+        self.assertIn(b'<41><0041>',document.streams[2])
+        self.assertIn(b'<4A> <27E6>',document.streams[2])
+        self.assertIn(b'<4B> <27E7>',document.streams[2])
+        self.assertEqual([m['glyph_name'] for m in proof['mappings']],['llbracket','rrbracket'])
+        self.assertTrue(all(m['symbol_reference']==adapter.STMARY_GLYPH_SOURCE for m in proof['mappings']))
+        self.assertEqual([u['glyph_name'] for u in proof['unresolved']],['llbracket.1'])
 
     def test_type1_outline_fingerprint_covers_width_and_expanded_shape(self):
         class CharString:
