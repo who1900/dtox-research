@@ -655,7 +655,8 @@ class FreshSourceTests(unittest.TestCase):
 
         for message, expected in (
                 ("not a raw TeX tar/zip archive", fresh_sources.FreshSourceError),
-                ("fresh ORIGINAL disk reserve failed", fresh_sources.FreshSourceDependencyError)):
+                ("fresh ORIGINAL disk reserve failed", fresh_sources.FreshSourceStoragePressure),
+                ("corrupt existing blob", fresh_sources.FreshSourceDependencyError)):
             class Store:
                 def __init__(self, root): pass
                 def blob_path(self, digest): return Path(tmp) / "missing-blob"
@@ -668,8 +669,75 @@ class FreshSourceTests(unittest.TestCase):
                 raw_path = Path(tmp) / "fresh-source"
                 raw_path.write_bytes(raw)
                 with patch("pipeline.originals.OriginalStore", Store):
-                    with self.assertRaises(expected):
+                    with self.assertRaises(expected) as caught:
                         fresh_sources._register_original(artifact, raw_path, root)
+                    self.assertIsInstance(caught.exception.__cause__, OriginalError)
+                    self.assertEqual(str(caught.exception.__cause__), message)
+                    if message == "corrupt existing blob":
+                        self.assertNotIsInstance(caught.exception, fresh_sources.FreshSourceStoragePressure)
+
+    def test_generic_original_reuse_requires_exact_url_and_complete_provenance(self):
+        paper_id = "oa:generic-paper"
+        source_url = "https://arxiv.org/pdf/2408.11826v1"
+        raw = b"%PDF-1.7\nknown generic source"
+        sha = hashlib.sha256(raw).hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = OriginalStore.create(Path(tmp) / "originals")
+            source = Path(tmp) / "source.pdf"
+            source.write_bytes(raw)
+            store.ingest_file(source, Provenance(
+                canonical_id=paper_id, source_url=source_url, retrieval_url=source_url,
+                original_kind="PDF", edition="sha256:" + sha,
+                retrieved_at="2026-10-14T00:00:00Z", raw_sha256=sha), max_bytes=1024)
+            row = {"paper_id": paper_id, "fresh_kind": "PDF", "fresh_url": source_url,
+                   "reuse_original": True}
+            cached = fresh_sources._cached_original(row, store.root)
+            self.assertEqual(cached[0].canonical_id, paper_id)
+            self.assertEqual(cached[0].raw_bytes, raw)
+            self.assertIsNone(fresh_sources._cached_original(
+                dict(row, fresh_url="https://arxiv.org/pdf/2408.11826v2"), store.root))
+
+    def test_alternate_arxiv_source_preserves_owner_and_checks_title(self):
+        raw = b"%PDF-1.7\nfixture"
+        url = "https://arxiv.org/pdf/2408.11826v1"
+        response = _Response(raw)
+        response.url = url
+        row = {"paper_id": "oa:owner", "source_paper_id": "2408.11826v1",
+               "source_url": url, "fresh_kind": "PDF", "fresh_version": "v1",
+               "title": "A Verified Source Title"}
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(fresh_sources, "_parse_pdf", return_value=(
+                    "A Verified Source Title\n\nSource body.", {"page_count": 1})), \
+                    patch.object(fresh_sources, "_pipeline_modules", return_value=(
+                        SimpleNamespace(build_chunks_markdown=lambda *a, **k: ([], "markdown")), None)), \
+                    patch.object(fresh_sources, "_validate_candidate_sections"), \
+                    patch.object(fresh_sources, "_register_original", return_value={
+                        "canonical_path": "original", "edition": "v1"}) as register:
+                # A prior pressure failure may already have staged the same raw
+                # source. A successful retry must remove that owned duplicate.
+                staged_raw = Path(tmp) / "originals" / hashlib.sha256(raw).hexdigest()
+                staged_raw.parent.mkdir()
+                staged_raw.write_bytes(raw)
+                result = fresh_sources.acquire_and_parse(row, Path(tmp), session=_Session(response))
+                self.assertFalse(staged_raw.exists())
+                self.assertEqual(result["canonical_id"], "oa:owner")
+                self.assertEqual(result["source_binding"]["canonical_id"], "oa:owner")
+                self.assertEqual(result["source_binding"]["source_paper_id"], "2408.11826v1")
+                self.assertEqual(register.call_args.args[0].canonical_id, "oa:owner")
+                with self.assertRaisesRegex(fresh_sources.FreshSourceError, "target title"):
+                    fresh_sources.acquire_and_parse(dict(row, title="A Different Target Title"),
+                                                    Path(tmp), session=_Session(response))
+        with self.assertRaisesRegex(fresh_sources.FreshSourceError, "exact official PDF URL"):
+            fresh_sources.acquire_and_parse(dict(row, source_paper_id="2408.11827v1"), "unused")
+
+    def test_arxiv_source_id_accepts_only_exact_official_pdf_routes(self):
+        self.assertEqual(fresh_sources.arxiv_source_id("https://arxiv.org/pdf/2408.11826v1.pdf"),
+                         "2408.11826v1")
+        self.assertEqual(fresh_sources.arxiv_source_id("https://arxiv.org/pdf/hep-th/0611328"),
+                         "hep-th/0611328")
+        for url in ("https://example.org/pdf/2408.11826", "https://arxiv.org/abs/2408.11826",
+                    "https://arxiv.org/pdf/2408.11826?x=1", "http://arxiv.org/pdf/2408.11826"):
+            self.assertIsNone(fresh_sources.arxiv_source_id(url))
 
 
 if __name__ == "__main__":

@@ -17,6 +17,34 @@ class BatchTests(unittest.TestCase):
             FreshSourceDependencyError('selected ORIGINAL CAS blob failed verification')))
         self.assertFalse(worker._unsafe_preparation_error(FreshSourceError('source request returned HTTP 404')))
 
+    def test_claim_run_preserves_prior_evidence_and_resumable_prepared(self):
+        import sqlite3
+        conn = sqlite3.connect(':memory:')
+        worker._schema(conn)
+        for paper, status in [('retry', 'deferred'), ('ready', 'prepared')]:
+            conn.execute("INSERT INTO targets(paper_id,status,reason,metrics_json,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                         (paper, status, 'prior cause', '{"source_sha":"abc"}', 'old', 'old'))
+        conn.commit()
+        worker._claim_run(conn, [dict(paper_id='retry'), dict(paper_id='ready')], {'run_id': 'new'})
+        rows = conn.execute('SELECT paper_id,status,reason,metrics_json FROM targets ORDER BY paper_id').fetchall()
+        self.assertEqual(rows, [('ready', 'prepared', 'prior cause', '{"source_sha":"abc"}'),
+                                ('retry', 'pending', 'prior cause', '{"source_sha":"abc"}')])
+        self.assertEqual(json.loads(conn.execute("SELECT value FROM meta WHERE key='active_run'").fetchone()[0]),
+                         {'run_id': 'new'})
+        conn.close()
+
+    def test_storage_pressure_classifies_only_capacity_errors(self):
+        import sqlite3
+        from ops.corpus_quality.fresh_sources import FreshSourceStoragePressure, FreshSourceDependencyError
+        full = sqlite3.OperationalError('database or disk is full')
+        full.sqlite_errorcode = sqlite3.SQLITE_FULL
+        for error in (FreshSourceStoragePressure('reserve'), OSError(worker.errno.ENOSPC, 'full'), full):
+            self.assertTrue(worker._storage_pressure(error), repr(error))
+        for error in (OSError(worker.errno.EIO, 'I/O error'), sqlite3.DatabaseError('corrupt'),
+                      sqlite3.OperationalError('database or disk is full'),
+                      FreshSourceDependencyError('ORIGINAL hash mismatch')):
+            self.assertFalse(worker._storage_pressure(error), repr(error))
+
     def test_api_startup_check_runs_as_direct_script_outside_repository(self):
         import os
         import subprocess
@@ -52,6 +80,30 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(request['declared_source_url'], state['source_url'])
         self.assertEqual(request['paper_id'], state['arxiv_id'])
         self.assertIs(request['reuse_original'], True)
+
+    def test_oa_arxiv_route_retains_target_identity_and_declared_source(self):
+        from ops.corpus_quality import fresh_sources
+        state = dict(arxiv_id='oa:W123', title='Verified title',
+                     source_url='https://arxiv.org/pdf/2401.12345')
+        with patch.object(fresh_sources, 'resolve_arxiv_version', return_value={'fresh_version': 'v2'}):
+            request = worker._fresh_request(state, fresh_sources)
+        self.assertEqual(request['paper_id'], 'oa:W123')
+        self.assertEqual(request['source_paper_id'], '2401.12345')
+        self.assertEqual(request['declared_source_url'], state['source_url'])
+        self.assertEqual(request['fresh_kind'], 'HTML')
+        self.assertEqual(request['fresh_version'], 'v2')
+
+    def test_oa_arxiv_source_route_preserves_binding_and_owner_identity(self):
+        for kind, label in [('HTML', 'arxiv-html'), ('PDF', 'arxiv-pdf')]:
+            binding = dict(original_kind=kind, source_paper_id='2401.12345',
+                           paper_id='oa:W123', title='Verified title')
+            result = dict(source_binding=binding)
+            self.assertEqual(worker._source_route(result, 'oa:W123'), ('paper_markdown', label))
+            self.assertEqual(binding['paper_id'], 'oa:W123')
+            self.assertEqual(binding['title'], 'Verified title')
+            self.assertEqual(binding['source_paper_id'], '2401.12345')
+        self.assertEqual(worker._source_route(dict(source_binding={'original_kind': 'HTML'}), 'oa:W123'),
+                         ('paper_markdown', 'source-pdf'))
 
     def test_generic_http_input_requests_tls_at_the_declared_path(self):
         state = dict(arxiv_id='oa:W123', title='A verified paper',
@@ -503,13 +555,34 @@ class ContinuousStageTests(unittest.TestCase):
                     self.assertEqual(applied, ['good'])
                     self.assertEqual(error.call_args.args[1], 'bad')
         with tempfile.TemporaryDirectory() as directory:
-            failure = Mock(side_effect=OSError(errno.ENOSPC, 'disk full'))
+            failure = Mock(side_effect=OSError(errno.EIO, 'disk I/O failure'))
             apply = Mock()
             with self.stages(Path(directory), failure, lambda *a: {}, Mock(), apply) as runtime:
                 with self.assertRaises(OSError):
                     worker._run_stages([dict(paper_id='bad')], runtime,
                                        Path(directory), Path(directory), {})
             apply.assert_not_called()
+
+    def test_storage_pressure_drains_ready_work_and_retains_pending(self):
+        from ops.corpus_quality.fresh_sources import FreshSourceStoragePressure
+        applied, acquired = [], []
+        def acquire(paper, *args):
+            acquired.append(paper)
+            if paper == 'pressure':
+                raise FreshSourceStoragePressure('ORIGINAL reserve headroom')
+            return {}, {}
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            with self.stages(base, acquire, lambda *a: {}, lambda *a, **kw: {'phase': 'prepared'},
+                             lambda plans, *a: applied.extend(p for p, _, _ in plans)) as runtime, \
+                    patch.object(worker, '_update') as update, \
+                    patch.object(worker, 'MAX_IN_FLIGHT', 2):
+                with self.assertRaises(worker.RetryableWorkerError):
+                    worker._run_stages([dict(paper_id=p) for p in ('pressure', 'good', 'unstarted')], runtime, base, base, {})
+                retained = [call for call in update.call_args_list if call.args[1:3] == ('pressure', 'pending')]
+                self.assertEqual(len(retained), 1)
+        self.assertEqual(applied, ['good'])
+        self.assertEqual(set(acquired), {'pressure', 'good'})
 
     def test_prepared_journal_survives_local_prepare_exception(self):
         from unittest.mock import Mock
@@ -872,6 +945,14 @@ class FaultPolicyTests(unittest.TestCase):
         with patch.object(worker, 'run', side_effect=worker.RetryableWorkerError('down')):
             with self.assertRaises(worker.RetryableWorkerError):
                 worker.main(['run'])
+
+    def test_full_disk_retry_does_not_depend_on_writing_a_status_marker(self):
+        for number, expected in ((worker.errno.ENOSPC, 75), (worker.errno.EIO, 78)):
+            with tempfile.TemporaryDirectory() as directory, \
+                    patch.object(worker, '_atomic_json', side_effect=OSError(number, 'write failed')), \
+                    patch.object(worker, 'run') as run:
+                self.assertEqual(worker.main(['run', '--managed', '--base', directory]), expected)
+                run.assert_not_called()
 
 
 if __name__ == '__main__':

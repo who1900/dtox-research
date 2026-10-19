@@ -7,9 +7,10 @@ complete enough to prepare for publication.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import ast
+import errno
 import gzip
 import hashlib
 import html
@@ -42,6 +43,10 @@ class FreshSourceDependencyError(FreshSourceError):
     """A shared local dependency or configured store is unavailable."""
 
 
+class FreshSourceStoragePressure(FreshSourceDependencyError):
+    """ORIGINAL registration needs temporary disk headroom before retrying."""
+
+
 _ARXIV_ID = re.compile(r"^(\d{4}\.\d{4,5})(?:v([1-9]\d*))?$")
 _LEGACY_ARXIV_ID = re.compile(
     r"^([A-Za-z][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)?/\d{7})(?:v([1-9]\d*))?$")
@@ -59,6 +64,22 @@ def _arxiv_id_parts(canonical_id):
 def is_arxiv_id(canonical_id):
     """Return whether an ID uses modern or legacy arXiv canonical syntax."""
     return _arxiv_id_parts(canonical_id) is not None
+
+
+def arxiv_source_id(source_url):
+    """Read an exact arXiv paper ID from an official PDF URL, without aliases."""
+    try:
+        parsed = _url_parts(source_url)
+    except FreshSourceError:
+        return None
+    if parsed.hostname != "arxiv.org" or parsed.port is not None or parsed.query:
+        return None
+    if not parsed.path.startswith("/pdf/"):
+        return None
+    ident = parsed.path[len("/pdf/"):]
+    if ident.endswith(".pdf"):
+        ident = ident[:-4]
+    return ident if is_arxiv_id(ident) else None
 
 
 @dataclass(frozen=True)
@@ -963,6 +984,8 @@ def _register_original(artifact, raw_path, original_store_root):
             store.ingest_file(raw_path, provenance, max_bytes=_MAX_SOURCE_BYTES)
             storage = "new_blob_and_reference"
     except OriginalError as exc:
+        if str(exc) == "fresh ORIGINAL disk reserve failed":
+            raise FreshSourceStoragePressure(str(exc)) from exc
         if (artifact.original_kind == "rawTexarchive"
                 and str(exc) == "not a raw TeX tar/zip archive"):
             raise FreshSourceError(
@@ -970,6 +993,9 @@ def _register_original(artifact, raw_path, original_store_root):
         raise FreshSourceDependencyError(
             "fresh raw source could not be registered in existing ORIGINAL store") from exc
     except (OSError, ValueError) as exc:
+        if isinstance(exc, OSError) and (exc.errno == errno.ENOSPC
+                                        or getattr(exc, "winerror", None) in (39, 112)):
+            raise FreshSourceStoragePressure("ORIGINAL registration ran out of disk space") from exc
         raise FreshSourceDependencyError("fresh raw source could not be registered in existing ORIGINAL store") from exc
     canonical_blob = store.verify_blob(artifact.raw_sha256, artifact.raw_size_bytes)
     return {"store_root": str(root), "raw_sha256": artifact.raw_sha256,
@@ -1119,9 +1145,18 @@ def acquire_and_parse(row, stage_dir, *, timeout=120, session=None, fetched_at=N
         raise FreshSourceError("row is missing canonical paper ID")
     fresh_version = row.get("fresh_version")
     fresh_url = row.get("fresh_url") or row.get("source_url")
+    source_paper_id = row.get("source_paper_id", paper_id)
+    alternate_arxiv = source_paper_id != paper_id
+    if alternate_arxiv:
+        declared_id = arxiv_source_id(row.get("declared_source_url") or row.get("source_url"))
+        if (not paper_id.startswith("oa:") or not is_arxiv_id(source_paper_id)
+                or declared_id != source_paper_id):
+            raise FreshSourceError("alternate arXiv source must match the target's exact official PDF URL")
+        if not row.get("title") or len(_normalize_title(row["title"])) < 8:
+            raise FreshSourceError("alternate arXiv source requires a usable expected title")
     if paper_id.startswith("acl:"):
         kind, edition = "PDF", paper_id
-    elif is_arxiv_id(paper_id):
+    elif is_arxiv_id(source_paper_id):
         if not fresh_version:
             raise FreshSourceError("arXiv acquisition requires an explicitly resolved fresh version")
         kind, edition = row.get("fresh_kind", "rawTexarchive"), fresh_version
@@ -1131,19 +1166,27 @@ def acquire_and_parse(row, stage_dir, *, timeout=120, session=None, fetched_at=N
             raise FreshSourceError("generic source requires a fresh HTTPS PDF URL")
         edition = fresh_version or "sha256:pending"
     fetch_started = time.perf_counter()
-    cached = _cached_original(row, original_store_root)
+    cache_row = (dict(row, fresh_url=expected_source(source_paper_id, kind, edition))
+                 if alternate_arxiv else row)
+    cached = _cached_original(cache_row, original_store_root)
     if cached is None:
-        artifact = fetch_fresh_artifact(paper_id, original_kind=kind, edition=edition,
+        artifact = fetch_fresh_artifact(source_paper_id, original_kind=kind, edition=edition,
                                         timeout=timeout, session=session, retrieved_at=fetched_at,
                                         source_url=fresh_url if not paper_id.startswith("acl:") and
-                                        not is_arxiv_id(paper_id) else None)
+                                        not is_arxiv_id(source_paper_id) else None)
         original_receipt = None
     else:
         artifact, original_receipt = cached
+        if alternate_arxiv:
+            artifact = replace(artifact, canonical_id=source_paper_id)
     fetch_seconds = time.perf_counter() - fetch_started
     parse_started = time.perf_counter()
     text, diagnostics = parse_fresh_artifact(artifact, timeout=timeout, native_build=native_build,
                                              expected_title=row.get("title"))
+    if alternate_arxiv:
+        if _normalize_title(row["title"]) not in _normalize_title(text[:12000]):
+            raise FreshSourceError("alternate arXiv source text does not contain expected target title")
+        artifact = replace(artifact, canonical_id=paper_id)
     diagnostics["original_cache_reused"] = cached is not None
     diagnostics["fetch_seconds"] = round(fetch_seconds, 6)
     diagnostics["parse_seconds"] = round(time.perf_counter() - parse_started, 6)
@@ -1155,17 +1198,19 @@ def acquire_and_parse(row, stage_dir, *, timeout=120, session=None, fetched_at=N
     source_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
     suffix = ".tex" if kind == "rawTexarchive" else ".md"
     source_path = stage / "sources" / re.sub(r"[^A-Za-z0-9._-]", "_", paper_id) / (source_hash + suffix)
-    staged_original_created = False
+    staged_original = original_receipt is None
     if original_receipt is None:
-        staged_original_created = _write_content_once(original_path, artifact.raw_bytes)
+        _write_content_once(original_path, artifact.raw_bytes)
     _write_content_once(source_path, text.encode("utf-8"))
     if original_receipt is None:
         original_receipt = _register_original(artifact, original_path, original_store_root)
-    if staged_original_created:
+    if staged_original:
         if hashlib.sha256(original_path.read_bytes()).hexdigest() != artifact.raw_sha256:
             raise FreshSourceError("candidate raw stage changed after ORIGINAL registration")
         original_path.unlink()
     binding = {key: value for key, value in asdict(artifact).items() if key != "raw_bytes"}
+    if alternate_arxiv:
+        binding["source_paper_id"] = source_paper_id
     if row.get("declared_source_url"):
         binding["declared_source_url"] = row["declared_source_url"]
     # Preserve the declared request endpoint separately from any verified redirect.

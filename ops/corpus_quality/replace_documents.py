@@ -552,6 +552,15 @@ def _fresh_request(state, fresh):
         return dict(paper_id=paper_id, fresh_kind='HTML', fresh_version=version,
                     title=resolved.get('title'), resolver_receipt=resolved)
     source_url = state.get('source_url')
+    source_id = fresh.arxiv_source_id(source_url) if paper_id.startswith('oa:') and hasattr(fresh, 'arxiv_source_id') else None
+    if source_id:
+        resolved = fresh.resolve_arxiv_version(source_id, timeout=30)
+        version = resolved.get('fresh_version')
+        if not version:
+            raise DeferredPaper('fresh_arxiv_version_unresolved')
+        return dict(paper_id=paper_id, source_paper_id=source_id, fresh_kind='HTML',
+                    fresh_version=version, declared_source_url=source_url,
+                    title=state.get('title'), resolver_receipt=resolved)
     if paper_id.startswith('pmlr:') and isinstance(source_url, str):
         from ops.corpus_quality.fresh_sources import canonical_source_url
         return dict(paper_id=paper_id, fresh_kind='PDF',
@@ -563,10 +572,10 @@ def _fresh_request(state, fresh):
         # still verifies credentials, redirect host, PDF body and expected title.
         return dict(paper_id=paper_id, fresh_kind='PDF',
                     fresh_url='https://' + source_url[len('http://'):],
-                    declared_source_url=source_url, title=state['title'])
+                    declared_source_url=source_url, title=state['title'], reuse_original=True)
     if isinstance(source_url, str) and source_url.startswith('https://') and state.get('title'):
         return dict(paper_id=paper_id, fresh_kind='PDF', fresh_url=source_url,
-                    title=state['title'])
+                    title=state['title'], reuse_original=True)
     raise DeferredPaper('unsupported_canonical_source_id')
 
 
@@ -574,12 +583,13 @@ def _source_route(result, paper_id):
     route = result.get('source_route')
     binding = result.get('source_binding') or {}
     kind = binding.get('original_kind')
+    source_id = binding.get('source_paper_id') or paper_id
     if route in ('rawtexarchive', 'latex') or kind == 'rawTexarchive':
         return 'latex', 'latex'
     if kind in ('PDF', 'HTML') or route in ('pdf', 'html'):
         return 'paper_markdown', ('acl-pdf' if paper_id.startswith('acl:') else
-                                  'arxiv-html' if kind == 'HTML' and is_arxiv_id(paper_id)
-                                  else 'arxiv-pdf' if is_arxiv_id(paper_id)
+                                  'arxiv-html' if kind == 'HTML' and is_arxiv_id(source_id)
+                                  else 'arxiv-pdf' if is_arxiv_id(source_id)
                                   else 'source-pdf')
     raise DeferredPaper('unsupported_fresh_source_route')
 
@@ -746,7 +756,7 @@ def _prepare_candidate(paper_id, result, state, runtime, base, metrics, source_r
         raise DeferredPaper('admitted_chunk_count_outside_owner_bound')
     mode, source_label = _source_route(result, paper_id)
     if (mode == 'paper_markdown' and not paper_id.startswith('acl:')
-            and not is_arxiv_id(paper_id)):
+            and not is_arxiv_id((result.get('source_binding') or {}).get('source_paper_id') or paper_id)):
         source_label = state.get('fulltext_source') or 'source-pdf'
     if state.get('fulltext_source') == 'iacr-abstract':
         source_label = 'source-pdf'
@@ -1115,7 +1125,7 @@ def _acquire_one(paper_id, state, runtime, base, queued_at=None, source_request=
     stage = Path(base) / 'source-stage' / runtime['document_cache'].safe_id(paper_id)
     kwargs = dict(timeout=120, native_build=str(NATIVE_BUILD), original_store_root=str(ORIGINAL_STORE))
     started = time.monotonic()
-    is_arxiv = is_arxiv_id(paper_id)
+    is_arxiv = is_arxiv_id(request.get('source_paper_id', paper_id))
     routes = [request]
     if is_arxiv and request.get('fresh_kind') == 'HTML':
         routes = [dict(request, fresh_kind=kind) for kind in ('HTML', 'rawTexarchive', 'PDF')]
@@ -1131,7 +1141,7 @@ def _acquire_one(paper_id, state, runtime, base, queued_at=None, source_request=
             raise
         except runtime['fresh'].FreshSourceError as exc:
             # Transport retries are exhausted by _source_attempt before route fallback.
-            route_rejections.append({'route': name, 'reason': type(exc).__name__ + ':' + str(exc)[:240]})
+            route_rejections.append({'route': name, 'reason': _error_reason(exc)})
             continue
         diagnostics = candidate_result.get('diagnostics') or {}
         source_diagnostics.append(dict(route=name,
@@ -1261,7 +1271,7 @@ def _locks(base, *, wait=False, preflight=None):
 
 def _check_storage(base):
     if shutil.disk_usage(base).free < 2 * 1024 ** 3:
-        raise WorkerError('storage_headroom: less than 2 GiB free; remaining targets retained')
+        raise RetryableWorkerError('storage_headroom: less than 2 GiB free; remaining targets retained')
 
 
 def _runtime_preflight(runtime, worker):
@@ -1271,6 +1281,14 @@ def _runtime_preflight(runtime, worker):
     if any(value not in ('inactive', 'failed') for value in states.values()):
         raise WorkerError('ingestion writer is active: ' + json.dumps(states, sort_keys=True))
 
+
+
+def _storage_pressure(exc):
+    from ops.corpus_quality.fresh_sources import FreshSourceStoragePressure
+    return (isinstance(exc, FreshSourceStoragePressure)
+            or isinstance(exc, OSError) and exc.errno == errno.ENOSPC
+            or isinstance(exc, sqlite3.Error)
+            and getattr(exc, 'sqlite_errorcode', None) == sqlite3.SQLITE_FULL)
 
 
 def _unsafe_preparation_error(exc):
@@ -1338,6 +1356,7 @@ def _run_stages(selected, runtime, base, root, rowid_floors, *, source_requests=
         raise WorkerError('stage worker counts and in-flight bound must be positive')
     records = iter(selected)
     exhausted = False
+    resource_failure = None
     # A future owns exactly one document until it reaches the serialized writer.
     pending = {}
     with ThreadPoolExecutor(max_workers=PREFETCH_WORKERS) as sources, \
@@ -1351,11 +1370,16 @@ def _run_stages(selected, runtime, base, root, rowid_floors, *, source_requests=
                     exhausted = True
                     break
                 paper_id = record['paper_id']
-                _check_storage(base)
                 path = record.get('journal_path')
                 if path and Path(path).exists() and runtime['owner']._load(path).get('phase') == 'prepared':
                     ready.append((paper_id, Path(path), json.loads(record['metrics_json'] or '{}')))
                     continue
+                try:
+                    _check_storage(base)
+                except RetryableWorkerError as exc:
+                    resource_failure = exc
+                    exhausted = True
+                    break
                 journal = _journal_path(base, paper_id, runtime['document_cache'])
                 _update(base, paper_id, 'staging', reason=None, journal_path=journal)
                 try:
@@ -1394,6 +1418,11 @@ def _run_stages(selected, runtime, base, root, rowid_floors, *, source_requests=
                         _update(base, paper_id, 'prepared', reason=None, journal_path=journal, metrics=metrics)
                         ready.append((paper_id, journal, metrics))
                     except Exception as exc:
+                        if _storage_pressure(exc) or isinstance(exc, RetryableWorkerError):
+                            resource_failure = exc
+                            exhausted = True
+                            _update(base, paper_id, 'pending', reason=_error_reason(exc), metrics=metrics)
+                            continue
                         if _unsafe_preparation_error(exc):
                             raise
                         # prepare writes only its recovery journal. Preserve a
@@ -1419,6 +1448,19 @@ def _run_stages(selected, runtime, base, root, rowid_floors, *, source_requests=
                     if current:
                         _compress_applied_journal(base, paper_id, journal, runtime,
                                                   json.loads(current[0]['metrics_json']))
+
+    if resource_failure is not None:
+        raise RetryableWorkerError('shared resource pressure; prepared work drained; pending work retained') from resource_failure
+
+
+def _claim_run(conn, selected, active_run):
+    # Queue state and run identity commit together. Keep the prior rejection and
+    # metrics until this document actually starts, including after a crash.
+    with conn:
+        conn.executemany("UPDATE targets SET status='pending',updated_at=? WHERE paper_id=? AND status='deferred'",
+                         [(utc_now(), row['paper_id']) for row in selected])
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('active_run',?)",
+                     (json.dumps(active_run, separators=(',', ':')),))
 
 
 def run(base=BASE, root=ROOT, *, papers=None, limit=None, retry_deferred=False,
@@ -1467,9 +1509,7 @@ def run(base=BASE, root=ROOT, *, papers=None, limit=None, retry_deferred=False,
                     totals[key] += value
         conn = _connect(db_path(base))
         try:
-            with conn:
-                conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('active_run',?)",
-                             (json.dumps(active_run, separators=(',', ':')),))
+            _claim_run(conn, selected, active_run)
         finally:
             conn.close()
         write_status(base)
@@ -1582,13 +1622,15 @@ def main(argv=None):
                           failed_documents=counts.get('failed', 0),
                           whole_corpus_quality_complete=False)
             except Exception as exc:
-                retryable = (isinstance(exc, (RetryableWorkerError, MemoryError))
+                retryable = (isinstance(exc, (RetryableWorkerError, MemoryError)) or _storage_pressure(exc)
                              or isinstance(exc, OSError) and exc.errno in (errno.EMFILE, errno.ENFILE))
                 try:
                     lifecycle('bulk_interrupted', 'retry_wait' if retryable else 'needs_attention',
-                              type(exc).__name__ + ':' + str(exc)[:300])
-                except OSError:
-                    retryable = False  # A durable lifecycle write failure needs operator attention.
+                              _error_reason(exc))
+                except OSError as status_error:
+                    # A full disk can also prevent the retry marker itself.
+                    # Preserve retryability only for that proven capacity fault.
+                    retryable = retryable and _storage_pressure(status_error)
                 print(json.dumps(dict(error=type(exc).__name__, retryable=retryable)), file=sys.stderr)
                 return 75 if retryable else 78
         else:
