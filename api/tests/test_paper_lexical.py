@@ -240,6 +240,9 @@ class PaperBm25Tests(unittest.TestCase):
         main._ro_conn_local.conns = {}
         self.patcher = patch.object(main, "PAPER_FTS_PATH", self.out_path)
         self.patcher.start()
+        self.state_patcher = patch.object(main, "STATE_DB_PATH", self.state_path)
+        self.state_patcher.start()
+        self.addCleanup(self.state_patcher.stop)
 
     def tearDown(self):
         self.patcher.stop()
@@ -268,6 +271,12 @@ class RunSearchPaperLexicalOffTests(unittest.TestCase):
     def setUp(self):
         main.qdrant_result_cache.data.clear()
         main.search_cache.data.clear()
+        state = sqlite3.connect(":memory:", check_same_thread=False)
+        state.execute("CREATE TABLE papers(arxiv_id TEXT PRIMARY KEY,status TEXT)")
+        self.addCleanup(state.close)
+        state_patch = patch.object(main, "_ro_conn", return_value=state)
+        state_patch.start()
+        self.addCleanup(state_patch.stop)
 
     def _dense_hit(self):
         return {"score": 0.9,
@@ -297,6 +306,12 @@ class RunSearchPaperLexicalOnTests(unittest.TestCase):
     def setUp(self):
         main.qdrant_result_cache.data.clear()
         main.search_cache.data.clear()
+        state = sqlite3.connect(":memory:", check_same_thread=False)
+        state.execute("CREATE TABLE papers(arxiv_id TEXT PRIMARY KEY,status TEXT)")
+        self.addCleanup(state.close)
+        state_patch = patch.object(main, "_ro_conn", return_value=state)
+        state_patch.start()
+        self.addCleanup(state_patch.stop)
 
     def _dense_hit(self, arxiv_id="1234.5678", score=0.9):
         return {"score": score, "payload": {"arxiv_id": arxiv_id, "title": "Dense Hit",
@@ -424,6 +439,12 @@ class HierPaperLexicalShortlistTests(unittest.TestCase):
     def setUp(self):
         main.qdrant_result_cache.data.clear()
         main.search_cache.data.clear()
+        state = sqlite3.connect(":memory:", check_same_thread=False)
+        state.execute("CREATE TABLE papers(arxiv_id TEXT PRIMARY KEY,status TEXT)")
+        self.addCleanup(state.close)
+        state_patch = patch.object(main, "_ro_conn", return_value=state)
+        state_patch.start()
+        self.addCleanup(state_patch.stop)
         self.vector = [0.1, 0.2, 0.3]
         for name, value in (("HIER_SEARCH", True), ("PAPER_LEXICAL", True),
                            ("HIER_GLOBAL_GRACE", 0.2)):

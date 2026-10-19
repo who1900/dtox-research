@@ -1149,7 +1149,15 @@ def acquire_and_parse(row, stage_dir, *, timeout=120, session=None, fetched_at=N
     alternate_arxiv = source_paper_id != paper_id
     if alternate_arxiv:
         declared_id = arxiv_source_id(row.get("declared_source_url") or row.get("source_url"))
-        if (not paper_id.startswith("oa:") or not is_arxiv_id(source_paper_id)
+        allowed_owner = paper_id.startswith("oa:")
+        if paper_id.startswith("wp:"):
+            from pipeline.whitepapers import WHITEPAPERS
+            manifest_id = next((arxiv_source_id(url) for slug, _, _, url in WHITEPAPERS
+                                if paper_id == "wp:" + slug), None)
+            allowed_owner = bool(manifest_id and is_arxiv_id(source_paper_id)
+                                 and re.sub(r"v\d+$", "", source_paper_id)
+                                 == re.sub(r"v\d+$", "", manifest_id))
+        if (not allowed_owner or not is_arxiv_id(source_paper_id)
                 or declared_id != source_paper_id):
             raise FreshSourceError("alternate arXiv source must match the target's exact official PDF URL")
         if not row.get("title") or len(_normalize_title(row["title"])) < 8:

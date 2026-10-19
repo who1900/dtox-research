@@ -730,6 +730,26 @@ class FreshSourceTests(unittest.TestCase):
         with self.assertRaisesRegex(fresh_sources.FreshSourceError, "exact official PDF URL"):
             fresh_sources.acquire_and_parse(dict(row, source_paper_id="2408.11827v1"), "unused")
 
+    def test_whitepaper_arxiv_owner_requires_manifest_identity_and_declared_url(self):
+        row = dict(paper_id='wp:celestia', source_paper_id='1905.09274',
+                   declared_source_url='https://arxiv.org/pdf/1905.09274',
+                   fresh_kind='HTML', fresh_version='v3', title='Verified source title')
+        # Stop at the acquisition boundary: this tests admission without network,
+        # models, or ORIGINAL writes. The shared acquisition path is tested above.
+        with patch.object(fresh_sources, '_cached_original', side_effect=RuntimeError('admitted')):
+            with self.assertRaisesRegex(RuntimeError, 'admitted'):
+                fresh_sources.acquire_and_parse(row, 'unused')
+        for changes in (dict(paper_id='wp:bitcoin'), dict(paper_id='wp:unknown'),
+                        dict(source_paper_id='1904.05234'),
+                        dict(declared_source_url='https://arxiv.org/pdf/1904.05234')):
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(fresh_sources.FreshSourceError, 'exact official PDF URL'):
+                    fresh_sources.acquire_and_parse(dict(row, **changes), 'unused')
+        with self.assertRaisesRegex(fresh_sources.FreshSourceError, 'usable expected title'):
+            fresh_sources.acquire_and_parse(dict(row, title=''), 'unused')
+        with self.assertRaisesRegex(fresh_sources.FreshSourceError, 'explicitly resolved fresh version'):
+            fresh_sources.acquire_and_parse(dict(row, fresh_version=None), 'unused')
+
     def test_arxiv_source_id_accepts_only_exact_official_pdf_routes(self):
         self.assertEqual(fresh_sources.arxiv_source_id("https://arxiv.org/pdf/2408.11826v1.pdf"),
                          "2408.11826v1")

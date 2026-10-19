@@ -400,8 +400,11 @@ def _bm25_candidates(query, layer=None, section_type=None, element_type=None,
             return []
     except sqlite3.Error:
         return []
+    excluded = _excluded_paper_ids(row[0] for row in rows)
     seen, out = set(), []
     for arxiv_id, _rank in rows:
+        if arxiv_id in excluded:
+            continue
         if arxiv_id and arxiv_id not in seen:
             seen.add(arxiv_id)
             out.append(arxiv_id)
@@ -500,7 +503,7 @@ def _paper_bm25(query, layer=None, year_from=None, year_to=None, limit=PAPER_BM2
         if time.monotonic() >= deadline:
             raise FuturesTimeoutError()
         return []
-    ids = [row[0] for row in rows if row[0]]
+    ids = _visible_paper_ids(row[0] for row in rows if row[0])
     if not source_balance:
         return ids[:limit]
     whitepapers = [pid for pid in ids if pid.startswith("wp:")][:2]
@@ -741,13 +744,55 @@ def prime_qdrant_searches(texts, layer, limit=80):
         return
 
 
+def _excluded_paper_ids(paper_ids):
+    """Read explicit exclusions by primary key; missing legacy records stay visible."""
+    ids = list(dict.fromkeys(pid for pid in paper_ids if isinstance(pid, str) and pid))
+    excluded = set()
+    if not ids:
+        return excluded
+    try:
+        conn = _ro_conn(STATE_DB_PATH)
+        for start in range(0, len(ids), 500):
+            part = ids[start:start + 500]
+            rows = conn.execute(
+                "SELECT arxiv_id FROM papers WHERE status='excluded' AND arxiv_id IN ("
+                + ",".join("?" * len(part)) + ")", part).fetchall()
+            excluded.update(row[0] for row in rows)
+    except (sqlite3.Error, OSError) as error:
+        raise HTTPException(status_code=503, detail="corpus visibility unavailable") from error
+    return excluded
+
+
+def _visible_paper_ids(paper_ids):
+    ids = list(paper_ids)
+    excluded = _excluded_paper_ids(ids)
+    return [pid for pid in ids if pid not in excluded]
+
+
+def _filter_cached_search(payload):
+    payload = copy.deepcopy(payload)
+    fields = ("results", "source_candidates")
+    excluded = _excluded_paper_ids(
+        row.get("arxiv_id") or row.get("id")
+        for field in fields for row in payload.get(field, []) or [])
+    for field in fields:
+        if isinstance(payload.get(field), list):
+            payload[field] = [row for row in payload[field]
+                              if (row.get("arxiv_id") or row.get("id")) not in excluded]
+    if "count" in payload and isinstance(payload.get("results"), list):
+        payload["count"] = len(payload["results"])
+    return payload
+
+
 def _filter_publication_points(points):
     """Hide revision-tagged points until their exact snapshot is published.
 
-    Unmarked points predate publication journaling and intentionally remain
-    visible without opening state.db. Journal lookups are exact-pair bounded.
+    Legacy points remain visible unless explicitly excluded in corpus state.
+    Status lookups are primary-key bounded; journal lookups are exact-pair bounded.
     """
     points = list(points or [])
+    excluded = _excluded_paper_ids((point.get("payload") or {}).get("arxiv_id") for point in points)
+    points = [point for point in points if (point.get("payload") or {}).get("arxiv_id") not in excluded]
     marked = []
     for point in points:
         payload = point.get("payload") or {}
@@ -1842,7 +1887,10 @@ def _lexical_fallback_results(query, paper_ids, limit):
     validate_project. They keep exact identifiers and protocol terms visible
     when dense retrieval is temporarily unavailable.
     """
-    ids = list(dict.fromkeys(pid for pid in paper_ids if pid))[:limit]
+    try:
+        ids = _visible_paper_ids(dict.fromkeys(pid for pid in paper_ids if pid))[:limit]
+    except HTTPException:
+        return []
     if not ids:
         return []
     match = _fts_query(query)
@@ -2832,7 +2880,7 @@ def _run_source_search(body, query, terms, unknown_terms, x_api_key, dense_timeo
         if cached is not None:
             cached = copy.deepcopy(cached)
             cached["source_generation"] = payload["source_generation"]
-            return cached
+            return _filter_cached_search(cached)
         must = _source_chunk_must({"layer": body.layer, "section_type": body.section_type,
                                   "element_type": body.element_type, "terms": terms,
                                   "year_from": body.year_from, "year_to": body.year_to})
@@ -3100,7 +3148,7 @@ def _run_search(body: SearchBody, x_api_key=None,
         cache_key += ("defer_hydration",)
     cached = search_cache.get(cache_key)
     if cached is not None:
-        return cached
+        return _filter_cached_search(cached)
 
     must = []
     if body.layer:
@@ -3695,6 +3743,8 @@ def paper_spec(
                                or isinstance(cursor, str) and (not cursor or len(cursor) > 1024)):
         raise HTTPException(status_code=400, detail="invalid continuation cursor")
 
+    if _excluded_paper_ids([arxiv_id]):
+        raise HTTPException(status_code=404, detail="paper not found")
     wanted = SPEC_ELEMENT_TYPES
     if target_elements:
         wanted = tuple(t.strip().lower() for t in target_elements.split(",") if t.strip())
@@ -6979,6 +7029,8 @@ def _paper_rows(paper_ids):
 
 
 def _hydrate_evidence(results, rows=None):
+    excluded = _excluded_paper_ids(row.get("arxiv_id") or row.get("id") for row in results)
+    results = [row for row in results if (row.get("arxiv_id") or row.get("id")) not in excluded]
     if rows is None:
         rows = _evidence_rows([r.get("arxiv_id") or r.get("id") for r in results])
     if any(row.get("metadata_authority") == "frozen_source_catalog" for row in results):
@@ -7562,9 +7614,11 @@ def similar_papers(paper_id: str, limit: int = 10, layer: Optional[str] = None,
     auth_and_limit(x_api_key)
     _check_layer(layer)
     limit = max(1, min(limit, 30))
+    if _excluded_paper_ids([paper_id]):
+        raise HTTPException(status_code=404, detail="paper not found")
     head = canonical_id(paper_id)
     point = None
-    for cand in dict.fromkeys([paper_id, head, *_twins()["members"].get(head, [])]):
+    for cand in _visible_paper_ids(dict.fromkeys([paper_id, head, *_twins()["members"].get(head, [])])):
         point = _coarse_point_id(cand)
         if point is not None:
             break
@@ -7648,6 +7702,8 @@ def paper_section(paper_id: str, title: Optional[str] = None, section_type: Opti
     section by its exact title from /v1/paper/{id}, or by section_type
     (method, experiments, limitations, ...) for every section of that kind."""
     auth_and_limit(x_api_key)
+    if _excluded_paper_ids([paper_id]):
+        raise HTTPException(status_code=404, detail="paper not found")
     if not title and not section_type:
         raise HTTPException(status_code=400, detail="pass title or section_type")
     max_chars = max(500, min(max_chars, 20000))
@@ -7704,6 +7760,8 @@ def paper_card(paper_id: str, x_api_key: Optional[str] = Header(default=None)):
     neighbours inside the corpus (what it cites, what cites it), most cited
     first. The entry point for reading a paper or walking to related work."""
     auth_and_limit(x_api_key)
+    if _excluded_paper_ids([paper_id]):
+        raise HTTPException(status_code=404, detail="paper not found")
     rows = _paper_rows([paper_id])
     if paper_id not in rows:
         head = canonical_id(paper_id)

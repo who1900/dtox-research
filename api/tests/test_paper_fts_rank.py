@@ -9,6 +9,7 @@ class PaperFtsRankTests(unittest.TestCase):
     def setUp(self):
         self.conn = sqlite3.connect(":memory:")
         self.addCleanup(self.conn.close)
+        self.conn.execute("CREATE TABLE papers(arxiv_id TEXT PRIMARY KEY,status TEXT)")
         try:
             self.conn.execute(
                 "CREATE VIRTUAL TABLE papers_fts USING fts5("

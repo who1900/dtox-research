@@ -1,3 +1,4 @@
+import sqlite3
 import unittest
 from unittest.mock import patch, MagicMock
 
@@ -63,6 +64,12 @@ class TwoPhaseSearchTests(unittest.TestCase):
         # avoid stale cross-test hits in the module-level TTL caches
         main.qdrant_result_cache.data.clear()
         main.search_cache.data.clear()
+        self.state = sqlite3.connect(":memory:", check_same_thread=False)
+        self.state.execute("CREATE TABLE papers(arxiv_id TEXT PRIMARY KEY,status TEXT)")
+        self.addCleanup(self.state.close)
+        state_patch = patch.object(main, "_ro_conn", return_value=self.state)
+        state_patch.start()
+        self.addCleanup(state_patch.stop)
         self.vector = [0.1, 0.2, 0.3]
         patcher = patch.object(main, "embed_query", return_value=self.vector)
         patcher.start()

@@ -11,6 +11,86 @@ from ops.corpus_quality import replace_documents as worker
 
 
 class BatchTests(unittest.TestCase):
+    def test_scope_filter_omits_only_explicit_exclusions_without_changing_ledger(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            conn = sqlite3.connect(base / 'state.db')
+            conn.execute('CREATE TABLE papers(arxiv_id TEXT PRIMARY KEY, status TEXT)')
+            conn.executemany('INSERT INTO papers VALUES (?,?)',
+                             [('excluded', 'excluded'), ('done', 'done'), ('other', 'rejected')])
+            conn.commit()
+            conn.close()
+            selected = [dict(paper_id=pid, status='prepared', reason='prior evidence')
+                        for pid in ('excluded', 'done', 'other', 'missing')]
+            result = worker._in_scope_targets(selected, base)
+            self.assertEqual([row['paper_id'] for row in result], ['done', 'other', 'missing'])
+            self.assertEqual(len(selected), 4)
+            self.assertEqual(selected[0]['reason'], 'prior evidence')
+            # A prepared journal must not enter the publication fast path.
+            with patch.object(worker, '_journal_path', side_effect=AssertionError('staged excluded')), \
+                    patch.object(worker, '_apply_batch', side_effect=AssertionError('published excluded')):
+                worker._run_stages(selected[:1], {}, base, base, {})
+
+    def test_delayed_transport_retry_preserves_excluded_rows_and_receipts(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            conn = sqlite3.connect(base / 'state.db')
+            conn.execute('CREATE TABLE papers(arxiv_id TEXT PRIMARY KEY, status TEXT)')
+            conn.executemany('INSERT INTO papers VALUES (?,?)',
+                             [('excluded-pending', 'excluded'), ('excluded', 'excluded'), ('retry', 'done')])
+            conn.commit()
+            conn.close()
+            conn = worker._connect(worker.db_path(base))
+            worker._schema(conn)
+            for pid, status in [('excluded-pending', 'pending'), ('excluded', 'deferred'), ('retry', 'deferred')]:
+                conn.execute("INSERT INTO targets(paper_id,status,reason,metrics_json,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                             (pid, status, 'HTTPError:HTTP Error 503:down', '{"prior_receipt":"kept"}', 'old', 'old'))
+            conn.commit()
+            before = conn.execute("SELECT * FROM targets WHERE paper_id LIKE 'excluded%' ORDER BY paper_id").fetchall()
+            conn.close()
+            with patch.object(worker, 'write_status'):
+                self.assertEqual(worker._transport_retry_targets(base, base), ['retry'])
+            conn = worker._connect(worker.db_path(base))
+            after = conn.execute("SELECT * FROM targets WHERE paper_id LIKE 'excluded%' ORDER BY paper_id").fetchall()
+            self.assertEqual(before, after)
+            self.assertEqual(conn.execute('SELECT count(*) FROM targets').fetchone()[0], 3)
+            conn.close()
+
+    def test_run_retry_deferred_filters_excluded_before_limit_and_claim(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            conn = sqlite3.connect(base / 'state.db')
+            conn.execute('CREATE TABLE papers(arxiv_id TEXT PRIMARY KEY, status TEXT)')
+            rows = [('a-pending', 'pending'), ('b-prepared', 'prepared'),
+                    ('c-deferred', 'deferred'), ('z-keep', 'pending')]
+            conn.executemany('INSERT INTO papers VALUES (?,?)',
+                             [(pid, 'done' if pid == 'z-keep' else 'excluded') for pid, _ in rows])
+            conn.commit()
+            conn.close()
+            conn = worker._connect(worker.db_path(base))
+            worker._schema(conn)
+            conn.executemany("INSERT INTO targets(paper_id,status,reason,created_at,updated_at) VALUES(?,?,'prior','old','old')", rows)
+            conn.commit()
+            before = conn.execute("SELECT * FROM targets WHERE paper_id != 'z-keep' ORDER BY paper_id").fetchall()
+            conn.close()
+            runtime = dict(worker=object(), owner=object(), client=object(),
+                           paths={'cache_dir': base}, document_cache=object())
+            with patch.object(worker, '_locks', return_value=contextlib.nullcontext()), \
+                    patch.object(worker, '_load_runtime', return_value=runtime), \
+                    patch.object(worker, '_runtime_preflight'), patch.object(worker, 'recover_journals'), \
+                    patch.object(worker, '_rowid_floors', return_value={}), \
+                    patch.object(worker, '_order_preparation', side_effect=lambda selected, *args: selected), \
+                    patch.object(worker, 'write_status', return_value={}), \
+                    patch.object(worker, '_run_stages') as stages:
+                worker.run(base, base, retry_deferred=True, limit=1)
+            self.assertEqual([row['paper_id'] for row in stages.call_args.args[0]], ['z-keep'])
+            conn = worker._connect(worker.db_path(base))
+            self.assertEqual(conn.execute("SELECT * FROM targets WHERE paper_id != 'z-keep' ORDER BY paper_id").fetchall(), before)
+            conn.close()
+
     def test_original_store_integrity_fault_is_not_a_document_deferral(self):
         from ops.corpus_quality.fresh_sources import FreshSourceDependencyError, FreshSourceError
         self.assertTrue(worker._unsafe_preparation_error(
@@ -92,6 +172,44 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(request['declared_source_url'], state['source_url'])
         self.assertEqual(request['fresh_kind'], 'HTML')
         self.assertEqual(request['fresh_version'], 'v2')
+
+    def test_whitepaper_without_state_url_uses_ingestion_manifest(self):
+        from pipeline.whitepapers import WHITEPAPERS
+        for slug in ('bitcoin', 'zerocash', 'uniswap-v4'):
+            _, title, _, url = next(item for item in WHITEPAPERS if item[0] == slug)
+            with self.subTest(slug=slug):
+                request = worker._fresh_request(
+                    dict(arxiv_id='wp:' + slug, title=title, source_url=None), object())
+                self.assertEqual(request['paper_id'], 'wp:' + slug)
+                self.assertEqual(request['title'], title)
+                self.assertEqual(request['fresh_url'], url.replace('http://', 'https://', 1))
+                self.assertIs(request['reuse_original'], True)
+
+    def test_unknown_whitepaper_without_source_is_deferred(self):
+        with self.assertRaisesRegex(worker.DeferredPaper, 'unsupported_canonical_whitepaper_id'):
+            worker._fresh_request(dict(arxiv_id='wp:unknown', title='Unknown'), object())
+
+    def test_whitepaper_explicit_source_is_preserved(self):
+        url = 'https://publisher.example/verified-edition.pdf'
+        request = worker._fresh_request(dict(arxiv_id='wp:bitcoin', title='Verified title',
+                                             source_url=url), object())
+        self.assertEqual(request['fresh_url'], url)
+        self.assertEqual(request['title'], 'Verified title')
+
+    def test_whitepaper_arxiv_route_uses_exact_resolved_edition(self):
+        from ops.corpus_quality import fresh_sources
+        from pipeline.whitepapers import WHITEPAPERS
+        _, title, _, url = next(item for item in WHITEPAPERS if item[0] == 'celestia')
+        with patch.object(fresh_sources, 'resolve_arxiv_version',
+                          return_value={'fresh_version': 'v3'}) as resolve:
+            request = worker._fresh_request(
+                dict(arxiv_id='wp:celestia', title=title, source_url=None), fresh_sources)
+        resolve.assert_called_once_with('1905.09274', timeout=30)
+        self.assertEqual(request['paper_id'], 'wp:celestia')
+        self.assertEqual(request['source_paper_id'], '1905.09274')
+        self.assertEqual(request['declared_source_url'], url)
+        self.assertEqual(request['fresh_kind'], 'HTML')
+        self.assertEqual(request['fresh_version'], 'v3')
 
     def test_oa_arxiv_source_route_preserves_binding_and_owner_identity(self):
         for kind, label in [('HTML', 'arxiv-html'), ('PDF', 'arxiv-pdf')]:

@@ -552,7 +552,15 @@ def _fresh_request(state, fresh):
         return dict(paper_id=paper_id, fresh_kind='HTML', fresh_version=version,
                     title=resolved.get('title'), resolver_receipt=resolved)
     source_url = state.get('source_url')
-    source_id = fresh.arxiv_source_id(source_url) if paper_id.startswith('oa:') and hasattr(fresh, 'arxiv_source_id') else None
+    if paper_id.startswith('wp:') and not source_url:
+        # Ingestion's curated manifest owns these IDs; older state rows did not
+        # persist its source URL. Importing the manifest does not load service.
+        from pipeline.whitepapers import WHITEPAPERS
+        source_url = next((url for slug, _, _, url in WHITEPAPERS
+                           if paper_id == 'wp:' + slug), None)
+        if source_url is None:
+            raise DeferredPaper('unsupported_canonical_whitepaper_id')
+    source_id = fresh.arxiv_source_id(source_url) if paper_id.startswith(('oa:', 'wp:')) and hasattr(fresh, 'arxiv_source_id') else None
     if source_id:
         resolved = fresh.resolve_arxiv_version(source_id, timeout=30)
         version = resolved.get('fresh_version')
@@ -1344,6 +1352,24 @@ def _submit_preparation(sources, candidates, paper_id, state, runtime, base, met
     return completed
 
 
+def _in_scope_targets(selected, root):
+    """Leave the frozen ledger intact; omit only explicitly excluded live IDs."""
+    state_db = Path(root) / 'state.db'
+    if not selected or not state_db.exists():
+        return selected
+    excluded = set()
+    conn = _connect(state_db, readonly=True)
+    try:
+        for offset in range(0, len(selected), 500):
+            ids = [row['paper_id'] for row in selected[offset:offset + 500]]
+            placeholders = ','.join('?' for _ in ids)
+            excluded.update(row[0] for row in conn.execute(
+                f"SELECT arxiv_id FROM papers WHERE status='excluded' AND arxiv_id IN ({placeholders})", ids))
+    finally:
+        conn.close()
+    return [row for row in selected if row['paper_id'] not in excluded]
+
+
 def _run_stages(selected, runtime, base, root, rowid_floors, *, source_requests=None,
                 gate_base=None):
     """Bounded independent source/embedding stages feed one publication owner.
@@ -1354,7 +1380,7 @@ def _run_stages(selected, runtime, base, root, rowid_floors, *, source_requests=
     """
     if min(PREFETCH_WORKERS, CANDIDATE_WORKERS, MAX_IN_FLIGHT) < 1:
         raise WorkerError('stage worker counts and in-flight bound must be positive')
-    records = iter(selected)
+    records = iter(_in_scope_targets(selected, root))
     exhausted = False
     resource_failure = None
     # A future owns exactly one document until it reaches the serialized writer.
@@ -1489,7 +1515,9 @@ def run(base=BASE, root=ROOT, *, papers=None, limit=None, retry_deferred=False,
             if record.get('journal_path') and Path(record['journal_path']).exists():
                 _advance_rowid_floors(rowid_floors, runtime['owner']._load(record['journal_path']))
         statuses = ('pending','prepared','staging') + (('deferred',) if retry_deferred else ())
-        selected = _get_targets(base, statuses, papers=papers or None, limit=limit)
+        selected = _in_scope_targets(_get_targets(base, statuses, papers=papers or None), root)
+        if limit is not None:
+            selected = selected[:limit]
         if papers and not selected:
             unknown = [p for p in papers if not _get_targets(base, ('pending','prepared','staging','deferred','applied','failed'), [p])]
             if unknown:
@@ -1541,13 +1569,13 @@ def run(base=BASE, root=ROOT, *, papers=None, limit=None, retry_deferred=False,
         return write_status(base, run_status)
 
 
-def _transport_retry_targets(base):
+def _transport_retry_targets(base, root=ROOT):
     # One extra managed pass after ordinary work drains; retain this allowance
     # in the existing durable ledger across restarts and metric replacement.
-    if _get_targets(base, ('pending', 'staging', 'prepared')):
+    if _in_scope_targets(_get_targets(base, ('pending', 'staging', 'prepared')), root):
         return []
     selected = []
-    for row in _get_targets(base, ('deferred',)):
+    for row in _in_scope_targets(_get_targets(base, ('deferred',)), root):
         metrics = json.loads(row['metrics_json'] or '{}')
         reason = row.get('reason') or ''
         transport = ('source_transport_retries_exhausted:' in reason
@@ -1608,7 +1636,7 @@ def main(argv=None):
                              wait_for_lock=args.wait_for_lock)
                 # Explicit bounded subsets and manual retry selections keep their scope.
                 if not args.paper and args.limit is None and not args.retry_deferred:
-                    retry_ids = _transport_retry_targets(args.base)
+                    retry_ids = _transport_retry_targets(args.base, args.root)
                     if retry_ids:
                         lifecycle('bulk_running', 'retry_wait', 'source_transport_delayed_pass',
                                   retry_documents=len(retry_ids))

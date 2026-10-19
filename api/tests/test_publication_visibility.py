@@ -1,5 +1,6 @@
 """Publication visibility gate tests use only temporary, read-only state DBs."""
 import sqlite3
+from contextlib import closing
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,7 @@ class PublicationVisibilityTests(unittest.TestCase):
         self.db = str(Path(temp.name) / "state.db")
         self.fts_db = None
         conn = sqlite3.connect(self.db)
+        conn.execute("CREATE TABLE papers(arxiv_id TEXT PRIMARY KEY, status TEXT)")
         conn.execute("CREATE TABLE paper_publications(arxiv_id TEXT, revision TEXT, kind TEXT, state TEXT, retry_after REAL, "
                      "PRIMARY KEY(arxiv_id,revision))")
         conn.execute("CREATE INDEX idx_publications_kind_state_retry "
@@ -66,16 +68,86 @@ class PublicationVisibilityTests(unittest.TestCase):
         self.assertEqual([p["payload"]["publication_revision"]
                           for p in main._filter_publication_points(points)], ["right"])
 
-    def test_legacy_points_do_not_open_database(self):
-        with patch.object(main, "_ro_conn", side_effect=AssertionError("unexpected DB call")) as read_db:
-            points = [self.point("legacy-a"), self.point("legacy-b")]
-            self.assertEqual(main._filter_publication_points(points), points)
-        read_db.assert_not_called()
+    def test_legacy_unknown_records_stay_visible(self):
+        points = [self.point("legacy-a"), self.point("legacy-b")]
+        self.assertEqual(main._filter_publication_points(points), points)
 
-    def test_unavailable_database_hides_marked_but_keeps_legacy(self):
+    def test_unavailable_database_blocks_visibility(self):
         points = [self.point("legacy"), self.point("new", "pending")]
         with patch.object(main, "_ro_conn", side_effect=sqlite3.OperationalError("offline")):
-            self.assertEqual(main._filter_publication_points(points), [points[0]])
+            with self.assertRaises(main.HTTPException) as caught:
+                main._filter_publication_points(points)
+        self.assertEqual(caught.exception.status_code, 503)
+
+    def test_excluded_legacy_and_published_snapshots_hidden(self):
+        self.publish("excluded", "r1")
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("INSERT INTO papers VALUES ('excluded','excluded')")
+            conn.commit()
+        points = [self.point("excluded"), self.point("excluded", "r1"), self.point("unknown")]
+        self.assertEqual(main._filter_publication_points(points), [points[-1]])
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("UPDATE papers SET status='done' WHERE arxiv_id='excluded'")
+            conn.commit()
+        self.assertEqual(main._filter_publication_points(points), points)
+
+    def test_excluded_direct_read_rejected_before_vector_or_alias_lookup(self):
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("INSERT INTO papers VALUES ('excluded','excluded')")
+            conn.commit()
+        with patch.object(main, "auth_and_limit"), patch.object(main, "qdrant_scroll_by_arxiv") as scroll:
+            for call in (lambda: main.paper_spec("excluded"),
+                         lambda: main.paper_card("excluded"),
+                         lambda: main.paper_section("excluded", title="Methods"),
+                         lambda: main.similar_papers("excluded")):
+                with self.assertRaises(main.HTTPException) as caught:
+                    call()
+                self.assertEqual(caught.exception.status_code, 404)
+            scroll.assert_not_called()
+
+    def test_cached_result_exclusion_rechecked_without_mutating_cache(self):
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("INSERT INTO papers VALUES ('excluded','excluded')")
+            conn.commit()
+        payload = {"count": 2, "results": [{"arxiv_id": "excluded"}, {"arxiv_id": "unknown"}],
+                   "source_candidates": [{"arxiv_id": "excluded"}]}
+        filtered = main._filter_cached_search(payload)
+        self.assertEqual(filtered["results"], [{"arxiv_id": "unknown"}])
+        self.assertEqual(filtered["source_candidates"], [])
+        self.assertEqual(filtered["count"], 1)
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(len(payload["results"]), 2)
+
+    def test_derived_evidence_hydration_drops_excluded_catalog_metadata(self):
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("INSERT INTO papers VALUES ('excluded','excluded')")
+            conn.commit()
+        results = [{"arxiv_id": "excluded", "metadata_authority": "frozen_source_catalog"},
+                   {"arxiv_id": "unknown"}]
+        with patch.object(main, "hydrate_results", side_effect=lambda records, *args: records):
+            self.assertEqual(main._hydrate_evidence(results, {}), [{"arxiv_id": "unknown"}])
+
+    def test_exclusion_lookup_uses_paper_primary_key_and_bounded_batches(self):
+        conn = main._ro_conn(self.db)
+        sql = "SELECT arxiv_id FROM papers WHERE status='excluded' AND arxiv_id IN (?,?)"
+        details = " ".join(row[3] for row in conn.execute(
+            "EXPLAIN QUERY PLAN " + sql, ["excluded", "unknown"]))
+        self.assertIn("SEARCH papers", details)
+        self.assertNotIn("SCAN papers", details)
+
+    def test_lexical_candidates_remove_excluded_before_final_limit(self):
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("INSERT INTO papers VALUES ('excluded','excluded')")
+            conn.commit()
+        self.fts_db = str(Path(self.db).with_name("fts.db"))
+        with closing(sqlite3.connect(self.fts_db)) as conn:
+            conn.execute("CREATE VIRTUAL TABLE chunks USING fts5(text,arxiv_id UNINDEXED,layers,"
+                         "section_type,element_type,year UNINDEXED)")
+            conn.executemany("INSERT INTO chunks VALUES ('evidence',?,'web3','method','text',2025)",
+                             [("excluded",), ("kept",)])
+            conn.commit()
+        with patch.object(main, "FTS_DB_PATH", self.fts_db):
+            self.assertEqual(main._bm25_candidates("evidence", limit=1), ["kept"])
 
     def test_poisoned_marker_without_exact_identity_is_hidden(self):
         self.publish("good", "r1")
@@ -158,8 +230,9 @@ class PublicationVisibilityTests(unittest.TestCase):
         conn = RecordingConnection()
         with patch.object(main, "_ro_conn", return_value=conn):
             self.assertEqual(main._filter_publication_points(points), [])
-        self.assertEqual(len(conn.calls), 3)
-        self.assertLessEqual(max(len(params) // 2 for _, params in conn.calls), 200)
+        journal_calls = [(sql, params) for sql, params in conn.calls if "FROM paper_publications" in sql]
+        self.assertEqual(len(journal_calls), 3)
+        self.assertLessEqual(max(len(params) // 2 for _, params in journal_calls), 200)
 
     def test_journal_lookup_uses_exact_composite_primary_key_without_table_scan(self):
         conn = main._ro_conn(self.db)
